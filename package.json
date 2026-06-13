@@ -17,6 +17,7 @@
     "@google/gemini-cli": "0.46.0",
     "@google/genai": "2.8.0",
     "dotenv": "17.4.2",
+    "mysql2": "^3.22.5",
     "octokit": "5.0.5",
     "pino": "10.3.1"
   },

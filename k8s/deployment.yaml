@@ -64,6 +64,20 @@ spec:
               value: "3000"
             - name: GITHUB_ORG
               value: seorilabs
+            - name: WORKFLOW_STORE
+              value: mysql
+            - name: WORKFLOW_POLL_INTERVAL_MS
+              value: "5000"
+            - name: WORKFLOW_LEASE_MS
+              value: "600000"
+            - name: WORKFLOW_MAX_ATTEMPTS
+              value: "3"
+            - name: MYSQL_HOST
+              value: mysql.data.svc.cluster.local
+            - name: MYSQL_PORT
+              value: "3306"
+            - name: MYSQL_DATABASE
+              value: base
             - name: GEMINI_PROVIDER
               value: cli
             - name: GEMINI_CLI_COMMAND
@@ -82,6 +96,16 @@ spec:
               value: "false"
             - name: LOG_LEVEL
               value: info
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-app-cred
+                  key: username
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-app-cred
+                  key: password
             - name: GITHUB_APP_ID
               valueFrom:
                 secretKeyRef:

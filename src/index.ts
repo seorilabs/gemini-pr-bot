@@ -5,6 +5,7 @@ import pino from "pino";
 import { loadConfig } from "./config.js";
 import { TtlSet } from "./dedupe.js";
 import { PrBot } from "./bot.js";
+import { MysqlWorkflowStore, WorkflowEngine } from "./workflow.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const config = loadConfig();
@@ -19,21 +20,42 @@ const app = new App({
 });
 
 const bot = new PrBot(config, logger);
+const workflowEngine =
+  config.workflowStore === "mysql"
+    ? new WorkflowEngine(app, bot, new MysqlWorkflowStore(config, logger), config, logger)
+    : null;
 
-app.webhooks.on("issue_comment.created", (event) => {
-  bot.scheduleIssueComment(event);
+function deliveryIdFromEvent(event: any): string | undefined {
+  return event.id || event.delivery || event.payload?.delivery;
+}
+
+async function handleWebhookEvent(eventName: string, event: any, fallback: () => void): Promise<void> {
+  if (!workflowEngine) {
+    fallback();
+    return;
+  }
+
+  await workflowEngine.enqueue(eventName, {
+    id: deliveryIdFromEvent(event),
+    name: eventName,
+    payload: event.payload,
+  });
+}
+
+app.webhooks.on("issue_comment.created", async (event) => {
+  await handleWebhookEvent("issue_comment", event, () => bot.scheduleIssueComment(event));
 });
 
-app.webhooks.on("pull_request_review_comment.created", (event) => {
-  bot.scheduleReviewComment(event);
+app.webhooks.on("pull_request_review_comment.created", async (event) => {
+  await handleWebhookEvent("pull_request_review_comment", event, () => bot.scheduleReviewComment(event));
 });
 
-app.webhooks.on("pull_request_review.submitted", (event) => {
-  bot.schedulePullRequestReview(event);
+app.webhooks.on("pull_request_review.submitted", async (event) => {
+  await handleWebhookEvent("pull_request_review", event, () => bot.schedulePullRequestReview(event));
 });
 
-app.webhooks.on(["pull_request.opened", "pull_request.reopened", "pull_request.synchronize"], (event) => {
-  bot.schedulePullRequest(event);
+app.webhooks.on(["pull_request.opened", "pull_request.reopened", "pull_request.synchronize"], async (event) => {
+  await handleWebhookEvent("pull_request", event, () => bot.schedulePullRequest(event));
 });
 
 app.webhooks.onError((error) => {
@@ -146,7 +168,7 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   }, config.shutdownGraceMs).unref();
 
   try {
-    await Promise.all([closeServer(), bot.shutdown(signal)]);
+    await Promise.all([closeServer(), workflowEngine?.stop(), bot.shutdown(signal)]);
     clearTimeout(forceExitTimer);
     process.exit(0);
   } catch (error) {
@@ -164,6 +186,10 @@ process.on("SIGINT", () => {
   void shutdown("SIGINT");
 });
 
+if (workflowEngine) {
+  await workflowEngine.start();
+}
+
 server.listen(config.port, () => {
   logger.info(
     {
@@ -171,6 +197,7 @@ server.listen(config.port, () => {
       org: config.githubOrg,
       provider: config.geminiProvider,
       model: config.geminiModel || "default",
+      workflowStore: config.workflowStore,
       allowPublicRepos: config.allowPublicRepos,
       autoReviewOnOpen: config.autoReviewOnOpen,
       autoReviewOnSynchronize: config.autoReviewOnSynchronize,

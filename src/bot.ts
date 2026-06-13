@@ -46,6 +46,20 @@ type ActiveCheckRun = {
   prNumber: number;
   headSha: string;
   kind: "review" | "agent";
+  durable: boolean;
+};
+
+export type WorkflowCheckRecord = {
+  checkRunId: number;
+  kind: "review" | "agent";
+  repoFullName: string;
+  prNumber: number;
+  headSha: string;
+};
+
+export type WorkflowExecution = {
+  checkRunId?: number | null;
+  recordCheckRun: (record: WorkflowCheckRecord) => Promise<void>;
 };
 
 export class PrBot {
@@ -86,6 +100,35 @@ export class PrBot {
     });
   }
 
+  async processEvent(
+    octokit: Octokit,
+    eventName: string,
+    payload: any,
+    workflow?: WorkflowExecution,
+  ): Promise<void> {
+    if (eventName === "issue_comment") {
+      await this.handleIssueComment(octokit, payload, workflow);
+      return;
+    }
+
+    if (eventName === "pull_request_review_comment") {
+      await this.handleReviewComment(octokit, payload, workflow);
+      return;
+    }
+
+    if (eventName === "pull_request_review") {
+      await this.handlePullRequestReview(octokit, payload, workflow);
+      return;
+    }
+
+    if (eventName === "pull_request") {
+      await this.handlePullRequest(octokit, payload, workflow);
+      return;
+    }
+
+    this.logger.warn({ event: eventName }, "unsupported webhook event ignored");
+  }
+
   private background(name: string, payload: any, task: () => Promise<void>): void {
     const repo = payload.repository?.full_name;
     const delivery = payload.delivery;
@@ -124,7 +167,7 @@ export class PrBot {
   async shutdown(reason: string): Promise<void> {
     this.shuttingDown = true;
 
-    const activeChecks = [...this.activeChecks.values()];
+    const activeChecks = [...this.activeChecks.values()].filter((check) => !check.durable);
     this.logger.warn(
       {
         reason,
@@ -165,7 +208,7 @@ export class PrBot {
     );
   }
 
-  private async handleIssueComment(octokit: Octokit, payload: any): Promise<void> {
+  private async handleIssueComment(octokit: Octokit, payload: any, workflow?: WorkflowExecution): Promise<void> {
     if (!shouldHandleRepository(payload, this.config) || payload.sender.type === "Bot") {
       return;
     }
@@ -202,7 +245,7 @@ export class PrBot {
         source: "issue_comment",
         sender: payload.sender.login,
         request: command.request,
-      });
+      }, workflow);
       return;
     }
 
@@ -210,7 +253,7 @@ export class PrBot {
       await this.runAgent(octokit, repo, issueNumber, command.request, {
         source: "issue_comment",
         sender: payload.sender.login,
-      }, { type: "pr_comment" });
+      }, { type: "pr_comment" }, workflow);
       return;
     }
 
@@ -220,7 +263,7 @@ export class PrBot {
     });
   }
 
-  private async handleReviewComment(octokit: Octokit, payload: any): Promise<void> {
+  private async handleReviewComment(octokit: Octokit, payload: any, workflow?: WorkflowExecution): Promise<void> {
     if (!shouldHandleRepository(payload, this.config) || payload.sender.type === "Bot") {
       return;
     }
@@ -253,7 +296,7 @@ export class PrBot {
       await this.runAgent(octokit, repo, prNumber, command.request, {
         source: "review_comment",
         sender: payload.sender.login,
-      }, { type: "review_comment", commentId: payload.comment.id });
+      }, { type: "review_comment", commentId: payload.comment.id }, workflow);
       return;
     }
 
@@ -272,7 +315,7 @@ export class PrBot {
     await postReviewCommentReply(octokit, repo, prNumber, payload.comment.id, answer);
   }
 
-  private async handlePullRequestReview(octokit: Octokit, payload: any): Promise<void> {
+  private async handlePullRequestReview(octokit: Octokit, payload: any, workflow?: WorkflowExecution): Promise<void> {
     if (!shouldHandleRepository(payload, this.config) || payload.sender.type === "Bot") {
       return;
     }
@@ -291,7 +334,7 @@ export class PrBot {
         source: "pull_request_review",
         sender: payload.sender.login,
         request: command.request,
-      });
+      }, workflow);
       return;
     }
 
@@ -310,7 +353,7 @@ export class PrBot {
       await this.runAgent(octokit, repo, prNumber, command.request, {
         source: "pull_request_review",
         sender: payload.sender.login,
-      }, { type: "pr_comment" });
+      }, { type: "pr_comment" }, workflow);
       return;
     }
 
@@ -320,7 +363,7 @@ export class PrBot {
     });
   }
 
-  private async handlePullRequest(octokit: Octokit, payload: any): Promise<void> {
+  private async handlePullRequest(octokit: Octokit, payload: any, workflow?: WorkflowExecution): Promise<void> {
     if (!shouldHandleRepository(payload, this.config) || payload.sender.type === "Bot") {
       return;
     }
@@ -330,7 +373,7 @@ export class PrBot {
       await this.runReview(octokit, repoFromPayload(payload), payload.pull_request.number, {
         source: `pull_request.${action}`,
         sender: payload.sender.login,
-      });
+      }, workflow);
       return;
     }
 
@@ -338,7 +381,7 @@ export class PrBot {
       await this.runReview(octokit, repoFromPayload(payload), payload.pull_request.number, {
         source: "pull_request.synchronize",
         sender: payload.sender.login,
-      });
+      }, workflow);
     }
   }
 
@@ -347,13 +390,14 @@ export class PrBot {
     repo: RepoRef,
     prNumber: number,
     trigger: ReviewTrigger,
+    workflow?: WorkflowExecution,
   ): Promise<void> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
     if (this.shuttingDown) {
       return;
     }
 
-    const check = await this.createTrackedCheck(octokit, repo, prNumber, context.headSha, "review");
+    const check = await this.createTrackedCheck(octokit, repo, prNumber, context.headSha, "review", workflow);
 
     try {
       if (this.hasMergeConflict(context)) {
@@ -405,13 +449,14 @@ export class PrBot {
     request: string,
     trigger: ReviewTrigger,
     target: AgentReplyTarget,
+    workflow?: WorkflowExecution,
   ): Promise<void> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
     if (this.shuttingDown) {
       return;
     }
 
-    const check = await this.createTrackedCheck(octokit, repo, prNumber, context.headSha, "agent");
+    const check = await this.createTrackedCheck(octokit, repo, prNumber, context.headSha, "agent", workflow);
 
     try {
       if (this.hasMergeConflict(context)) {
@@ -468,8 +513,22 @@ export class PrBot {
     prNumber: number,
     headSha: string,
     kind: ActiveCheckRun["kind"],
+    workflow?: WorkflowExecution,
   ): Promise<ActiveCheckRun | null> {
-    const checkRunId = await createInProgressCheck(octokit, repo, headSha);
+    let checkRunId = workflow?.checkRunId ?? null;
+    if (!checkRunId) {
+      checkRunId = await createInProgressCheck(octokit, repo, headSha);
+      if (checkRunId && workflow) {
+        await workflow.recordCheckRun({
+          checkRunId,
+          kind,
+          repoFullName: repo.fullName,
+          prNumber,
+          headSha,
+        });
+      }
+    }
+
     if (!checkRunId) {
       return null;
     }
@@ -482,6 +541,7 @@ export class PrBot {
       prNumber,
       headSha,
       kind,
+      durable: Boolean(workflow),
     };
     this.nextActiveCheckKey += 1;
     this.activeChecks.set(check.key, check);

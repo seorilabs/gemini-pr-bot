@@ -21,7 +21,8 @@ flowchart LR
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Gemini PR Bot` check run for review and agent jobs.
-- Cancels in-progress `Gemini PR Bot` check runs during pod shutdown so rollout/restart does not leave stale pending checks.
+- Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
+- Persists active check-run IDs so a restarted worker can resume a job instead of leaving stale pending checks.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default.
 
@@ -75,6 +76,24 @@ flowchart TD
 
 Approval from agent mode is guarded: the model output must include the approval action marker and the exact `No actionable findings.` finding result. Otherwise the bot only comments.
 
+## Workflow Persistence
+
+In production, set `WORKFLOW_STORE=mysql`. The daemon creates and uses the `base.gemini_pr_bot_workflows` table.
+
+```mermaid
+flowchart TD
+  Webhook["GitHub webhook"] --> Enqueue["Insert workflow row"]
+  Enqueue --> Ack["Return 202 accepted"]
+  Worker["Daemon worker"] --> Lease["Lease queued or expired workflow"]
+  Lease --> Bot["Run PR review/agent logic"]
+  Bot --> Check["Create or reuse Gemini PR Bot check-run"]
+  Check --> Done["Complete workflow row"]
+  Lease -->|worker dies| Expire["Lease expires"]
+  Expire --> Lease
+```
+
+The workflow table stores delivery dedupe keys, payload JSON, attempts, lease owner/expiry, PR identity, and `check_run_id`. If a pod restarts after creating a check-run, the next worker lease reuses that check-run instead of creating an untracked pending check.
+
 ## Required Secrets
 
 Create an organization-owned GitHub App using [docs/github-app-settings.md](docs/github-app-settings.md).
@@ -88,6 +107,7 @@ export GITHUB_WEBHOOK_SECRET="..."
 
 ./scripts/create-k8s-secret.sh
 ./scripts/create-gemini-cli-oauth-secret.sh
+./scripts/copy-mysql-app-secret.sh
 ```
 
 ## Build And Deploy
