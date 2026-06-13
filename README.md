@@ -15,7 +15,7 @@ flowchart LR
 
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
 - Responds to PR comments containing `@gemini-cli` or `@gemini`.
-- Runs explicit review on `@gemini-cli /review`.
+- Runs explicit review on `@gemini-cli /review`; if there are no actionable findings, it submits an approval review instead of only commenting.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]`.
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
 - Replies directly to inline review comments when mentioned there.
@@ -48,9 +48,11 @@ Other review agents should treat the latest non-stale Gemini approval as "no fur
 flowchart TD
   Review["/review or PR opened"] --> Context["Build PR context"]
   Context --> Gemini["Gemini strict review prompt"]
-  Gemini --> Output["Findings + verification + check run"]
+  Gemini --> Decision{"Actionable findings?"}
+  Decision -->|Yes| Output["Post findings comment + check run"]
+  Decision -->|No| Approval["GitHub APPROVE review with HEAD marker"]
   Output --> Approve["Maintainer or trusted agent runs /approve"]
-  Approve --> Approval["GitHub APPROVE review with HEAD marker"]
+  Approve --> Approval
   Approval --> Agent["Other agents read review state + marker"]
   Agent -->|Approval current| Stop["No further agent action"]
   Agent -->|New commit or stale approval| Review

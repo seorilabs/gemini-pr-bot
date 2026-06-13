@@ -277,6 +277,18 @@ export class PrBot {
 
     try {
       const reviewText = await this.createReviewTextFromContext(context, trigger);
+      if (this.shouldApproveReviewText(reviewText)) {
+        await approvePullRequest(
+          octokit,
+          repo,
+          prNumber,
+          this.approvalText(trigger.sender, "Review found no actionable findings.", context.headSha, reviewText),
+          context.headSha,
+        );
+        await completeCheck(octokit, repo, checkRunId, "success", "Gemini review approved PR", reviewText);
+        return;
+      }
+
       await postPrComment(octokit, repo, prNumber, reviewText);
       await completeCheck(octokit, repo, checkRunId, "success", "Gemini review completed", reviewText);
     } catch (error) {
@@ -512,6 +524,10 @@ export class PrBot {
 
   private shouldApproveAgentText(text: string): boolean {
     return text.includes(AGENT_APPROVE_MARKER) && /\bNo actionable findings\./iu.test(text);
+  }
+
+  private shouldApproveReviewText(text: string): boolean {
+    return /\bNo actionable findings\./iu.test(text);
   }
 
   private publicAgentText(text: string): string {
