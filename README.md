@@ -73,6 +73,7 @@ npm ci
 npm run check
 ./scripts/build-and-push.sh
 kubectl apply -k k8s
+kubectl -n apps rollout restart deployment/gemini-pr-bot
 kubectl -n apps rollout status deployment/gemini-pr-bot
 ```
 
@@ -81,6 +82,7 @@ If the local machine does not have Docker, build and push from the cluster with 
 ```bash
 ./scripts/build-in-cluster.sh
 kubectl apply -k k8s
+kubectl -n apps rollout restart deployment/gemini-pr-bot
 kubectl -n apps rollout status deployment/gemini-pr-bot
 ```
 
