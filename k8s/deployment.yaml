@@ -15,6 +15,8 @@ spec:
       labels:
         app.kubernetes.io/name: gemini-pr-bot
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: rpi5
       securityContext:
         fsGroup: 10001
       imagePullSecrets:
