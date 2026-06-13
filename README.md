@@ -26,7 +26,10 @@ flowchart LR
 
 ```text
 @gemini-cli /review
+@seorilabs-gemini-pr-bot /review
+/gemini review
 @gemini-cli /approve [reason]
+/gemini approve [reason]
 @gemini-cli /help
 @gemini-cli <question>
 ```

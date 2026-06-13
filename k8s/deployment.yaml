@@ -68,7 +68,7 @@ spec:
             - name: HOME
               value: /home/app
             - name: BOT_MENTIONS
-              value: "@gemini-cli,@gemini"
+              value: "@gemini-cli,@gemini,@seorilabs-gemini-pr-bot"
             - name: TRUSTED_ASSOCIATIONS
               value: "OWNER,MEMBER,COLLABORATOR"
             - name: ALLOW_PUBLIC_REPOS
