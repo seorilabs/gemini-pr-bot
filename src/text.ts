@@ -1,0 +1,60 @@
+import type { Config } from "./config.js";
+
+export type BotCommand = {
+  mention: string;
+  mode: "review" | "chat" | "help";
+  request: string;
+};
+
+export function truncate(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, maxChars - 32))}\n\n...truncated...`;
+}
+
+export function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function parseBotCommand(body: string, config: Config): BotCommand | null {
+  for (const mention of config.botMentions) {
+    const regex = new RegExp(`(?:^|\\s)${escapeRegExp(mention)}(?=$|\\s|[.,:;!?])`, "iu");
+    const match = regex.exec(body);
+    if (!match) {
+      continue;
+    }
+
+    const requestStart = (match.index ?? 0) + match[0].length;
+    const rawRequest = body.slice(requestStart).trim();
+    const reviewMatch = rawRequest.match(/^\/review(?:\s+([\s\S]*))?$/iu);
+    if (reviewMatch) {
+      return {
+        mention,
+        mode: "review",
+        request: reviewMatch[1]?.trim() || "이 PR을 코드리뷰해줘.",
+      };
+    }
+
+    if (/^\/help\b/iu.test(rawRequest)) {
+      return {
+        mention,
+        mode: "help",
+        request: rawRequest,
+      };
+    }
+
+    return {
+      mention,
+      mode: "chat",
+      request: rawRequest || "이 PR의 현재 맥락을 보고 도움이 될 만한 답변을 짧게 작성해줘.",
+    };
+  }
+
+  return null;
+}
+
+export function githubCommentBody(body: string, maxChars = 60_000): string {
+  return truncate(`${body.trim()}\n\n---\n_Gemini PR Bot_`, maxChars);
+}
+

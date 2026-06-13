@@ -1,0 +1,22 @@
+{
+  "name": "Seorilabs Gemini PR Bot",
+  "url": "https://github.com/seorilabs/gemini-pr-bot",
+  "hook_attributes": {
+    "url": "https://gemini-pr-bot.vzyx.xyz/github/webhook"
+  },
+  "public": false,
+  "default_permissions": {
+    "checks": "write",
+    "contents": "read",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write"
+  },
+  "default_events": [
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment"
+  ]
+}
+
