@@ -114,7 +114,7 @@ spec:
                 path: config.json
 YAML
 
-retry kubectl apply -f "${job_yaml}"
+retry kubectl apply --validate=false -f "${job_yaml}"
 
 if ! kubectl -n "${namespace}" wait --for=condition=complete "job/${job_name}" --timeout="${timeout}"; then
   kubectl -n "${namespace}" describe "job/${job_name}" || true
