@@ -10,6 +10,7 @@ import {
   postReviewCommentReply,
   repoFromPayload,
   shouldHandleRepository,
+  type PullRequestContext,
   type RepoRef,
   type ReviewTrigger,
 } from "./github.js";
@@ -201,11 +202,11 @@ export class PrBot {
     prNumber: number,
     trigger: ReviewTrigger,
   ): Promise<void> {
-    const { headSha } = await buildPullRequestContext(octokit, repo, prNumber, this.config);
-    const checkRunId = await createInProgressCheck(octokit, repo, headSha);
+    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
+    const checkRunId = await createInProgressCheck(octokit, repo, context.headSha);
 
     try {
-      const reviewText = await this.createReviewText(octokit, repo, prNumber, trigger);
+      const reviewText = await this.createReviewTextFromContext(context, trigger);
       await postPrComment(octokit, repo, prNumber, reviewText);
       await completeCheck(octokit, repo, checkRunId, "success", "Gemini review completed", reviewText);
     } catch (error) {
@@ -233,6 +234,13 @@ export class PrBot {
     trigger: ReviewTrigger,
   ): Promise<string> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
+    return this.createReviewTextFromContext(context, trigger);
+  }
+
+  private async createReviewTextFromContext(
+    context: PullRequestContext,
+    trigger: ReviewTrigger,
+  ): Promise<string> {
     const prompt = [
       "Write a concise pull request code review.",
       "",
@@ -287,4 +295,3 @@ export class PrBot {
     ].join("\n");
   }
 }
-

@@ -16,6 +16,12 @@ export type ReviewTrigger = {
   request?: string;
 };
 
+export type PullRequestContext = {
+  headSha: string;
+  title: string;
+  markdown: string;
+};
+
 export function repoFromPayload(payload: any): RepoRef {
   return {
     owner: payload.repository.owner.login,
@@ -60,7 +66,7 @@ export async function buildPullRequestContext(
   repo: RepoRef,
   prNumber: number,
   config: Config,
-): Promise<{ headSha: string; title: string; markdown: string }> {
+): Promise<PullRequestContext> {
   const { data: pr } = await octokit.rest.pulls.get({
     owner: repo.owner,
     repo: repo.repo,
@@ -246,4 +252,3 @@ export async function postReviewCommentReply(
     body: githubCommentBody(body),
   });
 }
-
