@@ -236,6 +236,23 @@ export async function completeCheck(
   });
 }
 
+export async function approvePullRequest(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+  body: string,
+  headSha: string,
+): Promise<void> {
+  await octokit.rest.pulls.createReview({
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: prNumber,
+    commit_id: headSha,
+    event: "APPROVE",
+    body: githubCommentBody(body),
+  });
+}
+
 export async function postPrComment(
   octokit: Octokit,
   repo: RepoRef,

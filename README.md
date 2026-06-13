@@ -16,7 +16,7 @@ flowchart LR
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
 - Responds to PR comments containing `@gemini-cli` or `@gemini`.
 - Runs explicit review on `@gemini-cli /review`.
-- Records an agent coordination marker on `@gemini-cli /approve [reason]`.
+- Submits a GitHub approval review on `@gemini-cli /approve [reason]`.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Gemini PR Bot` check run for review jobs.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
@@ -31,13 +31,13 @@ flowchart LR
 @gemini-cli <question>
 ```
 
-`/approve` does not submit a GitHub approval review. It posts a coordination comment with a hidden marker:
+`/approve` submits a real GitHub approval review for the current PR HEAD. The approval review body includes a hidden coordination marker:
 
 ```html
 <!-- seorilabs-gemini-pr-bot:status=no-action-required head=<head-sha> -->
 ```
 
-Other review agents should treat that marker as "no further agent action required" only when `head=<head-sha>` matches the current PR HEAD. A new commit makes the marker stale.
+Other review agents should treat the latest non-stale Gemini approval as "no further agent action required". A new commit makes the marker stale when the repository's branch protection dismisses stale approvals.
 
 ```mermaid
 flowchart TD
@@ -45,10 +45,10 @@ flowchart TD
   Context --> Gemini["Gemini strict review prompt"]
   Gemini --> Output["Findings + verification + check run"]
   Output --> Approve["Maintainer or trusted agent runs /approve"]
-  Approve --> Marker["PR comment marker with current HEAD SHA"]
-  Marker --> Agent["Other agents read marker"]
-  Agent -->|HEAD matches| Stop["No further agent action"]
-  Agent -->|New commits| Review
+  Approve --> Approval["GitHub APPROVE review with HEAD marker"]
+  Approval --> Agent["Other agents read review state + marker"]
+  Agent -->|Approval current| Stop["No further agent action"]
+  Agent -->|New commit or stale approval| Review
 ```
 
 ## Required Secrets

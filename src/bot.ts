@@ -1,6 +1,7 @@
 import type { Config } from "./config.js";
 import { GeminiClient } from "./gemini.js";
 import {
+  approvePullRequest,
   buildPullRequestContext,
   completeCheck,
   createInProgressCheck,
@@ -102,7 +103,13 @@ export class PrBot {
 
     if (command.mode === "approve") {
       const headSha = await getPullRequestHeadSha(octokit, repo, issueNumber);
-      await postPrComment(octokit, repo, issueNumber, this.approvalText(payload.sender.login, command.request, headSha));
+      await approvePullRequest(
+        octokit,
+        repo,
+        issueNumber,
+        this.approvalText(payload.sender.login, command.request, headSha),
+        headSha,
+      );
       return;
     }
 
@@ -141,12 +148,12 @@ export class PrBot {
 
     if (command.mode === "approve") {
       const headSha = await getPullRequestHeadSha(octokit, repo, prNumber);
-      await postReviewCommentReply(
+      await approvePullRequest(
         octokit,
         repo,
         prNumber,
-        payload.comment.id,
         this.approvalText(payload.sender.login, command.request, headSha),
+        headSha,
       );
       return;
     }
@@ -191,7 +198,13 @@ export class PrBot {
 
     if (command.mode === "approve") {
       const headSha = await getPullRequestHeadSha(octokit, repo, prNumber);
-      await postPrComment(octokit, repo, prNumber, this.approvalText(payload.sender.login, command.request, headSha));
+      await approvePullRequest(
+        octokit,
+        repo,
+        prNumber,
+        this.approvalText(payload.sender.login, command.request, headSha),
+        headSha,
+      );
       return;
     }
 
@@ -345,7 +358,7 @@ export class PrBot {
       "사용 가능한 명령:",
       "",
       "- `@gemini-cli /review`: 현재 PR을 리뷰합니다.",
-      "- `@gemini-cli /approve [사유]`: 이 PR에 더 이상 에이전트 대응이 필요 없다는 marker를 남깁니다.",
+      "- `@gemini-cli /approve [사유]`: GitHub approval review와 agent coordination marker를 남깁니다.",
       "- `@gemini-cli 질문`: PR 맥락을 보고 질문에 답합니다.",
       "- inline review comment에서 `@gemini-cli 질문`: 해당 review comment에 답글로 응답합니다.",
     ].join("\n");
@@ -361,6 +374,8 @@ export class PrBot {
       `Reason: ${reason}`,
       "",
       "No further agent action required unless new commits arrive or a maintainer explicitly requests another review.",
+      "",
+      "Note: stale approval dismissal depends on the repository branch protection setting.",
     ].join("\n");
   }
 }
