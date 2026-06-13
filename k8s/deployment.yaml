@@ -80,6 +80,8 @@ spec:
               value: base
             - name: GEMINI_PROVIDER
               value: cli
+            - name: GEMINI_MODEL
+              value: gemini-3-flash-preview
             - name: GEMINI_CLI_COMMAND
               value: /app/node_modules/.bin/gemini
             - name: HOME
