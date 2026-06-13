@@ -7,7 +7,7 @@ flowchart LR
   GitHub["GitHub App Webhook"] --> Ingress["K8s Ingress"]
   Ingress --> Bot["gemini-pr-bot"]
   Bot --> GitHubAPI["GitHub App Installation API"]
-  Bot --> Gemini["Gemini API"]
+  Bot --> Gemini["Gemini CLI or API"]
   Bot --> Comment["PR comments / inline replies / check runs"]
 ```
 
@@ -16,10 +16,40 @@ flowchart LR
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
 - Responds to PR comments containing `@gemini-cli` or `@gemini`.
 - Runs explicit review on `@gemini-cli /review`.
+- Records an agent coordination marker on `@gemini-cli /approve [reason]`.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Gemini PR Bot` check run for review jobs.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default.
+
+## Commands
+
+```text
+@gemini-cli /review
+@gemini-cli /approve [reason]
+@gemini-cli /help
+@gemini-cli <question>
+```
+
+`/approve` does not submit a GitHub approval review. It posts a coordination comment with a hidden marker:
+
+```html
+<!-- seorilabs-gemini-pr-bot:status=no-action-required head=<head-sha> -->
+```
+
+Other review agents should treat that marker as "no further agent action required" only when `head=<head-sha>` matches the current PR HEAD. A new commit makes the marker stale.
+
+```mermaid
+flowchart TD
+  Review["/review or PR opened"] --> Context["Build PR context"]
+  Context --> Gemini["Gemini strict review prompt"]
+  Gemini --> Output["Findings + verification + check run"]
+  Output --> Approve["Maintainer or trusted agent runs /approve"]
+  Approve --> Marker["PR comment marker with current HEAD SHA"]
+  Marker --> Agent["Other agents read marker"]
+  Agent -->|HEAD matches| Stop["No further agent action"]
+  Agent -->|New commits| Review
+```
 
 ## Required Secrets
 

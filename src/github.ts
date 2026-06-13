@@ -57,6 +57,19 @@ export async function isPullRequestIssue(octokit: Octokit, repo: RepoRef, issueN
   return Boolean(data.pull_request);
 }
 
+export async function getPullRequestHeadSha(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+): Promise<string> {
+  const { data: pr } = await octokit.rest.pulls.get({
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: prNumber,
+  });
+  return pr.head.sha;
+}
+
 async function paginate(octokit: Octokit, method: any, params: Record<string, unknown>) {
   return octokit.paginate(method, params);
 }

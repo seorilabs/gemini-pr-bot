@@ -4,6 +4,7 @@ import {
   buildPullRequestContext,
   completeCheck,
   createInProgressCheck,
+  getPullRequestHeadSha,
   isPullRequestIssue,
   isTrustedAssociation,
   postPrComment,
@@ -15,6 +16,8 @@ import {
   type ReviewTrigger,
 } from "./github.js";
 import { parseBotCommand } from "./text.js";
+
+const NO_ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=no-action-required";
 
 type Logger = {
   info: (value: unknown, message?: string) => void;
@@ -97,6 +100,12 @@ export class PrBot {
       return;
     }
 
+    if (command.mode === "approve") {
+      const headSha = await getPullRequestHeadSha(octokit, repo, issueNumber);
+      await postPrComment(octokit, repo, issueNumber, this.approvalText(payload.sender.login, command.request, headSha));
+      return;
+    }
+
     if (command.mode === "review") {
       await this.runReview(octokit, repo, issueNumber, {
         source: "issue_comment",
@@ -127,6 +136,18 @@ export class PrBot {
 
     if (command.mode === "help") {
       await postReviewCommentReply(octokit, repo, prNumber, payload.comment.id, this.helpText());
+      return;
+    }
+
+    if (command.mode === "approve") {
+      const headSha = await getPullRequestHeadSha(octokit, repo, prNumber);
+      await postReviewCommentReply(
+        octokit,
+        repo,
+        prNumber,
+        payload.comment.id,
+        this.approvalText(payload.sender.login, command.request, headSha),
+      );
       return;
     }
 
@@ -165,6 +186,12 @@ export class PrBot {
         sender: payload.sender.login,
         request: command.request,
       });
+      return;
+    }
+
+    if (command.mode === "approve") {
+      const headSha = await getPullRequestHeadSha(octokit, repo, prNumber);
+      await postPrComment(octokit, repo, prNumber, this.approvalText(payload.sender.login, command.request, headSha));
       return;
     }
 
@@ -242,15 +269,43 @@ export class PrBot {
     trigger: ReviewTrigger,
   ): Promise<string> {
     const prompt = [
-      "Write a concise pull request code review.",
+      "Write a strict pull request code review.",
+      "",
+      "Primary goal:",
+      "- Find actionable defects that a maintainer should fix before merge.",
+      "- Prefer fewer high-confidence findings over many low-confidence comments.",
+      "- If a possible concern is not directly supported by the diff, put it under verification suggestions instead of findings.",
+      "",
+      "Finding rules:",
+      "- Findings must be grounded in the supplied diff/context.",
+      "- Each finding must include severity, file/function or line reference when available, impact, and concrete fix direction.",
+      "- Do not include praise, broad summaries, style-only preferences, or nits.",
+      "- Do not mention that you are an AI model.",
+      "- Keep code quotes short: quote identifiers or a minimal expression only when useful.",
+      "- If a Mermaid diagram helps explain a bug path, state machine, or architecture flow, include one compact diagram.",
+      "- If the PR conversation contains the marker `seorilabs-gemini-pr-bot:status=no-action-required`, treat it as a prior human/agent approval signal. Prefer markers whose recorded HEAD SHA matches the current PR Head SHA. Still review if this request explicitly asks for `/review`, but avoid reopening already-settled issues unless the new diff contradicts the marker.",
+      "",
+      "Severity guide:",
+      "- Critical: data loss, security exposure, crash on common path, or broken release path.",
+      "- High: likely runtime failure, serious regression, incorrect core behavior.",
+      "- Medium: real bug with narrower trigger, missing required validation, important test gap.",
+      "- Low: minor but actionable correctness or maintainability issue.",
       "",
       "Output format:",
       "## Gemini Review",
       "",
-      "- Findings first, ordered by severity.",
-      "- Include file and line/function references when the supplied context supports it.",
-      "- If there are no actionable findings, say that clearly.",
-      "- End with a short verification/test suggestion only when useful.",
+      "### Findings",
+      "- `[Severity] file_or_symbol`: impact and evidence. Suggested fix.",
+      "",
+      "If there are no actionable findings, write exactly:",
+      "### Findings",
+      "No actionable findings.",
+      "",
+      "### Verification",
+      "- Only include concrete checks that are useful for this PR.",
+      "",
+      "### Coordination",
+      "- If no further agent action appears needed, include: `No further agent action required unless new commits arrive.`",
       "",
       `Trigger: ${trigger.source}`,
       `Requested by: ${trigger.sender}`,
@@ -290,8 +345,22 @@ export class PrBot {
       "사용 가능한 명령:",
       "",
       "- `@gemini-cli /review`: 현재 PR을 리뷰합니다.",
+      "- `@gemini-cli /approve [사유]`: 이 PR에 더 이상 에이전트 대응이 필요 없다는 marker를 남깁니다.",
       "- `@gemini-cli 질문`: PR 맥락을 보고 질문에 답합니다.",
       "- inline review comment에서 `@gemini-cli 질문`: 해당 review comment에 답글로 응답합니다.",
+    ].join("\n");
+  }
+
+  private approvalText(sender: string, reason: string, headSha: string): string {
+    return [
+      `<!-- ${NO_ACTION_REQUIRED_MARKER} head=${headSha} -->`,
+      "## Agent Coordination",
+      "",
+      `Approved by: @${sender}`,
+      `Applies to HEAD: \`${headSha}\``,
+      `Reason: ${reason}`,
+      "",
+      "No further agent action required unless new commits arrive or a maintainer explicitly requests another review.",
     ].join("\n");
   }
 }

@@ -2,7 +2,7 @@ import type { Config } from "./config.js";
 
 export type BotCommand = {
   mention: string;
-  mode: "review" | "chat" | "help";
+  mode: "review" | "chat" | "help" | "approve";
   request: string;
 };
 
@@ -44,6 +44,15 @@ export function parseBotCommand(body: string, config: Config): BotCommand | null
       };
     }
 
+    const approveMatch = rawRequest.match(/^\/(?:approve|approved|done|no-action|no_action|resolved)(?:\s+([\s\S]*))?$/iu);
+    if (approveMatch) {
+      return {
+        mention,
+        mode: "approve",
+        request: approveMatch[1]?.trim() || "추가 대응이 필요 없음을 승인합니다.",
+      };
+    }
+
     return {
       mention,
       mode: "chat",
@@ -57,4 +66,3 @@ export function parseBotCommand(body: string, config: Config): BotCommand | null
 export function githubCommentBody(body: string, maxChars = 60_000): string {
   return truncate(`${body.trim()}\n\n---\n_Gemini PR Bot_`, maxChars);
 }
-
