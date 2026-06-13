@@ -3,6 +3,15 @@ import { githubCommentBody, truncate } from "./text.js";
 
 type Octokit = any;
 
+export type CheckConclusion =
+  | "success"
+  | "failure"
+  | "neutral"
+  | "cancelled"
+  | "skipped"
+  | "timed_out"
+  | "action_required";
+
 export type RepoRef = {
   owner: string;
   repo: string;
@@ -277,7 +286,7 @@ export async function completeCheck(
   octokit: Octokit,
   repo: RepoRef,
   checkRunId: number | null,
-  conclusion: "success" | "failure" | "action_required",
+  conclusion: CheckConclusion,
   title: string,
   summary: string,
 ): Promise<void> {

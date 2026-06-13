@@ -15,6 +15,7 @@ export type Config = {
   autoReviewOnOpen: boolean;
   autoReviewOnSynchronize: boolean;
   deliveryTtlMs: number;
+  shutdownGraceMs: number;
   maxWebhookBodyBytes: number;
   maxPatchChars: number;
   maxContextChars: number;
@@ -95,6 +96,7 @@ export function loadConfig(): Config {
     autoReviewOnOpen: optionalBool("AUTO_REVIEW_ON_OPEN", true),
     autoReviewOnSynchronize: optionalBool("AUTO_REVIEW_ON_SYNCHRONIZE", false),
     deliveryTtlMs: optionalInt("DELIVERY_TTL_MS", 60 * 60 * 1000),
+    shutdownGraceMs: optionalInt("SHUTDOWN_GRACE_MS", 25_000),
     maxWebhookBodyBytes: optionalInt("MAX_WEBHOOK_BODY_BYTES", 5 * 1024 * 1024),
     maxPatchChars: optionalInt("MAX_PATCH_CHARS", 120_000),
     maxContextChars: optionalInt("MAX_CONTEXT_CHARS", 160_000),

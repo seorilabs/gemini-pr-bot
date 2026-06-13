@@ -13,6 +13,7 @@ import {
   requestChangesPullRequest,
   repoFromPayload,
   shouldHandleRepository,
+  type CheckConclusion,
   type PullRequestContext,
   type PullRequestStatus,
   type RepoRef,
@@ -37,8 +38,22 @@ type Logger = {
 
 type Octokit = any;
 
+type ActiveCheckRun = {
+  key: number;
+  octokit: Octokit;
+  repo: RepoRef;
+  checkRunId: number;
+  prNumber: number;
+  headSha: string;
+  kind: "review" | "agent";
+};
+
 export class PrBot {
   private readonly gemini: GeminiClient;
+  private readonly activeTasks = new Set<Promise<void>>();
+  private readonly activeChecks = new Map<number, ActiveCheckRun>();
+  private nextActiveCheckKey = 1;
+  private shuttingDown = false;
 
   constructor(
     private readonly config: Config,
@@ -74,19 +89,80 @@ export class PrBot {
   private background(name: string, payload: any, task: () => Promise<void>): void {
     const repo = payload.repository?.full_name;
     const delivery = payload.delivery;
+    if (this.shuttingDown) {
+      this.logger.warn({ event: name, repo, delivery }, "webhook task ignored during shutdown");
+      return;
+    }
+
     setImmediate(() => {
-      task().catch((error) => {
-        this.logger.error(
-          {
-            error,
-            event: name,
-            repo,
-            delivery,
-          },
-          "background webhook task failed",
-        );
-      });
+      if (this.shuttingDown) {
+        this.logger.warn({ event: name, repo, delivery }, "webhook task skipped during shutdown");
+        return;
+      }
+
+      let promise: Promise<void>;
+      promise = task()
+        .catch((error) => {
+          this.logger.error(
+            {
+              error,
+              event: name,
+              repo,
+              delivery,
+            },
+            "background webhook task failed",
+          );
+        })
+        .finally(() => {
+          this.activeTasks.delete(promise);
+        });
+
+      this.activeTasks.add(promise);
     });
+  }
+
+  async shutdown(reason: string): Promise<void> {
+    this.shuttingDown = true;
+
+    const activeChecks = [...this.activeChecks.values()];
+    this.logger.warn(
+      {
+        reason,
+        activeTasks: this.activeTasks.size,
+        activeChecks: activeChecks.length,
+      },
+      "Gemini PR Bot shutdown started",
+    );
+
+    const summary = [
+      `Gemini PR Bot stopped while this job was running.`,
+      "",
+      `Reason: ${reason}`,
+      "",
+      "The job was marked as cancelled so GitHub does not keep a stale pending check.",
+      "Request another review after the bot is back online.",
+    ].join("\n");
+
+    const results = await Promise.allSettled(
+      activeChecks.map((check) =>
+        this.completeTrackedCheck(
+          check,
+          "cancelled",
+          "Gemini job cancelled during bot shutdown",
+          summary,
+        ),
+      ),
+    );
+
+    const failed = results.filter((result) => result.status === "rejected").length;
+    this.logger.warn(
+      {
+        reason,
+        cancelledChecks: activeChecks.length - failed,
+        failed,
+      },
+      "Gemini PR Bot shutdown completed",
+    );
   }
 
   private async handleIssueComment(octokit: Octokit, payload: any): Promise<void> {
@@ -273,16 +349,22 @@ export class PrBot {
     trigger: ReviewTrigger,
   ): Promise<void> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
-    const checkRunId = await createInProgressCheck(octokit, repo, context.headSha);
+    if (this.shuttingDown) {
+      return;
+    }
+
+    const check = await this.createTrackedCheck(octokit, repo, prNumber, context.headSha, "review");
 
     try {
       if (this.hasMergeConflict(context)) {
         const conflictText = this.mergeConflictText(repo, prNumber, context);
+        if (this.shuttingDown) {
+          return;
+        }
+
         await requestChangesPullRequest(octokit, repo, prNumber, conflictText, context.headSha);
-        await completeCheck(
-          octokit,
-          repo,
-          checkRunId,
+        await this.completeTrackedCheck(
+          check,
           "action_required",
           "Merge conflict requires resolution",
           conflictText,
@@ -291,6 +373,10 @@ export class PrBot {
       }
 
       const reviewText = await this.createReviewTextFromContext(context, trigger);
+      if (this.shuttingDown) {
+        return;
+      }
+
       if (this.shouldApproveReviewText(reviewText, context)) {
         await approvePullRequest(
           octokit,
@@ -299,15 +385,15 @@ export class PrBot {
           this.approvalText(trigger.sender, "Review found no actionable findings.", context.headSha, reviewText),
           context.headSha,
         );
-        await completeCheck(octokit, repo, checkRunId, "success", "Gemini review approved PR", reviewText);
+        await this.completeTrackedCheck(check, "success", "Gemini review approved PR", reviewText);
         return;
       }
 
       await postPrComment(octokit, repo, prNumber, reviewText);
-      await completeCheck(octokit, repo, checkRunId, "success", "Gemini review completed", reviewText);
+      await this.completeTrackedCheck(check, "success", "Gemini review completed", reviewText);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await completeCheck(octokit, repo, checkRunId, "failure", "Gemini review failed", message);
+      await this.completeTrackedCheck(check, "failure", "Gemini review failed", message);
       throw error;
     }
   }
@@ -321,16 +407,22 @@ export class PrBot {
     target: AgentReplyTarget,
   ): Promise<void> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
-    const checkRunId = await createInProgressCheck(octokit, repo, context.headSha);
+    if (this.shuttingDown) {
+      return;
+    }
+
+    const check = await this.createTrackedCheck(octokit, repo, prNumber, context.headSha, "agent");
 
     try {
       if (this.hasMergeConflict(context)) {
         const conflictText = this.mergeConflictText(repo, prNumber, context);
+        if (this.shuttingDown) {
+          return;
+        }
+
         await requestChangesPullRequest(octokit, repo, prNumber, conflictText, context.headSha);
-        await completeCheck(
-          octokit,
-          repo,
-          checkRunId,
+        await this.completeTrackedCheck(
+          check,
           "action_required",
           "Merge conflict requires resolution",
           conflictText,
@@ -340,6 +432,9 @@ export class PrBot {
 
       const agentText = await this.createAgentTextFromContext(context, request, trigger);
       const publicText = this.publicAgentText(agentText);
+      if (this.shuttingDown) {
+        return;
+      }
 
       if (this.shouldApproveAgentText(agentText, context)) {
         await approvePullRequest(
@@ -349,7 +444,7 @@ export class PrBot {
           this.approvalText(trigger.sender, "Agent mention analysis found no actionable findings.", context.headSha, publicText),
           context.headSha,
         );
-        await completeCheck(octokit, repo, checkRunId, "success", "Gemini agent approved PR", publicText);
+        await this.completeTrackedCheck(check, "success", "Gemini agent approved PR", publicText);
         return;
       }
 
@@ -359,11 +454,54 @@ export class PrBot {
         await postPrComment(octokit, repo, prNumber, publicText);
       }
 
-      await completeCheck(octokit, repo, checkRunId, "success", "Gemini agent commented", publicText);
+      await this.completeTrackedCheck(check, "success", "Gemini agent commented", publicText);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await completeCheck(octokit, repo, checkRunId, "failure", "Gemini agent failed", message);
+      await this.completeTrackedCheck(check, "failure", "Gemini agent failed", message);
       throw error;
+    }
+  }
+
+  private async createTrackedCheck(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    headSha: string,
+    kind: ActiveCheckRun["kind"],
+  ): Promise<ActiveCheckRun | null> {
+    const checkRunId = await createInProgressCheck(octokit, repo, headSha);
+    if (!checkRunId) {
+      return null;
+    }
+
+    const check: ActiveCheckRun = {
+      key: this.nextActiveCheckKey,
+      octokit,
+      repo,
+      checkRunId,
+      prNumber,
+      headSha,
+      kind,
+    };
+    this.nextActiveCheckKey += 1;
+    this.activeChecks.set(check.key, check);
+    return check;
+  }
+
+  private async completeTrackedCheck(
+    check: ActiveCheckRun | null,
+    conclusion: CheckConclusion,
+    title: string,
+    summary: string,
+  ): Promise<void> {
+    if (!check) {
+      return;
+    }
+
+    try {
+      await completeCheck(check.octokit, check.repo, check.checkRunId, conclusion, title, summary);
+    } finally {
+      this.activeChecks.delete(check.key);
     }
   }
 

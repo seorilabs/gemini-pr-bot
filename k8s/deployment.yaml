@@ -15,6 +15,7 @@ spec:
       labels:
         app.kubernetes.io/name: gemini-pr-bot
     spec:
+      terminationGracePeriodSeconds: 35
       nodeSelector:
         kubernetes.io/hostname: rpi5
       securityContext:

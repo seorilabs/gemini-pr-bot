@@ -117,6 +117,53 @@ const server = createServer(async (req, res) => {
 
 setInterval(() => deliveries.deleteExpired(), Math.min(config.deliveryTtlMs, 60_000)).unref();
 
+let shuttingDown = false;
+
+function closeServer(): Promise<void> {
+  return new Promise((resolve) => {
+    server.close((error) => {
+      if (error) {
+        logger.warn({ error }, "HTTP server close returned an error");
+      }
+      resolve();
+    });
+    server.closeIdleConnections?.();
+  });
+}
+
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+  logger.warn({ signal }, "shutdown signal received");
+
+  const forceExitTimer = setTimeout(() => {
+    logger.error({ signal }, "shutdown grace period exceeded");
+    server.closeAllConnections?.();
+    process.exit(1);
+  }, config.shutdownGraceMs).unref();
+
+  try {
+    await Promise.all([closeServer(), bot.shutdown(signal)]);
+    clearTimeout(forceExitTimer);
+    process.exit(0);
+  } catch (error) {
+    clearTimeout(forceExitTimer);
+    logger.error({ error, signal }, "shutdown failed");
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
+
+process.on("SIGINT", () => {
+  void shutdown("SIGINT");
+});
+
 server.listen(config.port, () => {
   logger.info(
     {

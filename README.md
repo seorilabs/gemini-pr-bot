@@ -21,6 +21,7 @@ flowchart LR
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Gemini PR Bot` check run for review and agent jobs.
+- Cancels in-progress `Gemini PR Bot` check runs during pod shutdown so rollout/restart does not leave stale pending checks.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default.
 
