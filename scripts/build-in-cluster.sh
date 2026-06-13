@@ -12,6 +12,21 @@ job_name="build-gemini-pr-bot-${safe_tag}"
 context_configmap="${job_name}-context"
 tmpdir=$(mktemp -d)
 context_tgz="${tmpdir}/context.tgz"
+job_yaml="${tmpdir}/job.yaml"
+
+retry() {
+  for attempt in 1 2 3 4 5; do
+    if "$@"; then
+      return 0
+    fi
+
+    sleep_seconds=$((attempt * 3))
+    echo "command failed; retrying in ${sleep_seconds}s (${attempt}/5): $*" >&2
+    sleep "${sleep_seconds}"
+  done
+
+  "$@"
+}
 
 cleanup() {
   rm -rf "${tmpdir}"
@@ -25,11 +40,11 @@ fi
 
 git archive --format=tar HEAD | gzip -9 >"${context_tgz}"
 
-kubectl -n "${namespace}" delete job "${job_name}" --ignore-not-found
-kubectl -n "${namespace}" delete configmap "${context_configmap}" --ignore-not-found
-kubectl -n "${namespace}" create configmap "${context_configmap}" --from-file=context.tgz="${context_tgz}"
+retry kubectl -n "${namespace}" delete job "${job_name}" --ignore-not-found
+retry kubectl -n "${namespace}" delete configmap "${context_configmap}" --ignore-not-found
+retry kubectl -n "${namespace}" create configmap "${context_configmap}" --from-file=context.tgz="${context_tgz}"
 
-cat <<YAML | kubectl apply -f -
+cat >"${job_yaml}" <<YAML
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -99,6 +114,8 @@ spec:
                 path: config.json
 YAML
 
+retry kubectl apply -f "${job_yaml}"
+
 if ! kubectl -n "${namespace}" wait --for=condition=complete "job/${job_name}" --timeout="${timeout}"; then
   kubectl -n "${namespace}" describe "job/${job_name}" || true
   kubectl -n "${namespace}" logs "job/${job_name}" -c unpack-context --tail=-1 || true
@@ -108,4 +125,3 @@ fi
 
 kubectl -n "${namespace}" logs "job/${job_name}" -c kaniko --tail=80
 echo "Pushed ${image}:${tag} and ${image}:latest"
-
