@@ -46,6 +46,14 @@ kubectl apply -k k8s
 kubectl -n apps rollout status deployment/gemini-pr-bot
 ```
 
+If the local machine does not have Docker, build and push from the cluster with Kaniko:
+
+```bash
+./scripts/build-in-cluster.sh
+kubectl apply -k k8s
+kubectl -n apps rollout status deployment/gemini-pr-bot
+```
+
 Webhook endpoint:
 
 ```text
@@ -59,4 +67,3 @@ cp .env.example .env
 npm ci
 npm run dev
 ```
-
