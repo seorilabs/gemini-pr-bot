@@ -5,20 +5,23 @@ import {
   buildPullRequestContext,
   completeCheck,
   createInProgressCheck,
-  getPullRequestHeadSha,
+  getPullRequestStatus,
   isPullRequestIssue,
   isTrustedAssociation,
   postPrComment,
   postReviewCommentReply,
+  requestChangesPullRequest,
   repoFromPayload,
   shouldHandleRepository,
   type PullRequestContext,
+  type PullRequestStatus,
   type RepoRef,
   type ReviewTrigger,
 } from "./github.js";
 import { parseBotCommand } from "./text.js";
 
 const NO_ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=no-action-required";
+const MERGE_CONFLICT_MARKER = "seorilabs-gemini-pr-bot:status=merge-conflict";
 const AGENT_APPROVE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=approve -->";
 const AGENT_COMMENT_MARKER = "<!-- seorilabs-gemini-pr-bot:action=comment -->";
 
@@ -108,13 +111,12 @@ export class PrBot {
     }
 
     if (command.mode === "approve") {
-      const headSha = await getPullRequestHeadSha(octokit, repo, issueNumber);
-      await approvePullRequest(
+      await this.runApprove(
         octokit,
         repo,
         issueNumber,
-        this.approvalText(payload.sender.login, command.request, headSha),
-        headSha,
+        payload.sender.login,
+        command.request,
       );
       return;
     }
@@ -161,13 +163,12 @@ export class PrBot {
     }
 
     if (command.mode === "approve") {
-      const headSha = await getPullRequestHeadSha(octokit, repo, prNumber);
-      await approvePullRequest(
+      await this.runApprove(
         octokit,
         repo,
         prNumber,
-        this.approvalText(payload.sender.login, command.request, headSha),
-        headSha,
+        payload.sender.login,
+        command.request,
       );
       return;
     }
@@ -219,13 +220,12 @@ export class PrBot {
     }
 
     if (command.mode === "approve") {
-      const headSha = await getPullRequestHeadSha(octokit, repo, prNumber);
-      await approvePullRequest(
+      await this.runApprove(
         octokit,
         repo,
         prNumber,
-        this.approvalText(payload.sender.login, command.request, headSha),
-        headSha,
+        payload.sender.login,
+        command.request,
       );
       return;
     }
@@ -276,8 +276,22 @@ export class PrBot {
     const checkRunId = await createInProgressCheck(octokit, repo, context.headSha);
 
     try {
+      if (this.hasMergeConflict(context)) {
+        const conflictText = this.mergeConflictText(repo, prNumber, context);
+        await requestChangesPullRequest(octokit, repo, prNumber, conflictText, context.headSha);
+        await completeCheck(
+          octokit,
+          repo,
+          checkRunId,
+          "action_required",
+          "Merge conflict requires resolution",
+          conflictText,
+        );
+        return;
+      }
+
       const reviewText = await this.createReviewTextFromContext(context, trigger);
-      if (this.shouldApproveReviewText(reviewText)) {
+      if (this.shouldApproveReviewText(reviewText, context)) {
         await approvePullRequest(
           octokit,
           repo,
@@ -310,10 +324,24 @@ export class PrBot {
     const checkRunId = await createInProgressCheck(octokit, repo, context.headSha);
 
     try {
+      if (this.hasMergeConflict(context)) {
+        const conflictText = this.mergeConflictText(repo, prNumber, context);
+        await requestChangesPullRequest(octokit, repo, prNumber, conflictText, context.headSha);
+        await completeCheck(
+          octokit,
+          repo,
+          checkRunId,
+          "action_required",
+          "Merge conflict requires resolution",
+          conflictText,
+        );
+        return;
+      }
+
       const agentText = await this.createAgentTextFromContext(context, request, trigger);
       const publicText = this.publicAgentText(agentText);
 
-      if (this.shouldApproveAgentText(agentText)) {
+      if (this.shouldApproveAgentText(agentText, context)) {
         await approvePullRequest(
           octokit,
           repo,
@@ -357,6 +385,10 @@ export class PrBot {
     trigger: ReviewTrigger,
   ): Promise<string> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
+    if (this.hasMergeConflict(context)) {
+      return this.mergeConflictText(repo, prNumber, context);
+    }
+
     return this.createReviewTextFromContext(context, trigger);
   }
 
@@ -380,6 +412,7 @@ export class PrBot {
       "- Keep code quotes short: quote identifiers or a minimal expression only when useful.",
       "- If a Mermaid diagram helps explain a bug path, state machine, or architecture flow, include one compact diagram.",
       "- If the PR conversation contains the marker `seorilabs-gemini-pr-bot:status=no-action-required`, treat it as a prior human/agent approval signal. Prefer markers whose recorded HEAD SHA matches the current PR Head SHA. Still review if this request explicitly asks for `/review`, but avoid reopening already-settled issues unless the new diff contradicts the marker.",
+      "- If GitHub mergeable is `false` or mergeable_state is `dirty`/`conflicting`, treat the merge conflict as a blocking finding. Do not write `No actionable findings.`; include concrete conflict-resolution steps.",
       "",
       "Severity guide:",
       "- Critical: data loss, security exposure, crash on common path, or broken release path.",
@@ -430,6 +463,7 @@ export class PrBot {
       "- If the user says fixes were applied, thanks after addressing review feedback, asks for another look, or asks whether anything remains, perform a review-quality assessment.",
       "- Choose approve only when the supplied diff and conversation show no actionable findings remain.",
       "- Never approve if any correctness, runtime, security, data loss, regression, required validation, or required test concern remains.",
+      "- Never approve if GitHub mergeable is `false` or mergeable_state is `dirty`/`conflicting`; choose comment and give conflict-resolution steps.",
       "- CI failures do not automatically block approval when the conversation clearly identifies them as infrastructure-only, but mention that status under Verification.",
       "- If evidence is insufficient, choose comment and state exactly what is missing.",
       "- If prior comments contain `seorilabs-gemini-pr-bot:status=no-action-required`, prefer markers whose recorded HEAD SHA matches the current PR Head SHA.",
@@ -493,6 +527,34 @@ export class PrBot {
     return this.gemini.answer(prompt);
   }
 
+  private async runApprove(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    sender: string,
+    reason: string,
+  ): Promise<void> {
+    const status = await getPullRequestStatus(octokit, repo, prNumber);
+    if (this.hasMergeConflict(status)) {
+      await requestChangesPullRequest(
+        octokit,
+        repo,
+        prNumber,
+        this.mergeConflictText(repo, prNumber, status),
+        status.headSha,
+      );
+      return;
+    }
+
+    await approvePullRequest(
+      octokit,
+      repo,
+      prNumber,
+      this.approvalText(sender, reason, status.headSha),
+      status.headSha,
+    );
+  }
+
   private helpText(): string {
     return [
       "사용 가능한 명령:",
@@ -522,12 +584,56 @@ export class PrBot {
     ].filter((line): line is string => line !== undefined).join("\n");
   }
 
-  private shouldApproveAgentText(text: string): boolean {
-    return text.includes(AGENT_APPROVE_MARKER) && /\bNo actionable findings\./iu.test(text);
+  private mergeConflictText(repo: RepoRef, prNumber: number, status: PullRequestStatus): string {
+    return [
+      `<!-- ${MERGE_CONFLICT_MARKER} head=${status.headSha} -->`,
+      "## Merge Conflict",
+      "",
+      "GitHub reports that this PR cannot currently be merged cleanly.",
+      "",
+      `- PR: \`${repo.fullName}#${prNumber}\``,
+      `- Base: \`${status.baseRepoFullName}:${status.baseRef}\``,
+      `- Head: \`${status.headRepoFullName}:${status.headRef}\``,
+      `- Head SHA: \`${status.headSha}\``,
+      `- GitHub mergeable: \`${status.mergeable ?? "unknown"}\``,
+      `- GitHub mergeable_state: \`${status.mergeableState}\``,
+      "",
+      "### Suggested Action",
+      "",
+      "```bash",
+      `gh pr checkout ${prNumber} -R ${repo.fullName}`,
+      `git fetch origin ${status.baseRef}`,
+      `git merge origin/${status.baseRef}`,
+      "# resolve conflict markers in the files Git reports",
+      "git status",
+      "git add <resolved-files>",
+      "git commit",
+      "git push",
+      "```",
+      "",
+      "```mermaid",
+      "flowchart TD",
+      "  A[\"Checkout PR branch\"] --> B[\"Merge latest base branch\"]",
+      "  B --> C[\"Resolve conflict markers\"]",
+      "  C --> D[\"Run repo checks\"]",
+      "  D --> E[\"Commit and push\"]",
+      "  E --> F[\"Ask Gemini to review again\"]",
+      "```",
+      "",
+      "No approval was submitted. Resolve the merge conflict first, then request another review.",
+    ].join("\n");
   }
 
-  private shouldApproveReviewText(text: string): boolean {
-    return /\bNo actionable findings\./iu.test(text);
+  private hasMergeConflict(status: PullRequestStatus): boolean {
+    return status.mergeable === false || ["dirty", "conflicting"].includes(status.mergeableState.toLowerCase());
+  }
+
+  private shouldApproveAgentText(text: string, status: PullRequestStatus): boolean {
+    return !this.hasMergeConflict(status) && text.includes(AGENT_APPROVE_MARKER) && /\bNo actionable findings\./iu.test(text);
+  }
+
+  private shouldApproveReviewText(text: string, status: PullRequestStatus): boolean {
+    return !this.hasMergeConflict(status) && /\bNo actionable findings\./iu.test(text);
   }
 
   private publicAgentText(text: string): string {

@@ -16,9 +16,19 @@ export type ReviewTrigger = {
   request?: string;
 };
 
-export type PullRequestContext = {
+export type PullRequestStatus = {
   headSha: string;
   title: string;
+  draft: boolean;
+  mergeable: boolean | null;
+  mergeableState: string;
+  baseRef: string;
+  headRef: string;
+  baseRepoFullName: string;
+  headRepoFullName: string;
+};
+
+export type PullRequestContext = PullRequestStatus & {
   markdown: string;
 };
 
@@ -62,16 +72,63 @@ export async function getPullRequestHeadSha(
   repo: RepoRef,
   prNumber: number,
 ): Promise<string> {
-  const { data: pr } = await octokit.rest.pulls.get({
-    owner: repo.owner,
-    repo: repo.repo,
-    pull_number: prNumber,
-  });
-  return pr.head.sha;
+  return (await getPullRequestStatus(octokit, repo, prNumber)).headSha;
+}
+
+export async function getPullRequestStatus(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+): Promise<PullRequestStatus> {
+  const pr = await getPullRequestWithMergeability(octokit, repo, prNumber);
+  return {
+    headSha: pr.head.sha,
+    title: pr.title,
+    draft: Boolean(pr.draft),
+    mergeable: pr.mergeable ?? null,
+    mergeableState: String(pr.mergeable_state || "unknown"),
+    baseRef: pr.base.ref,
+    headRef: pr.head.ref,
+    baseRepoFullName: pr.base.repo?.full_name || repo.fullName,
+    headRepoFullName: pr.head.repo?.full_name || repo.fullName,
+  };
 }
 
 async function paginate(octokit: Octokit, method: any, params: Record<string, unknown>) {
   return octokit.paginate(method, params);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function getPullRequestWithMergeability(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+): Promise<any> {
+  let latest: any;
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const { data: pr } = await octokit.rest.pulls.get({
+      owner: repo.owner,
+      repo: repo.repo,
+      pull_number: prNumber,
+    });
+    latest = pr;
+
+    if (pr.mergeable !== null && pr.mergeable !== undefined) {
+      return pr;
+    }
+
+    if (attempt < 3) {
+      await delay(1_000);
+    }
+  }
+
+  return latest;
 }
 
 export async function buildPullRequestContext(
@@ -80,11 +137,7 @@ export async function buildPullRequestContext(
   prNumber: number,
   config: Config,
 ): Promise<PullRequestContext> {
-  const { data: pr } = await octokit.rest.pulls.get({
-    owner: repo.owner,
-    repo: repo.repo,
-    pull_number: prNumber,
-  });
+  const pr = await getPullRequestWithMergeability(octokit, repo, prNumber);
 
   const [files, commits, issueComments, reviewComments] = await Promise.all([
     paginate(octokit, octokit.rest.pulls.listFiles, {
@@ -158,9 +211,12 @@ export async function buildPullRequestContext(
     `Pull request: #${prNumber}`,
     `Title: ${pr.title}`,
     `Author: ${pr.user?.login || "unknown"}`,
-    `Base: ${pr.base.ref}`,
-    `Head: ${pr.head.ref}`,
+    `Draft: ${Boolean(pr.draft)}`,
+    `Base: ${pr.base.repo?.full_name || repo.fullName}:${pr.base.ref}`,
+    `Head: ${pr.head.repo?.full_name || repo.fullName}:${pr.head.ref}`,
     `Head SHA: ${pr.head.sha}`,
+    `GitHub mergeable: ${pr.mergeable ?? "unknown"}`,
+    `GitHub mergeable_state: ${pr.mergeable_state || "unknown"}`,
     "",
     "## PR Body",
     pr.body || "(empty)",
@@ -182,6 +238,13 @@ export async function buildPullRequestContext(
   return {
     headSha: pr.head.sha,
     title: pr.title,
+    draft: Boolean(pr.draft),
+    mergeable: pr.mergeable ?? null,
+    mergeableState: String(pr.mergeable_state || "unknown"),
+    baseRef: pr.base.ref,
+    headRef: pr.head.ref,
+    baseRepoFullName: pr.base.repo?.full_name || repo.fullName,
+    headRepoFullName: pr.head.repo?.full_name || repo.fullName,
     markdown: truncate(markdown, config.maxContextChars),
   };
 }
@@ -214,7 +277,7 @@ export async function completeCheck(
   octokit: Octokit,
   repo: RepoRef,
   checkRunId: number | null,
-  conclusion: "success" | "failure",
+  conclusion: "success" | "failure" | "action_required",
   title: string,
   summary: string,
 ): Promise<void> {
@@ -249,6 +312,23 @@ export async function approvePullRequest(
     pull_number: prNumber,
     commit_id: headSha,
     event: "APPROVE",
+    body: githubCommentBody(body),
+  });
+}
+
+export async function requestChangesPullRequest(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+  body: string,
+  headSha: string,
+): Promise<void> {
+  await octokit.rest.pulls.createReview({
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: prNumber,
+    commit_id: headSha,
+    event: "REQUEST_CHANGES",
     body: githubCommentBody(body),
   });
 }

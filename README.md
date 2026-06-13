@@ -18,6 +18,7 @@ flowchart LR
 - Runs explicit review on `@gemini-cli /review`; if there are no actionable findings, it submits an approval review instead of only commenting.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]`.
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
+- Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Gemini PR Bot` check run for review and agent jobs.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
@@ -47,7 +48,9 @@ Other review agents should treat the latest non-stale Gemini approval as "no fur
 ```mermaid
 flowchart TD
   Review["/review or PR opened"] --> Context["Build PR context"]
-  Context --> Gemini["Gemini strict review prompt"]
+  Context --> Conflict{"Merge conflict?"}
+  Conflict -->|Yes| RequestChanges["REQUEST_CHANGES review with resolution steps"]
+  Conflict -->|No| Gemini["Gemini strict review prompt"]
   Gemini --> Decision{"Actionable findings?"}
   Decision -->|Yes| Output["Post findings comment + check run"]
   Decision -->|No| Approval["GitHub APPROVE review with HEAD marker"]
