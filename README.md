@@ -25,15 +25,15 @@ flowchart LR
 
 Create an organization-owned GitHub App using [docs/github-app-settings.md](docs/github-app-settings.md).
 
-Then create the K8s secret:
+Then create the K8s secrets.
 
 ```bash
 export GITHUB_APP_ID="..."
 export GITHUB_PRIVATE_KEY_FILE="/path/to/seorilabs-gemini-pr-bot.private-key.pem"
 export GITHUB_WEBHOOK_SECRET="..."
-export GEMINI_API_KEY="..."
 
 ./scripts/create-k8s-secret.sh
+./scripts/create-gemini-cli-oauth-secret.sh
 ```
 
 ## Build And Deploy

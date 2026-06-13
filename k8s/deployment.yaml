@@ -15,12 +15,44 @@ spec:
       labels:
         app.kubernetes.io/name: gemini-pr-bot
     spec:
+      securityContext:
+        fsGroup: 10001
       imagePullSecrets:
         - name: registry-pull-cred
+      initContainers:
+        - name: prepare-gemini-home
+          image: busybox:1.37.0
+          command:
+            - sh
+            - -c
+          args:
+            - |
+              set -eu
+              mkdir -p /gemini-home/.gemini
+              cp /gemini-cli-secret/oauth_creds.json /gemini-home/.gemini/oauth_creds.json
+              cp /gemini-cli-secret/google_accounts.json /gemini-home/.gemini/google_accounts.json
+              cp /gemini-cli-secret/settings.json /gemini-home/.gemini/settings.json
+              chown -R 10001:10001 /gemini-home
+              chmod 700 /gemini-home/.gemini
+              chmod 600 /gemini-home/.gemini/*
+          volumeMounts:
+            - name: gemini-home
+              mountPath: /gemini-home
+            - name: gemini-cli-secret
+              mountPath: /gemini-cli-secret
+              readOnly: true
       containers:
         - name: gemini-pr-bot
           image: registry.vzyx.xyz/seorilabs/gemini-pr-bot:latest
           imagePullPolicy: Always
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: http
               containerPort: 3000
@@ -29,8 +61,12 @@ spec:
               value: "3000"
             - name: GITHUB_ORG
               value: seorilabs
-            - name: GEMINI_MODEL
-              value: gemini-2.5-flash
+            - name: GEMINI_PROVIDER
+              value: cli
+            - name: GEMINI_CLI_COMMAND
+              value: /app/node_modules/.bin/gemini
+            - name: HOME
+              value: /home/app
             - name: BOT_MENTIONS
               value: "@gemini-cli,@gemini"
             - name: TRUSTED_ASSOCIATIONS
@@ -58,11 +94,6 @@ spec:
                 secretKeyRef:
                   name: gemini-pr-bot-secrets
                   key: GITHUB_WEBHOOK_SECRET
-            - name: GEMINI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: gemini-pr-bot-secrets
-                  key: GEMINI_API_KEY
           readinessProbe:
             httpGet:
               path: /readyz
@@ -82,12 +113,26 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop:
-                - ALL
+          volumeMounts:
+            - name: gemini-home
+              mountPath: /home/app
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: gemini-home
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: gemini-cli-secret
+          secret:
+            secretName: gemini-pr-bot-cli-oauth
+            items:
+              - key: oauth_creds.json
+                path: oauth_creds.json
+              - key: google_accounts.json
+                path: google_accounts.json
+              - key: settings.json
+                path: settings.json
 ---
 apiVersion: v1
 kind: Service
@@ -129,4 +174,3 @@ spec:
                 name: gemini-pr-bot
                 port:
                   name: http
-

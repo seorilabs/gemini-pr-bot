@@ -4,8 +4,11 @@ export type Config = {
   githubPrivateKey: string;
   githubWebhookSecret: string;
   githubOrg: string;
-  geminiApiKey: string;
-  geminiModel: string;
+  geminiProvider: "api" | "cli";
+  geminiApiKey?: string;
+  geminiModel?: string;
+  geminiCliCommand: string;
+  geminiCliTimeoutMs: number;
   botMentions: string[];
   trustedAssociations: Set<string>;
   allowPublicRepos: boolean;
@@ -59,6 +62,15 @@ function optionalList(name: string, fallback: string[]): string[] {
 
 export function loadConfig(): Config {
   const privateKey = requiredEnv("GITHUB_PRIVATE_KEY").replace(/\\n/g, "\n");
+  const geminiProvider = (process.env.GEMINI_PROVIDER?.trim() || "api").toLowerCase();
+  if (!["api", "cli"].includes(geminiProvider)) {
+    throw new Error("GEMINI_PROVIDER must be either 'api' or 'cli'");
+  }
+
+  const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
+  if (geminiProvider === "api" && !geminiApiKey) {
+    throw new Error("Missing required environment variable: GEMINI_API_KEY");
+  }
 
   return {
     port: optionalInt("PORT", 3000),
@@ -66,8 +78,11 @@ export function loadConfig(): Config {
     githubPrivateKey: privateKey,
     githubWebhookSecret: requiredEnv("GITHUB_WEBHOOK_SECRET"),
     githubOrg: process.env.GITHUB_ORG?.trim() || "seorilabs",
-    geminiApiKey: requiredEnv("GEMINI_API_KEY"),
-    geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash",
+    geminiProvider: geminiProvider as "api" | "cli",
+    geminiApiKey,
+    geminiModel: process.env.GEMINI_MODEL?.trim(),
+    geminiCliCommand: process.env.GEMINI_CLI_COMMAND?.trim() || "/app/node_modules/.bin/gemini",
+    geminiCliTimeoutMs: optionalInt("GEMINI_CLI_TIMEOUT_MS", 180_000),
     botMentions: optionalList("BOT_MENTIONS", ["@gemini-cli", "@gemini"]).sort(
       (left, right) => right.length - left.length,
     ),
@@ -85,4 +100,3 @@ export function loadConfig(): Config {
     maxContextChars: optionalInt("MAX_CONTEXT_CHARS", 160_000),
   };
 }
-

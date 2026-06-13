@@ -122,7 +122,8 @@ server.listen(config.port, () => {
     {
       port: config.port,
       org: config.githubOrg,
-      model: config.geminiModel,
+      provider: config.geminiProvider,
+      model: config.geminiModel || "default",
       allowPublicRepos: config.allowPublicRepos,
       autoReviewOnOpen: config.autoReviewOnOpen,
       autoReviewOnSynchronize: config.autoReviewOnSynchronize,

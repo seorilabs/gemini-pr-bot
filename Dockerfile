@@ -12,11 +12,10 @@ FROM node:24.16.0-alpine AS runtime
 ENV NODE_ENV=production
 ENV PORT=3000
 WORKDIR /app
-RUN addgroup -S app && adduser -S app -G app
+RUN addgroup -S -g 10001 app && adduser -S -u 10001 -G app app
 COPY --from=build /app/package*.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 USER app
 EXPOSE 3000
 CMD ["node", "dist/index.js"]
-
