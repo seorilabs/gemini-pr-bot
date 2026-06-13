@@ -19,6 +19,12 @@ import {
 import { parseBotCommand } from "./text.js";
 
 const NO_ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=no-action-required";
+const AGENT_APPROVE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=approve -->";
+const AGENT_COMMENT_MARKER = "<!-- seorilabs-gemini-pr-bot:action=comment -->";
+
+type AgentReplyTarget =
+  | { type: "pr_comment" }
+  | { type: "review_comment"; commentId: number };
 
 type Logger = {
   info: (value: unknown, message?: string) => void;
@@ -122,6 +128,14 @@ export class PrBot {
       return;
     }
 
+    if (command.mode === "agent") {
+      await this.runAgent(octokit, repo, issueNumber, command.request, {
+        source: "issue_comment",
+        sender: payload.sender.login,
+      }, { type: "pr_comment" });
+      return;
+    }
+
     await this.runAnswer(octokit, repo, issueNumber, command.request, {
       source: "issue_comment",
       sender: payload.sender.login,
@@ -155,6 +169,14 @@ export class PrBot {
         this.approvalText(payload.sender.login, command.request, headSha),
         headSha,
       );
+      return;
+    }
+
+    if (command.mode === "agent") {
+      await this.runAgent(octokit, repo, prNumber, command.request, {
+        source: "review_comment",
+        sender: payload.sender.login,
+      }, { type: "review_comment", commentId: payload.comment.id });
       return;
     }
 
@@ -208,6 +230,14 @@ export class PrBot {
       return;
     }
 
+    if (command.mode === "agent") {
+      await this.runAgent(octokit, repo, prNumber, command.request, {
+        source: "pull_request_review",
+        sender: payload.sender.login,
+      }, { type: "pr_comment" });
+      return;
+    }
+
     await this.runAnswer(octokit, repo, prNumber, command.request, {
       source: "pull_request_review",
       sender: payload.sender.login,
@@ -252,6 +282,47 @@ export class PrBot {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await completeCheck(octokit, repo, checkRunId, "failure", "Gemini review failed", message);
+      throw error;
+    }
+  }
+
+  private async runAgent(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    request: string,
+    trigger: ReviewTrigger,
+    target: AgentReplyTarget,
+  ): Promise<void> {
+    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
+    const checkRunId = await createInProgressCheck(octokit, repo, context.headSha);
+
+    try {
+      const agentText = await this.createAgentTextFromContext(context, request, trigger);
+      const publicText = this.publicAgentText(agentText);
+
+      if (this.shouldApproveAgentText(agentText)) {
+        await approvePullRequest(
+          octokit,
+          repo,
+          prNumber,
+          this.approvalText(trigger.sender, "Agent mention analysis found no actionable findings.", context.headSha, publicText),
+          context.headSha,
+        );
+        await completeCheck(octokit, repo, checkRunId, "success", "Gemini agent approved PR", publicText);
+        return;
+      }
+
+      if (target.type === "review_comment") {
+        await postReviewCommentReply(octokit, repo, prNumber, target.commentId, publicText);
+      } else {
+        await postPrComment(octokit, repo, prNumber, publicText);
+      }
+
+      await completeCheck(octokit, repo, checkRunId, "success", "Gemini agent commented", publicText);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await completeCheck(octokit, repo, checkRunId, "failure", "Gemini agent failed", message);
       throw error;
     }
   }
@@ -330,6 +401,63 @@ export class PrBot {
     return this.gemini.review(prompt);
   }
 
+  private async createAgentTextFromContext(
+    context: PullRequestContext,
+    request: string,
+    trigger: ReviewTrigger,
+  ): Promise<string> {
+    const prompt = [
+      "Analyze the pull request mention and choose the next agent action.",
+      "",
+      "Possible actions:",
+      "- comment: answer, explain, ask for clarification, or report actionable findings.",
+      "- approve: submit an approval review because the PR has no actionable findings remaining.",
+      "",
+      "Decision rules:",
+      "- If the user asks a direct question, answer it and choose comment unless the same message clearly asks for readiness or approval.",
+      "- If the user says fixes were applied, thanks after addressing review feedback, asks for another look, or asks whether anything remains, perform a review-quality assessment.",
+      "- Choose approve only when the supplied diff and conversation show no actionable findings remain.",
+      "- Never approve if any correctness, runtime, security, data loss, regression, required validation, or required test concern remains.",
+      "- CI failures do not automatically block approval when the conversation clearly identifies them as infrastructure-only, but mention that status under Verification.",
+      "- If evidence is insufficient, choose comment and state exactly what is missing.",
+      "- If prior comments contain `seorilabs-gemini-pr-bot:status=no-action-required`, prefer markers whose recorded HEAD SHA matches the current PR Head SHA.",
+      "",
+      "Output contract:",
+      "- Include exactly one hidden action marker as the first non-empty line:",
+      `  ${AGENT_APPROVE_MARKER}`,
+      `  ${AGENT_COMMENT_MARKER}`,
+      "- If action is approve, the Findings section must contain exactly: `No actionable findings.`",
+      "- If action is comment because findings remain, list findings first, ordered by severity.",
+      "",
+      "Output format:",
+      "## Gemini Agent",
+      "",
+      "### Decision",
+      "- `approve` or `comment`, with one short reason.",
+      "",
+      "### Findings",
+      "- `[Severity] file_or_symbol`: impact and evidence. Suggested fix.",
+      "",
+      "If there are no actionable findings, write exactly:",
+      "### Findings",
+      "No actionable findings.",
+      "",
+      "### Verification",
+      "- Only include concrete checks useful for this PR.",
+      "",
+      "### Coordination",
+      "- State whether further agent action is needed.",
+      "",
+      `Trigger: ${trigger.source}`,
+      `Requested by: ${trigger.sender}`,
+      `User request: ${request}`,
+      "",
+      context.markdown,
+    ].join("\n");
+
+    return this.gemini.agent(prompt);
+  }
+
   private async createAnswerText(
     octokit: Octokit,
     repo: RepoRef,
@@ -359,12 +487,12 @@ export class PrBot {
       "",
       "- `@gemini-cli /review`: 현재 PR을 리뷰합니다.",
       "- `@gemini-cli /approve [사유]`: GitHub approval review와 agent coordination marker를 남깁니다.",
-      "- `@gemini-cli 질문`: PR 맥락을 보고 질문에 답합니다.",
-      "- inline review comment에서 `@gemini-cli 질문`: 해당 review comment에 답글로 응답합니다.",
+      "- `@gemini-cli 질문`: PR 맥락을 분석하고 comment 또는 approve를 결정합니다.",
+      "- inline review comment에서 `@gemini-cli 질문`: 해당 review comment 맥락으로 답하거나 PR을 approve합니다.",
     ].join("\n");
   }
 
-  private approvalText(sender: string, reason: string, headSha: string): string {
+  private approvalText(sender: string, reason: string, headSha: string, analysis?: string): string {
     return [
       `<!-- ${NO_ACTION_REQUIRED_MARKER} head=${headSha} -->`,
       "## Agent Coordination",
@@ -376,6 +504,21 @@ export class PrBot {
       "No further agent action required unless new commits arrive or a maintainer explicitly requests another review.",
       "",
       "Note: stale approval dismissal depends on the repository branch protection setting.",
-    ].join("\n");
+      analysis ? "" : undefined,
+      analysis ? "## Agent Analysis" : undefined,
+      analysis || undefined,
+    ].filter((line): line is string => line !== undefined).join("\n");
+  }
+
+  private shouldApproveAgentText(text: string): boolean {
+    return text.includes(AGENT_APPROVE_MARKER) && /\bNo actionable findings\./iu.test(text);
+  }
+
+  private publicAgentText(text: string): string {
+    return text
+      .split("\n")
+      .filter((line) => line.trim() !== AGENT_APPROVE_MARKER && line.trim() !== AGENT_COMMENT_MARKER)
+      .join("\n")
+      .trim();
   }
 }

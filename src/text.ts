@@ -2,7 +2,7 @@ import type { Config } from "./config.js";
 
 export type BotCommand = {
   mention: string;
-  mode: "review" | "chat" | "help" | "approve";
+  mode: "review" | "chat" | "help" | "approve" | "agent";
   request: string;
 };
 
@@ -46,8 +46,8 @@ function parseRequest(mention: string, rawRequest: string): BotCommand {
 
   return {
     mention,
-    mode: "chat",
-    request: rawRequest || "이 PR의 현재 맥락을 보고 도움이 될 만한 답변을 짧게 작성해줘.",
+    mode: "agent",
+    request: rawRequest || "이 PR의 현재 맥락을 분석하고 다음 에이전트 행동을 결정해줘.",
   };
 }
 

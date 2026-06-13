@@ -17,8 +17,9 @@ flowchart LR
 - Responds to PR comments containing `@gemini-cli` or `@gemini`.
 - Runs explicit review on `@gemini-cli /review`.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]`.
+- Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
 - Replies directly to inline review comments when mentioned there.
-- Creates a `Gemini PR Bot` check run for review jobs.
+- Creates a `Gemini PR Bot` check run for review and agent jobs.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default.
 
@@ -32,6 +33,7 @@ flowchart LR
 /gemini approve [reason]
 @gemini-cli /help
 @gemini-cli <question>
+@seorilabs-gemini-pr-bot <question or handoff>
 ```
 
 `/approve` submits a real GitHub approval review for the current PR HEAD. The approval review body includes a hidden coordination marker:
@@ -53,6 +55,19 @@ flowchart TD
   Agent -->|Approval current| Stop["No further agent action"]
   Agent -->|New commit or stale approval| Review
 ```
+
+Normal mentions use agent mode. The bot asks Gemini to choose one action:
+
+```mermaid
+flowchart TD
+  Mention["Bot mentioned"] --> Context["Build PR context"]
+  Context --> Decide["Gemini agent decision"]
+  Decide -->|Action: comment| Comment["Post PR comment or inline reply"]
+  Decide -->|Action: approve + no actionable findings| Approval["Submit GitHub APPROVE review"]
+  Decide --> Check["Complete Gemini PR Bot check"]
+```
+
+Approval from agent mode is guarded: the model output must include the approval action marker and the exact `No actionable findings.` finding result. Otherwise the bot only comments.
 
 ## Required Secrets
 
