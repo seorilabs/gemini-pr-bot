@@ -21,6 +21,12 @@ else
   printf '{}\n' >"${build_docker_config}/config.json"
 fi
 
+for docker_state_dir in cli-plugins buildx contexts; do
+  if [[ -d "${source_docker_config}/${docker_state_dir}" ]]; then
+    ln -s "${source_docker_config}/${docker_state_dir}" "${build_docker_config}/${docker_state_dir}"
+  fi
+done
+
 node -e '
 const fs = require("node:fs");
 const path = process.argv[1];
