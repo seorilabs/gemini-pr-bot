@@ -530,7 +530,7 @@ export class PrBot {
         }
 
         const conflictText = this.mergeConflictText(repo, prNumber, latest);
-        if (this.shuttingDown) {
+        if (await this.cancelTrackedCheckIfShuttingDown(check, "리뷰 취소", "병합 충돌 리뷰를 게시하기 전에 봇이 중지되었습니다.")) {
           return;
         }
 
@@ -545,7 +545,7 @@ export class PrBot {
       }
 
       const reviewText = await this.createReviewTextFromContext(context, trigger);
-      if (this.shuttingDown) {
+      if (await this.cancelTrackedCheckIfShuttingDown(check, "리뷰 취소", "리뷰 결과를 게시하기 전에 봇이 중지되었습니다.")) {
         return;
       }
       const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
@@ -634,7 +634,7 @@ export class PrBot {
               options,
             )
           : this.mergeConflictText(repo, prNumber, latest);
-        if (this.shuttingDown) {
+        if (await this.cancelTrackedCheckIfShuttingDown(check, "에이전트 응답 취소", "병합 충돌 응답을 게시하기 전에 봇이 중지되었습니다.")) {
           return;
         }
 
@@ -650,7 +650,7 @@ export class PrBot {
 
       const agentText = await this.createAgentTextFromContext(context, request, trigger);
       const publicText = this.publicAgentText(agentText);
-      if (this.shuttingDown) {
+      if (await this.cancelTrackedCheckIfShuttingDown(check, "에이전트 응답 취소", "에이전트 응답을 게시하기 전에 봇이 중지되었습니다.")) {
         return;
       }
       const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
@@ -766,6 +766,19 @@ export class PrBot {
     } finally {
       this.activeChecks.delete(check.key);
     }
+  }
+
+  private async cancelTrackedCheckIfShuttingDown(
+    check: ActiveCheckRun | null,
+    title: string,
+    summary: string,
+  ): Promise<boolean> {
+    if (!this.shuttingDown) {
+      return false;
+    }
+
+    await this.completeTrackedCheck(check, "cancelled", title, summary);
+    return true;
   }
 
   private async runAnswer(
