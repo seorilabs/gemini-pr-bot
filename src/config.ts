@@ -55,6 +55,10 @@ export type Config = {
   maxWebhookBodyBytes: number;
   maxPatchChars: number;
   maxContextChars: number;
+  deepRepoContextMode: "off" | "auto" | "always";
+  deepRepoContextTimeoutMs: number;
+  deepRepoContextMaxFiles: number;
+  deepRepoContextMaxBytes: number;
 };
 
 function requiredEnv(name: string): string {
@@ -99,6 +103,17 @@ function optionalList(name: string, fallback: string[]): string[] {
 
 function optionalRepositorySet(name: string, fallback: string[]): Set<string> {
   return new Set(optionalList(name, fallback).map((item) => item.toLowerCase()));
+}
+
+function optionalChoice<T extends string>(name: string, fallback: T, choices: readonly T[]): T {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) {
+    return fallback;
+  }
+  if (!choices.includes(raw as T)) {
+    throw new Error(`Invalid ${name} value: ${raw}`);
+  }
+  return raw as T;
 }
 
 function isAiReviewProviderName(value: string): value is AiReviewProviderName {
@@ -246,5 +261,9 @@ export function loadConfig(): Config {
     maxWebhookBodyBytes: optionalInt("MAX_WEBHOOK_BODY_BYTES", 5 * 1024 * 1024),
     maxPatchChars: optionalInt("MAX_PATCH_CHARS", 120_000),
     maxContextChars: optionalInt("MAX_CONTEXT_CHARS", 160_000),
+    deepRepoContextMode: optionalChoice("DEEP_REPO_CONTEXT_MODE", "auto", ["off", "auto", "always"]),
+    deepRepoContextTimeoutMs: optionalInt("DEEP_REPO_CONTEXT_TIMEOUT_MS", 60_000),
+    deepRepoContextMaxFiles: optionalInt("DEEP_REPO_CONTEXT_MAX_FILES", 40),
+    deepRepoContextMaxBytes: optionalInt("DEEP_REPO_CONTEXT_MAX_BYTES", 80_000),
   };
 }

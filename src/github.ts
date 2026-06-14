@@ -1,4 +1,5 @@
 import type { Config } from "./config.js";
+import { buildDeepRepoContext } from "./repo-context.js";
 import { githubCommentBody, truncate } from "./text.js";
 
 type Octokit = any;
@@ -10,6 +11,31 @@ const LEGACY_REVIEW_CHECK_NAME = "Gemini PR Bot";
 const NO_ACTION_REQUIRED_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=no-action-required";
 const MERGE_CONFLICT_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=merge-conflict";
 const FAILING_CHECK_CONCLUSIONS = new Set(["action_required", "cancelled", "failure", "timed_out"]);
+const MAX_CHANGED_FILE_CONTENT_CHARS = 20_000;
+const MAX_CHANGED_FILE_CONTENT_CONTEXT_CHARS = 50_000;
+const BINARY_FILE_EXTENSIONS = new Set([
+  ".7z",
+  ".avif",
+  ".bin",
+  ".bmp",
+  ".dmg",
+  ".gif",
+  ".gz",
+  ".ico",
+  ".jpeg",
+  ".jpg",
+  ".mov",
+  ".mp3",
+  ".mp4",
+  ".pdf",
+  ".png",
+  ".ttf",
+  ".wav",
+  ".webp",
+  ".woff",
+  ".woff2",
+  ".zip",
+]);
 
 export type CheckConclusion =
   | "success"
@@ -50,6 +76,11 @@ export type PullRequestStatus = {
 
 export type PullRequestContext = PullRequestStatus & {
   markdown: string;
+};
+
+export type PullRequestContextOptions = {
+  installationToken?: string;
+  deepContextRequested?: boolean;
 };
 
 export type StatusCheckSummary = {
@@ -166,6 +197,7 @@ export async function buildPullRequestContext(
   repo: RepoRef,
   prNumber: number,
   config: Config,
+  options: PullRequestContextOptions = {},
 ): Promise<PullRequestContext> {
   const pr = await getPullRequestWithMergeability(octokit, repo, prNumber);
 
@@ -227,6 +259,17 @@ export async function buildPullRequestContext(
     fileSections.push(section);
     patchChars += section.length;
   }
+
+  const changedFileContents = await buildChangedFileContents(octokit, repo, pr.head.sha, files);
+  const deepRepoContext = await buildDeepRepoContext({
+    repo,
+    prNumber,
+    headSha: pr.head.sha,
+    files,
+    config,
+    installationToken: options.installationToken,
+    requested: options.deepContextRequested,
+  });
 
   const recentIssueComments = issueComments
     .slice(-50)
@@ -293,6 +336,14 @@ export async function buildPullRequestContext(
     "## Recent Review Comments",
     recentReviewComments || "(none)",
     "",
+    "## Current Changed File Contents",
+    "These sections show the post-change HEAD contents for small changed text files. Use them to verify final state when a diff hunk is abbreviated or ambiguous.",
+    changedFileContents || "(none)",
+    "",
+    "## Deep Repository Context",
+    "This section is built from a shallow clone when deep context is enabled. It contains selected related files only, not the whole repository.",
+    deepRepoContext || "(none)",
+    "",
     "## Changed Files",
     fileSections.join("\n\n") || "(none)",
   ].join("\n");
@@ -312,6 +363,167 @@ export async function buildPullRequestContext(
     statusChecks,
     markdown: truncate(markdown, config.maxContextChars),
   };
+}
+
+async function buildChangedFileContents(
+  octokit: Octokit,
+  repo: RepoRef,
+  headSha: string,
+  files: any[],
+): Promise<string> {
+  const sections: string[] = [];
+  let contextChars = 0;
+
+  for (const file of files) {
+    if (!shouldFetchChangedFileContent(file)) {
+      continue;
+    }
+
+    const section = await buildChangedFileContentSection(octokit, repo, headSha, file);
+    if (!section) {
+      continue;
+    }
+
+    if (contextChars + section.length > MAX_CHANGED_FILE_CONTENT_CONTEXT_CHARS) {
+      sections.push("...additional current file contents omitted...");
+      break;
+    }
+
+    sections.push(section);
+    contextChars += section.length;
+  }
+
+  return sections.join("\n\n");
+}
+
+function shouldFetchChangedFileContent(file: any): boolean {
+  const filename = String(file.filename || "");
+  const status = String(file.status || "");
+  if (!filename || status === "removed" || status === "deleted") {
+    return false;
+  }
+  if (isLikelyBinaryPath(filename)) {
+    return false;
+  }
+
+  return typeof file.patch === "string" || isLikelyTextPath(filename);
+}
+
+async function buildChangedFileContentSection(
+  octokit: Octokit,
+  repo: RepoRef,
+  headSha: string,
+  file: any,
+): Promise<string | null> {
+  const filename = String(file.filename || "");
+  try {
+    const { data } = await octokit.rest.repos.getContent({
+      owner: repo.owner,
+      repo: repo.repo,
+      path: filename,
+      ref: headSha,
+    });
+    if (Array.isArray(data) || data.type !== "file") {
+      return null;
+    }
+
+    const size = Number(data.size || 0);
+    if (size > MAX_CHANGED_FILE_CONTENT_CHARS) {
+      return [
+        `### ${filename}`,
+        `status=${file.status} current_head_size=${size}`,
+        `current HEAD content omitted because it exceeds ${MAX_CHANGED_FILE_CONTENT_CHARS} characters`,
+      ].join("\n");
+    }
+
+    const encoded = typeof data.content === "string" ? data.content : "";
+    const content = Buffer.from(encoded.replace(/\n/g, ""), "base64").toString("utf8");
+    if (!content || looksBinary(content)) {
+      return null;
+    }
+
+    return [
+      `### ${filename}`,
+      `status=${file.status} additions=${file.additions} deletions=${file.deletions} current_head_size=${size}`,
+      `\`\`\`\`${codeFenceLanguage(filename)}`,
+      content.trimEnd(),
+      "````",
+    ].join("\n");
+  } catch (error) {
+    return [
+      `### ${filename}`,
+      `status=${file.status}`,
+      `current HEAD content unavailable: ${truncate(errorMessage(error), 300)}`,
+    ].join("\n");
+  }
+}
+
+function isLikelyBinaryPath(path: string): boolean {
+  const extension = pathExtension(path);
+  return BINARY_FILE_EXTENSIONS.has(extension);
+}
+
+function isLikelyTextPath(path: string): boolean {
+  const basename = path.split("/").pop()?.toLowerCase() || "";
+  if (["dockerfile", "makefile", "license", "notice"].includes(basename)) {
+    return true;
+  }
+
+  return Boolean(codeFenceLanguage(path));
+}
+
+function pathExtension(path: string): string {
+  const basename = path.split("/").pop()?.toLowerCase() || "";
+  const index = basename.lastIndexOf(".");
+  return index >= 0 ? basename.slice(index) : "";
+}
+
+function codeFenceLanguage(path: string): string {
+  const basename = path.split("/").pop()?.toLowerCase() || "";
+  if (basename === "dockerfile") {
+    return "dockerfile";
+  }
+  if (basename === "makefile") {
+    return "makefile";
+  }
+
+  switch (pathExtension(path)) {
+    case ".cjs":
+    case ".js":
+    case ".mjs":
+      return "javascript";
+    case ".css":
+      return "css";
+    case ".html":
+      return "html";
+    case ".json":
+      return "json";
+    case ".jsonl":
+      return "jsonl";
+    case ".jsx":
+      return "jsx";
+    case ".md":
+      return "markdown";
+    case ".sh":
+      return "bash";
+    case ".ts":
+      return "typescript";
+    case ".tsx":
+      return "tsx";
+    case ".txt":
+      return "text";
+    case ".xml":
+      return "xml";
+    case ".yaml":
+    case ".yml":
+      return "yaml";
+    default:
+      return "";
+  }
+}
+
+function looksBinary(value: string): boolean {
+  return value.includes("\0") || (value.match(/\uFFFD/g) || []).length > 0;
 }
 
 export async function isReviewThreadResolved(

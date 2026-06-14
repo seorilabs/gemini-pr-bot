@@ -106,10 +106,18 @@ spec:
               value: "180000"
             - name: CURSOR_MODEL
               value: gpt-5.2
+            - name: DEEP_REPO_CONTEXT_MODE
+              value: auto
+            - name: DEEP_REPO_CONTEXT_TIMEOUT_MS
+              value: "60000"
+            - name: DEEP_REPO_CONTEXT_MAX_FILES
+              value: "40"
+            - name: DEEP_REPO_CONTEXT_MAX_BYTES
+              value: "80000"
             - name: HOME
               value: /home/app
             - name: BOT_MENTIONS
-              value: "@seorilabs-seori,@seori,@gemini-cli,@gemini,@seorilabs-gemini-pr-bot"
+              value: "@seorilabs-seori,@seorilabs-gemini-pr-bot,@seori-bot,@seori,@gemini-cli,@gemini"
             - name: TRUSTED_ASSOCIATIONS
               value: "OWNER,MEMBER,COLLABORATOR"
             - name: ALLOW_PUBLIC_REPOS

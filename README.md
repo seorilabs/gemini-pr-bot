@@ -16,7 +16,7 @@ flowchart LR
 ## Behavior
 
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
-- Responds to PR comments containing `@gemini-cli` or `@gemini`.
+- Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
 - Runs explicit review on `@gemini-cli /review`; if there are no actionable findings, it submits an approval review instead of only commenting.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]`.
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
@@ -24,6 +24,7 @@ flowchart LR
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Seori Review` check run for review and agent jobs.
+- Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
 - Can route AI jobs across Gemini CLI, GitHub Copilot CLI, and Cursor Agent with weighted fallback.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks approval while tests, build, lint, typecheck, or status checks are failing or pending.
@@ -41,6 +42,7 @@ flowchart LR
 ```text
 @gemini-cli /review
 @seorilabs-seori /review
+@seori-bot /review
 @seorilabs-gemini-pr-bot /review
 /gemini review
 @gemini-cli /approve [reason]
@@ -48,6 +50,7 @@ flowchart LR
 @gemini-cli /help
 @gemini-cli <question>
 @seorilabs-seori <question or handoff>
+@seori-bot <question or handoff>
 @seorilabs-gemini-pr-bot <question or handoff>
 ```
 
@@ -87,6 +90,19 @@ flowchart TD
 ```
 
 Approval from agent mode is guarded: the model output must include the approval action marker and the exact `No actionable findings.` finding result. Otherwise the bot only comments.
+
+## Deep Repository Context
+
+By default, `DEEP_REPO_CONTEXT_MODE=auto` shallow-clones the PR head only for code, workflow, action, and config changes that benefit from surrounding repository context. The bot extracts a bounded set of related text files into the prompt, then deletes the checkout from `/tmp`.
+
+```text
+DEEP_REPO_CONTEXT_MODE=auto
+DEEP_REPO_CONTEXT_TIMEOUT_MS=60000
+DEEP_REPO_CONTEXT_MAX_FILES=40
+DEEP_REPO_CONTEXT_MAX_BYTES=80000
+```
+
+Use `off` to disable the clone path or `always` for every PR context build. A maintainer can also request deep context explicitly, for example `@seori-bot /review deep`.
 
 ## Workflow Persistence
 

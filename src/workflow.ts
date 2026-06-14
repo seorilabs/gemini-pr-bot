@@ -324,9 +324,11 @@ export class WorkflowEngine {
         throw new Error("Webhook payload does not include installation.id");
       }
 
+      const installationToken = await this.createInstallationToken(installationId);
       const octokit = await this.app.getInstallationOctokit(installationId);
       await this.bot.processEvent(octokit, run.eventName, run.payload, {
         checkRunId: run.checkRunId,
+        installationToken,
         recordCheckRun: (record) => this.store.recordCheckRun(run.id, record),
       });
       await this.store.complete(run.id);
@@ -346,6 +348,18 @@ export class WorkflowEngine {
     }
 
     return true;
+  }
+
+  private async createInstallationToken(installationId: number): Promise<string | undefined> {
+    try {
+      const result = await (this.app as any).octokit.rest.apps.createInstallationAccessToken({
+        installation_id: installationId,
+      });
+      return result.data.token;
+    } catch (error) {
+      this.logger.warn({ error }, "installation token unavailable for deep repo context");
+      return undefined;
+    }
   }
 
   private dedupeKey(eventName: string, event: WebhookEvent): string {

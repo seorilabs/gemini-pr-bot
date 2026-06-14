@@ -18,6 +18,7 @@ import {
   shouldHandleRepository,
   type CheckConclusion,
   type PullRequestContext,
+  type PullRequestContextOptions,
   type PullRequestStatus,
   type RepoRef,
   type ReviewTrigger,
@@ -71,6 +72,7 @@ export type WorkflowCheckRecord = {
 
 export type WorkflowExecution = {
   checkRunId?: number | null;
+  installationToken?: string;
   recordCheckRun: (record: WorkflowCheckRecord) => Promise<void>;
 };
 
@@ -278,7 +280,7 @@ export class PrBot {
     await this.runAnswer(octokit, repo, issueNumber, command.request, {
       source: "issue_comment",
       sender: payload.sender.login,
-    });
+    }, workflow);
   }
 
   private async handleReviewComment(octokit: Octokit, payload: any, workflow?: WorkflowExecution): Promise<void> {
@@ -330,11 +332,11 @@ export class PrBot {
             source: "review_comment",
             sender: payload.sender.login,
             request: command.request,
-          })
+          }, workflow)
         : await this.createAnswerText(octokit, repo, prNumber, command.request, {
             source: "review_comment",
             sender: payload.sender.login,
-          });
+          }, workflow);
 
     if (!(await this.currentStatusForPublish(octokit, repo, prNumber, generated.headSha, null))) {
       return;
@@ -391,7 +393,7 @@ export class PrBot {
     await this.runAnswer(octokit, repo, prNumber, command.request, {
       source: "pull_request_review",
       sender: payload.sender.login,
-    });
+    }, workflow);
   }
 
   private async handlePullRequest(octokit: Octokit, payload: any, workflow?: WorkflowExecution): Promise<void> {
@@ -434,7 +436,7 @@ export class PrBot {
     trigger: ReviewTrigger,
     workflow?: WorkflowExecution,
   ): Promise<void> {
-    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
+    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config, this.contextOptions(workflow, trigger.request));
     if (this.shuttingDown || (this.isClosedPullRequest(context) && !workflow?.checkRunId)) {
       return;
     }
@@ -530,7 +532,7 @@ export class PrBot {
     target: AgentReplyTarget,
     workflow?: WorkflowExecution,
   ): Promise<void> {
-    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
+    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config, this.contextOptions(workflow, request));
     if (this.shuttingDown || (this.isClosedPullRequest(context) && !workflow?.checkRunId)) {
       return;
     }
@@ -693,8 +695,9 @@ export class PrBot {
     prNumber: number,
     request: string,
     trigger: ReviewTrigger,
+    workflow?: WorkflowExecution,
   ): Promise<void> {
-    const generated = await this.createAnswerText(octokit, repo, prNumber, request, trigger);
+    const generated = await this.createAnswerText(octokit, repo, prNumber, request, trigger, workflow);
     if (!(await this.currentStatusForPublish(octokit, repo, prNumber, generated.headSha, null))) {
       return;
     }
@@ -707,8 +710,9 @@ export class PrBot {
     repo: RepoRef,
     prNumber: number,
     trigger: ReviewTrigger,
+    workflow?: WorkflowExecution,
   ): Promise<GeneratedText> {
-    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
+    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config, this.contextOptions(workflow, trigger.request));
     if (this.hasMergeConflict(context)) {
       return { text: this.mergeConflictText(repo, prNumber, context), headSha: context.headSha };
     }
@@ -734,6 +738,7 @@ export class PrBot {
       "",
       "Finding rules:",
       "- Findings must be grounded in the supplied diff/context.",
+      "- Treat `Current Changed File Contents` as the source of truth for the post-change file state when present. Do not claim code or configuration is missing if it is present there; GitHub file patches may be abbreviated.",
       "- Each finding must include severity, file/function or line reference when available, impact, and concrete fix direction.",
       "- Failing tests, builds, lint, typecheck, or required status checks are actionable findings unless the context clearly proves an external infrastructure-only failure.",
       "- Treat pending or queued checks as approval blockers, but do not infer a workflow defect from a transient queued check unless the context proves the job is stuck, unroutable, or using an ineligible runner.",
@@ -801,6 +806,7 @@ export class PrBot {
       "- If the PR now satisfies the acceptance criteria, narrow the review to defects introduced by the new changes made to satisfy those criteria, plus any clear stability regression those changes cause.",
       "- Do not reopen settled or unrelated issues just because older context is present. Reopen only when the latest diff contradicts a prior resolution or creates a new stability risk.",
       "- Choose approve only when the supplied diff and conversation show no actionable findings remain.",
+      "- Treat `Current Changed File Contents` as the source of truth for the post-change file state when present. Do not claim code or configuration is missing if it is present there; GitHub file patches may be abbreviated.",
       "- Choose close when the same acceptance criterion has already failed across repeated rounds and the latest diff still does not address it. Tell the PR author to stop iterating on this PR and reopen a smaller, clearer PR if they still want to continue.",
       "- Never approve if any correctness, runtime, security, data loss, regression, required validation, or required test concern remains.",
       "- Never approve if GitHub mergeable is `false` or mergeable_state is `dirty`/`conflicting`; choose comment and give conflict-resolution steps.",
@@ -857,8 +863,9 @@ export class PrBot {
     prNumber: number,
     request: string,
     trigger: ReviewTrigger,
+    workflow?: WorkflowExecution,
   ): Promise<GeneratedText> {
-    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
+    const context = await buildPullRequestContext(octokit, repo, prNumber, this.config, this.contextOptions(workflow, request));
     const prompt = [
       "Answer the user's pull request question.",
       "",
@@ -872,6 +879,13 @@ export class PrBot {
     ].join("\n");
 
     return { text: await this.gemini.answer(prompt), headSha: context.headSha };
+  }
+
+  private contextOptions(workflow: WorkflowExecution | undefined, request: string | undefined): PullRequestContextOptions {
+    return {
+      installationToken: workflow?.installationToken,
+      deepContextRequested: Boolean(request && /\bdeep\b|전체\s*맥락|전체\s*코드|full\s*context/iu.test(request)),
+    };
   }
 
   private async runApprove(
@@ -1046,8 +1060,9 @@ export class PrBot {
       "사용 가능한 명령:",
       "",
       "- `@seorilabs-seori /review`: 현재 PR을 리뷰합니다.",
+      "- `@seori-bot /review`: 현재 PR을 리뷰합니다.",
       "- `@seorilabs-seori /approve [사유]`: GitHub approval review와 agent coordination marker를 남깁니다.",
-      "- `@seorilabs-seori 질문`: PR 맥락을 분석하고 comment 또는 approve를 결정합니다.",
+      "- `@seorilabs-seori 질문`: PR 맥락을 분석하고 comment 또는 approve를 결정합니다. `/review deep`처럼 요청하면 deep repository context를 강제로 사용합니다.",
       "- inline review comment에서 `@seorilabs-seori 질문`: 해당 review comment 맥락으로 답하거나 PR을 approve합니다.",
     ].join("\n");
   }
