@@ -14,6 +14,21 @@ export type WorkflowQueueMetric = {
   oldestAgeSeconds: number;
 };
 
+export type ActiveWorkflowMetric = {
+  workflowId: number;
+  status: string;
+  eventName: string;
+  repoFullName: string;
+  prNumber: number;
+  title: string;
+  url: string;
+  headSha: string;
+  checkKind: string;
+  attempts: number;
+  ageSeconds: number;
+  nextRunDelaySeconds: number;
+};
+
 type CounterSeries = {
   labels: Record<string, string>;
   value: number;
@@ -73,6 +88,18 @@ const METADATA: Record<string, { type: "counter" | "gauge" | "histogram"; help: 
   gemini_pr_bot_workflow_oldest_row_age_seconds: {
     type: "gauge",
     help: "Age in seconds of the oldest workflow row by status and event.",
+  },
+  gemini_pr_bot_active_pr_info: {
+    type: "gauge",
+    help: "Active queued or running PR workflow information. Labels include repo, PR number, title, URL, status, and event.",
+  },
+  gemini_pr_bot_active_pr_age_seconds: {
+    type: "gauge",
+    help: "Age in seconds for active queued or running PR workflows. Labels identify the PR workflow.",
+  },
+  gemini_pr_bot_active_pr_next_run_delay_seconds: {
+    type: "gauge",
+    help: "Seconds until the next run time for active queued PR workflows. Running workflows report zero.",
   },
   gemini_pr_bot_ai_provider_attempts_total: {
     type: "counter",
@@ -166,6 +193,7 @@ export class MetricsRegistry {
     infoLabels?: MetricLabels;
     gauges?: GaugeSample[];
     workflowQueue?: WorkflowQueueMetric[];
+    activeWorkflows?: ActiveWorkflowMetric[];
   } = {}): string {
     const samples: string[] = [];
     const used = new Set<string>();
@@ -200,6 +228,14 @@ export class MetricsRegistry {
     }
 
     for (const metric of this.workflowQueueGauges(options.workflowQueue || [])) {
+      if (!used.has(metric.name)) {
+        samples.push(this.metadata(metric.name));
+        used.add(metric.name);
+      }
+      samples.push(metricLine(metric.name, normalizeLabels(metric.labels || {}), metric.value));
+    }
+
+    for (const metric of this.activeWorkflowGauges(options.activeWorkflows || [])) {
       if (!used.has(metric.name)) {
         samples.push(this.metadata(metric.name));
         used.add(metric.name);
@@ -295,6 +331,42 @@ export class MetricsRegistry {
           value: row.readyCount,
         });
       }
+    }
+    return samples;
+  }
+
+  private activeWorkflowGauges(rows: ActiveWorkflowMetric[]): GaugeSample[] {
+    const samples: GaugeSample[] = [];
+    for (const row of rows) {
+      const labels = {
+        workflow_id: row.workflowId,
+        status: row.status,
+        event: row.eventName,
+        repo: row.repoFullName,
+        pr_number: row.prNumber,
+        title: row.title,
+        url: row.url,
+        head_sha: row.headSha,
+        check_kind: row.checkKind,
+        attempts: row.attempts,
+      };
+      samples.push(
+        {
+          name: "gemini_pr_bot_active_pr_info",
+          labels,
+          value: 1,
+        },
+        {
+          name: "gemini_pr_bot_active_pr_age_seconds",
+          labels,
+          value: row.ageSeconds,
+        },
+        {
+          name: "gemini_pr_bot_active_pr_next_run_delay_seconds",
+          labels,
+          value: row.nextRunDelaySeconds,
+        },
+      );
     }
     return samples;
   }

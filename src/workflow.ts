@@ -9,7 +9,7 @@ import mysql, {
 import type { App } from "octokit";
 import type { Config } from "./config.js";
 import type { PrBot, WorkflowCheckRecord } from "./bot.js";
-import { metrics, type WorkflowQueueMetric } from "./metrics.js";
+import { metrics, type ActiveWorkflowMetric, type WorkflowQueueMetric } from "./metrics.js";
 
 type Logger = {
   info: (value: unknown, message?: string) => void;
@@ -39,6 +39,20 @@ type WorkflowQueueMetricRow = RowDataPacket & {
   row_count: number | string;
   ready_count: number | string;
   oldest_age_seconds: number | string | null;
+};
+
+type ActiveWorkflowMetricRow = RowDataPacket & {
+  id: number | string;
+  status: string;
+  event_name: string;
+  payload_json: string;
+  attempts: number | string;
+  check_kind: string | null;
+  repo_full_name: string | null;
+  pr_number: number | string | null;
+  head_sha: string | null;
+  age_seconds: number | string | null;
+  next_run_delay_seconds: number | string | null;
 };
 
 export type WorkflowRun = {
@@ -266,6 +280,32 @@ export class MysqlWorkflowStore {
       oldestAgeSeconds: Number(row.oldest_age_seconds || 0),
     }));
   }
+
+  async activeWorkflowMetrics(): Promise<ActiveWorkflowMetric[]> {
+    const [rows] = await this.pool.execute<ActiveWorkflowMetricRow[]>(`
+      SELECT
+        id,
+        status,
+        event_name,
+        payload_json,
+        attempts,
+        check_kind,
+        repo_full_name,
+        pr_number,
+        head_sha,
+        TIMESTAMPDIFF(MICROSECOND, created_at, CURRENT_TIMESTAMP(3)) / 1000000 AS age_seconds,
+        GREATEST(TIMESTAMPDIFF(MICROSECOND, CURRENT_TIMESTAMP(3), next_run_at) / 1000000, 0) AS next_run_delay_seconds
+      FROM gemini_pr_bot_workflows
+      WHERE status IN ('queued', 'running')
+      ORDER BY
+        FIELD(status, 'running', 'queued'),
+        next_run_at ASC,
+        created_at ASC
+      LIMIT 50
+    `);
+
+    return rows.map((row) => activeWorkflowMetricFromRow(row));
+  }
 }
 
 export class WorkflowEngine {
@@ -336,6 +376,10 @@ export class WorkflowEngine {
 
   async queueMetrics(): Promise<WorkflowQueueMetric[]> {
     return this.store.queueMetrics();
+  }
+
+  async activeWorkflowMetrics(): Promise<ActiveWorkflowMetric[]> {
+    return this.store.activeWorkflowMetrics();
   }
 
   private async loop(): Promise<void> {
@@ -452,4 +496,66 @@ function delay(ms: number): Promise<void> {
 
 function elapsedSecondsSince(startedAtMs: number): number {
   return (Date.now() - startedAtMs) / 1000;
+}
+
+function activeWorkflowMetricFromRow(row: ActiveWorkflowMetricRow): ActiveWorkflowMetric {
+  const payload = parsePayload(row.payload_json);
+  const repoFullName = truncateMetricLabel(
+    String(row.repo_full_name || payload.repository?.full_name || payload.repository?.fullName || "unknown"),
+    160,
+  );
+  const prNumber = numberOrZero(
+    row.pr_number
+      ?? payload.pull_request?.number
+      ?? payload.pullRequest?.number
+      ?? payload.issue?.number
+      ?? payload.ci_recheck?.pr_number
+      ?? payload.ciRecheck?.prNumber,
+  );
+  const title = truncateMetricLabel(
+    String(payload.pull_request?.title || payload.pullRequest?.title || payload.issue?.title || `PR #${prNumber}`),
+    180,
+  );
+  const url = truncateMetricLabel(
+    String(
+      payload.pull_request?.html_url
+        || payload.pullRequest?.htmlUrl
+        || payload.issue?.html_url
+        || (repoFullName !== "unknown" && prNumber > 0 ? `https://github.com/${repoFullName}/pull/${prNumber}` : ""),
+    ),
+    240,
+  );
+
+  return {
+    workflowId: numberOrZero(row.id),
+    status: row.status,
+    eventName: row.event_name,
+    repoFullName,
+    prNumber,
+    title,
+    url: url || "unknown",
+    headSha: truncateMetricLabel(String(row.head_sha || payload.pull_request?.head?.sha || payload.pullRequest?.head?.sha || ""), 64),
+    checkKind: row.check_kind || "none",
+    attempts: numberOrZero(row.attempts),
+    ageSeconds: Number(row.age_seconds || 0),
+    nextRunDelaySeconds: Number(row.next_run_delay_seconds || 0),
+  };
+}
+
+function parsePayload(payloadJson: string): any {
+  try {
+    return JSON.parse(payloadJson);
+  } catch {
+    return {};
+  }
+}
+
+function numberOrZero(value: unknown): number {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : 0;
+}
+
+function truncateMetricLabel(value: string, maxLength: number): string {
+  const trimmed = value.replaceAll(/\s+/g, " ").trim();
+  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 3)}...` : trimmed;
 }

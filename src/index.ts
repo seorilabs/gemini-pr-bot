@@ -8,7 +8,7 @@ import { STALE_REVIEW_SELF_TRIGGER_EVENT } from "./events.js";
 import { PrBot } from "./bot.js";
 import { StaleReviewMonitor, staleSelfTriggerDedupeKey, staleSelfTriggerPayload } from "./stale.js";
 import { MysqlWorkflowStore, WorkflowEngine } from "./workflow.js";
-import { metrics, metricsContentType, type WorkflowQueueMetric } from "./metrics.js";
+import { metrics, metricsContentType, type ActiveWorkflowMetric, type WorkflowQueueMetric } from "./metrics.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const config = loadConfig();
@@ -100,10 +100,16 @@ function hasForwardedHeaders(req: IncomingMessage): boolean {
 
 async function renderMetrics(): Promise<string> {
   let workflowQueue: WorkflowQueueMetric[] = [];
+  let activeWorkflows: ActiveWorkflowMetric[] = [];
   try {
     workflowQueue = workflowEngine ? await workflowEngine.queueMetrics() : [];
   } catch (error) {
     logger.warn({ error }, "workflow queue metrics unavailable");
+  }
+  try {
+    activeWorkflows = workflowEngine ? await workflowEngine.activeWorkflowMetrics() : [];
+  } catch (error) {
+    logger.warn({ error }, "active workflow metrics unavailable");
   }
 
   return metrics.render({
@@ -113,6 +119,7 @@ async function renderMetrics(): Promise<string> {
     },
     gauges: bot.metricSamples(),
     workflowQueue,
+    activeWorkflows,
   });
 }
 
