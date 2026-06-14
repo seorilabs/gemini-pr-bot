@@ -580,7 +580,7 @@ export class PrBot {
 
       const actionRequiredText = this.actionRequiredText("review", latest.headSha, reviewText);
       await postPrComment(octokit, repo, prNumber, actionRequiredText);
-      await this.completeTrackedCheck(check, "success", "리뷰 완료", actionRequiredText);
+      await this.completeTrackedCheck(check, "action_required", "조치 필요", actionRequiredText);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.completeTrackedCheck(check, "failure", "리뷰 실패", message);
@@ -702,7 +702,7 @@ export class PrBot {
         await postPrComment(octokit, repo, prNumber, commentText);
       }
 
-      await this.completeTrackedCheck(check, "success", "댓글 작성 완료", commentText);
+      await this.completeTrackedCheck(check, "action_required", "조치 필요", commentText);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.completeTrackedCheck(check, "failure", "에이전트 처리 실패", message);

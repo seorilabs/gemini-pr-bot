@@ -24,6 +24,7 @@ flowchart LR
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Seori Review` check run for review and agent jobs.
+- Marks `Seori Review` as `success` only when the bot approves the current HEAD; actionable review findings complete as `action_required`.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
 - Can route AI jobs across Gemini CLI, GitHub Copilot CLI, and Cursor Agent with weighted fallback.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
