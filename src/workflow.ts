@@ -93,15 +93,15 @@ export class MysqlWorkflowStore {
     `);
   }
 
-  async enqueue(eventName: string, dedupeKey: string, payload: any): Promise<boolean> {
+  async enqueue(eventName: string, dedupeKey: string, payload: any, delayMs = 0): Promise<boolean> {
     const payloadJson = JSON.stringify(payload);
     const [result] = await this.pool.execute<ResultSetHeader>(
       `
       INSERT IGNORE INTO gemini_pr_bot_workflows
-        (dedupe_key, event_name, payload_json, status, max_attempts)
-      VALUES (?, ?, ?, 'queued', ?)
+        (dedupe_key, event_name, payload_json, status, max_attempts, next_run_at)
+      VALUES (?, ?, ?, 'queued', ?, TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(3)))
       `,
-      [dedupeKey, eventName, payloadJson, this.config.workflowMaxAttempts],
+      [dedupeKey, eventName, payloadJson, this.config.workflowMaxAttempts, delayMs * 1000],
     );
     return result.affectedRows > 0;
   }
@@ -279,13 +279,14 @@ export class WorkflowEngine {
     );
   }
 
-  async enqueueSynthetic(eventName: string, dedupeKey: string, payload: any): Promise<boolean> {
-    const inserted = await this.store.enqueue(eventName, dedupeKey, payload);
+  async enqueueSynthetic(eventName: string, dedupeKey: string, payload: any, delayMs = 0): Promise<boolean> {
+    const inserted = await this.store.enqueue(eventName, dedupeKey, payload, delayMs);
     this.logger.info(
       {
         event: eventName,
         dedupeKey,
         inserted,
+        delayMs,
         repo: payload.repository?.full_name,
         action: payload.action,
       },
@@ -343,8 +344,11 @@ export class WorkflowEngine {
       const octokit = await this.app.getInstallationOctokit(installationId);
       await this.bot.processEvent(octokit, run.eventName, run.payload, {
         checkRunId: run.checkRunId,
+        installationId,
         installationToken,
         recordCheckRun: (record) => this.store.recordCheckRun(run.id, record),
+        enqueueSynthetic: (eventName, dedupeKey, payload, delayMs) =>
+          this.enqueueSynthetic(eventName, dedupeKey, payload, delayMs),
       });
       await this.store.complete(run.id);
       this.logger.info({ workflowId: run.id, event: run.eventName }, "workflow completed");

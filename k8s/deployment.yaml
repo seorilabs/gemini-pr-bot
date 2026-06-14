@@ -72,6 +72,12 @@ spec:
               value: "600000"
             - name: WORKFLOW_MAX_ATTEMPTS
               value: "3"
+            - name: CI_INITIAL_WAIT_MS
+              value: "60000"
+            - name: CI_RECHECK_INTERVAL_MS
+              value: "60000"
+            - name: CI_RECHECK_TIMEOUT_MS
+              value: "1200000"
             - name: SHUTDOWN_GRACE_MS
               value: "240000"
             - name: MYSQL_HOST

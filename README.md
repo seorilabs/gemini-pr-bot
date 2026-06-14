@@ -28,7 +28,8 @@ flowchart LR
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
 - Can route AI jobs across Gemini CLI, GitHub Copilot CLI, and Cursor Agent with weighted fallback.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
-- Blocks approval while tests, build, lint, typecheck, or status checks are failing or pending.
+- Blocks approval while tests, build, lint, typecheck, or status checks are failing.
+- Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
 - Ignores resolved inline review threads.
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
 - Persists active check-run IDs so a restarted worker can resume a job instead of leaving stale pending checks.
@@ -117,11 +118,15 @@ flowchart TD
   Lease --> Bot["Run PR review/agent logic"]
   Bot --> Check["Create or reuse Seori Review check-run"]
   Check --> Done["Complete workflow row"]
+  Check -->|CI pending| Recheck["Schedule ci_recheck row"]
+  Recheck --> Lease
   Lease -->|worker dies| Expire["Lease expires"]
   Expire --> Lease
 ```
 
 The workflow table stores delivery dedupe keys, payload JSON, attempts, lease owner/expiry, PR identity, and `check_run_id`. If a pod restarts after creating a check-run, the next worker lease reuses that check-run instead of creating an untracked pending check.
+
+When a review finds no actionable code issue but external CI is still pending, `Seori Review` stays `in_progress` and the bot schedules a delayed `ci_recheck` workflow instead of posting a "CI is still running" PR comment. The recheck submits approval and marks `Seori Review` successful once CI passes. It posts a PR comment only when CI fails or exceeds `CI_RECHECK_TIMEOUT_MS`.
 
 ## Required Secrets
 

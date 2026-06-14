@@ -1,5 +1,5 @@
 import type { Config } from "./config.js";
-import { STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
+import { CI_RECHECK_EVENT, STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
 import { GeminiClient } from "./gemini.js";
 import {
   approvePullRequest,
@@ -23,6 +23,7 @@ import {
   type PullRequestStatus,
   type RepoRef,
   type ReviewTrigger,
+  updateInProgressCheck,
 } from "./github.js";
 import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./telegram.js";
 import { parseBotCommand } from "./text.js";
@@ -67,13 +68,15 @@ type ActiveCheckRun = {
   checkRunId: number;
   prNumber: number;
   headSha: string;
-  kind: "review" | "agent";
+  kind: WorkflowCheckKind;
   durable: boolean;
 };
 
+type WorkflowCheckKind = "review" | "agent" | "ci_recheck";
+
 export type WorkflowCheckRecord = {
   checkRunId: number;
-  kind: "review" | "agent";
+  kind: WorkflowCheckKind;
   repoFullName: string;
   prNumber: number;
   headSha: string;
@@ -81,8 +84,23 @@ export type WorkflowCheckRecord = {
 
 export type WorkflowExecution = {
   checkRunId?: number | null;
+  installationId?: number;
   installationToken?: string;
   recordCheckRun: (record: WorkflowCheckRecord) => Promise<void>;
+  enqueueSynthetic?: (eventName: string, dedupeKey: string, payload: any, delayMs?: number) => Promise<boolean>;
+};
+
+type CiRecheckRequest = {
+  checkRunId: number;
+  prNumber: number;
+  headSha: string;
+  mode: "review" | "agent";
+  sender: string;
+  source: string;
+  approvalReason: string;
+  approvalBody: string;
+  startedAt: string;
+  attempt: number;
 };
 
 export class PrBot {
@@ -148,6 +166,11 @@ export class PrBot {
 
     if (eventName === "pull_request") {
       await this.handlePullRequest(octokit, payload, workflow);
+      return;
+    }
+
+    if (eventName === CI_RECHECK_EVENT) {
+      await this.handleCiRecheck(octokit, payload, workflow);
       return;
     }
 
@@ -489,6 +512,113 @@ export class PrBot {
     );
   }
 
+  private async handleCiRecheck(
+    octokit: Octokit,
+    payload: any,
+    workflow?: WorkflowExecution,
+  ): Promise<void> {
+    if (!shouldHandleRepository(payload, this.config)) {
+      return;
+    }
+
+    const repo = repoFromPayload(payload);
+    const request = this.ciRecheckRequest(payload);
+    if (!request) {
+      this.logger.warn({ repo: repo.fullName, payload }, "CI recheck payload missing required fields");
+      return;
+    }
+
+    await workflow?.recordCheckRun({
+      checkRunId: request.checkRunId,
+      kind: "ci_recheck",
+      repoFullName: repo.fullName,
+      prNumber: request.prNumber,
+      headSha: request.headSha,
+    });
+
+    const status = await getPullRequestStatus(octokit, repo, request.prNumber);
+    if (this.isClosedPullRequest(status)) {
+      await completeCheck(
+        octokit,
+        repo,
+        request.checkRunId,
+        "cancelled",
+        "닫힌 PR 승인 취소",
+        [
+          "CI 재확인 중 PR이 닫히거나 병합되어 approval을 제출하지 않았습니다.",
+          "",
+          `상태: \`${status.state}\``,
+          `병합 여부: \`${status.merged}\``,
+          `HEAD: \`${status.headSha}\``,
+        ].join("\n"),
+      );
+      return;
+    }
+
+    if (status.headSha !== request.headSha) {
+      await completeCheck(
+        octokit,
+        repo,
+        request.checkRunId,
+        "cancelled",
+        "오래된 CI 재확인 취소",
+        [
+          "CI 재확인 중 PR HEAD가 바뀌어 이전 HEAD의 approval을 제출하지 않았습니다.",
+          "",
+          `기존 HEAD: \`${request.headSha}\``,
+          `현재 HEAD: \`${status.headSha}\``,
+        ].join("\n"),
+      );
+      return;
+    }
+
+    if (this.hasMergeConflict(status)) {
+      await completeCheck(
+        octokit,
+        repo,
+        request.checkRunId,
+        "action_required",
+        "병합 충돌 해결 필요",
+        this.mergeConflictText(repo, request.prNumber, status),
+      );
+      return;
+    }
+
+    if (this.hasFailingStatusChecks(status)) {
+      const blockerText = this.actionRequiredText("status-check", status.headSha, this.statusCheckBlockerText(status));
+      await postPrComment(octokit, repo, request.prNumber, blockerText);
+      await completeCheck(octokit, repo, request.checkRunId, "action_required", "상태 체크 확인 필요", blockerText);
+      return;
+    }
+
+    if (this.hasPendingStatusChecks(status)) {
+      if (this.isCiRecheckTimedOut(request)) {
+        const timeoutText = this.actionRequiredText("status-check-timeout", status.headSha, this.ciTimeoutBlockerText(status));
+        await postPrComment(octokit, repo, request.prNumber, timeoutText);
+        await completeCheck(octokit, repo, request.checkRunId, "action_required", "CI 대기 시간 초과", timeoutText);
+        return;
+      }
+
+      await this.deferCiRecheck(octokit, repo, status, request, workflow, this.config.ciRecheckIntervalMs);
+      return;
+    }
+
+    await this.approveAndNotify(
+      octokit,
+      repo,
+      request.prNumber,
+      status,
+      this.approvalText(request.sender, request.approvalReason, status.headSha, request.approvalBody),
+      {
+        mode: request.mode,
+        sender: request.sender,
+        source: `ci_recheck:${request.source}`,
+        reason: request.approvalReason,
+      },
+    );
+    await completeCheck(octokit, repo, request.checkRunId, "success", "PR 승인 완료", request.approvalBody);
+  }
+
   private isAutoReviewIgnored(repo: RepoRef): boolean {
     const ignored = this.config.autoReviewIgnoredRepositories;
     return ignored.has(repo.fullName.toLowerCase()) || ignored.has(repo.repo.toLowerCase());
@@ -553,10 +683,30 @@ export class PrBot {
         return;
       }
 
-      if (this.wantsApproval(reviewText) && this.hasBlockingStatusChecks(latest)) {
+      if (this.wantsApproval(reviewText) && this.hasFailingStatusChecks(latest)) {
         const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
         await postPrComment(octokit, repo, prNumber, blockerText);
         await this.completeTrackedCheck(check, "action_required", "상태 체크 확인 필요", blockerText);
+        return;
+      }
+
+      if (this.wantsApproval(reviewText) && this.shouldDeferApprovalForCi(trigger, latest)) {
+        await this.deferApprovalUntilCiSettles(
+          octokit,
+          repo,
+          prNumber,
+          latest,
+          check,
+          workflow,
+          {
+            mode: "review",
+            sender: trigger.sender,
+            source: trigger.source,
+            reason: "리뷰 결과 조치할 항목이 없습니다.",
+            body: reviewText,
+          },
+          this.hasPendingStatusChecks(latest) ? this.config.ciRecheckIntervalMs : this.config.ciInitialWaitMs,
+        );
         return;
       }
 
@@ -658,7 +808,7 @@ export class PrBot {
         return;
       }
 
-      if (this.wantsApproval(agentText) && this.hasBlockingStatusChecks(latest)) {
+      if (this.wantsApproval(agentText) && this.hasFailingStatusChecks(latest)) {
         const blockerText = this.agentActionRequiredText(
           "status-check",
           latest.headSha,
@@ -667,6 +817,26 @@ export class PrBot {
         );
         await postPrComment(octokit, repo, prNumber, blockerText);
         await this.completeTrackedCheck(check, "action_required", "상태 체크 확인 필요", blockerText);
+        return;
+      }
+
+      if (this.wantsApproval(agentText) && this.shouldDeferApprovalForCi(trigger, latest)) {
+        await this.deferApprovalUntilCiSettles(
+          octokit,
+          repo,
+          prNumber,
+          latest,
+          check,
+          workflow,
+          {
+            mode: "agent",
+            sender: trigger.sender,
+            source: trigger.source,
+            reason: "에이전트 판단 결과 조치할 항목이 없습니다.",
+            body: publicText,
+          },
+          this.hasPendingStatusChecks(latest) ? this.config.ciRecheckIntervalMs : this.config.ciInitialWaitMs,
+        );
         return;
       }
 
@@ -781,6 +951,218 @@ export class PrBot {
     return true;
   }
 
+  private async deferApprovalUntilCiSettles(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    status: PullRequestStatus,
+    check: ActiveCheckRun | null,
+    workflow: WorkflowExecution | undefined,
+    approval: {
+      mode: "review" | "agent";
+      sender: string;
+      source: string;
+      reason: string;
+      body: string;
+    },
+    delayMs: number,
+  ): Promise<void> {
+    if (!check) {
+      this.logger.warn({ repo: repo.fullName, prNumber, headSha: status.headSha }, "CI recheck skipped without check-run");
+      return;
+    }
+
+    const request: CiRecheckRequest = {
+      checkRunId: check.checkRunId,
+      prNumber,
+      headSha: status.headSha,
+      mode: approval.mode,
+      sender: approval.sender,
+      source: approval.source,
+      approvalReason: approval.reason,
+      approvalBody: approval.body,
+      startedAt: new Date().toISOString(),
+      attempt: 1,
+    };
+
+    await updateInProgressCheck(
+      octokit,
+      repo,
+      check.checkRunId,
+      "CI 확인 대기",
+      this.ciWaitingSummary(status, request, delayMs),
+    );
+    this.activeChecks.delete(check.key);
+
+    await this.scheduleCiRecheck(octokit, repo, status, request, workflow, delayMs);
+  }
+
+  private async deferCiRecheck(
+    octokit: Octokit,
+    repo: RepoRef,
+    status: PullRequestStatus,
+    request: CiRecheckRequest,
+    workflow: WorkflowExecution | undefined,
+    delayMs: number,
+  ): Promise<void> {
+    const nextRequest = {
+      ...request,
+      attempt: request.attempt + 1,
+    };
+
+    await updateInProgressCheck(
+      octokit,
+      repo,
+      request.checkRunId,
+      "CI 확인 대기",
+      this.ciWaitingSummary(status, request, delayMs),
+    );
+    await this.scheduleCiRecheck(octokit, repo, status, nextRequest, workflow, delayMs);
+  }
+
+  private async scheduleCiRecheck(
+    octokit: Octokit,
+    repo: RepoRef,
+    status: PullRequestStatus,
+    request: CiRecheckRequest,
+    workflow: WorkflowExecution | undefined,
+    delayMs: number,
+  ): Promise<void> {
+    if (!workflow?.enqueueSynthetic || !workflow.installationId) {
+      await completeCheck(
+        octokit,
+        repo,
+        request.checkRunId,
+        "action_required",
+        "CI 재확인 예약 실패",
+        [
+          "CI가 아직 완료되지 않았지만 재확인 workflow를 예약할 수 없어 approval을 보류했습니다.",
+          "",
+          this.ciWaitingSummary(status, request, delayMs),
+        ].join("\n"),
+      );
+      return;
+    }
+
+    await workflow.enqueueSynthetic(
+      CI_RECHECK_EVENT,
+      this.ciRecheckDedupeKey(repo, request),
+      {
+        action: "ci_recheck",
+        installation: {
+          id: workflow.installationId,
+        },
+        repository: this.repositoryPayload(repo),
+        ci_recheck: {
+          check_run_id: request.checkRunId,
+          pr_number: request.prNumber,
+          head_sha: request.headSha,
+          mode: request.mode,
+          sender: request.sender,
+          source: request.source,
+          approval_reason: request.approvalReason,
+          approval_body: request.approvalBody,
+          started_at: request.startedAt,
+          attempt: request.attempt,
+        },
+      },
+      delayMs,
+    );
+  }
+
+  private ciRecheckRequest(payload: any): CiRecheckRequest | null {
+    const raw = payload.ci_recheck || payload.ciRecheck || {};
+    const checkRunId = Number(raw.check_run_id ?? raw.checkRunId);
+    const prNumber = Number(raw.pr_number ?? raw.prNumber);
+    const headSha = String(raw.head_sha ?? raw.headSha ?? "");
+    const startedAt = String(raw.started_at ?? raw.startedAt ?? new Date().toISOString());
+    const attempt = Number(raw.attempt ?? 1);
+    const mode = raw.mode === "agent" ? "agent" : "review";
+
+    if (!Number.isFinite(checkRunId) || !Number.isFinite(prNumber) || !headSha) {
+      return null;
+    }
+
+    return {
+      checkRunId,
+      prNumber,
+      headSha,
+      mode,
+      sender: String(raw.sender || "seori"),
+      source: String(raw.source || "unknown"),
+      approvalReason: String(raw.approval_reason ?? raw.approvalReason ?? "CI 통과 후 조치할 항목이 없습니다."),
+      approvalBody: String(raw.approval_body ?? raw.approvalBody ?? ""),
+      startedAt,
+      attempt: Number.isFinite(attempt) && attempt > 0 ? attempt : 1,
+    };
+  }
+
+  private ciRecheckDedupeKey(repo: RepoRef, request: CiRecheckRequest): string {
+    return [
+      CI_RECHECK_EVENT,
+      repo.fullName,
+      request.prNumber,
+      request.headSha,
+      request.checkRunId,
+      request.attempt,
+    ].join(":");
+  }
+
+  private repositoryPayload(repo: RepoRef): any {
+    return {
+      owner: {
+        login: repo.owner,
+      },
+      name: repo.repo,
+      full_name: repo.fullName,
+      private: repo.isPrivate,
+    };
+  }
+
+  private ciWaitingSummary(status: PullRequestStatus, request: CiRecheckRequest, delayMs: number): string {
+    const pending = status.statusChecks.pending.length > 0
+      ? status.statusChecks.pending.map((check) => `- ${check}`).join("\n")
+      : "- 아직 외부 CI check-run/status가 보이지 않습니다.";
+
+    return [
+      "코드 리뷰상 조치할 항목은 없지만, 현재 HEAD의 CI 상태가 아직 확정되지 않아 approval을 보류했습니다.",
+      "",
+      `HEAD: \`${status.headSha}\``,
+      `재확인 시도: \`${request.attempt}\``,
+      `다음 재확인: 약 \`${Math.round(delayMs / 1000)}초\` 후`,
+      "",
+      "### 대기 중",
+      pending,
+      "",
+      "CI가 통과하면 이 check-run을 success로 완료하고 approval review를 제출합니다.",
+      "CI가 실패하거나 제한 시간을 넘기면 그때 PR 코멘트를 남깁니다.",
+    ].join("\n");
+  }
+
+  private ciTimeoutBlockerText(status: PullRequestStatus): string {
+    return [
+      "## CI 대기 시간 초과",
+      "",
+      "코드 리뷰상 조치할 항목은 없었지만, CI가 제한 시간 안에 완료되지 않아 approval review를 제출하지 않았습니다.",
+      "",
+      `HEAD: \`${status.headSha}\``,
+      `제한 시간: \`${Math.round(this.config.ciRecheckTimeoutMs / 60000)}분\``,
+      "",
+      "### 아직 대기 중",
+      ...status.statusChecks.pending.map((check) => `- ${check}`),
+      "",
+      "CI가 정상적으로 끝난 뒤 다시 리뷰를 요청하세요.",
+    ].join("\n");
+  }
+
+  private isCiRecheckTimedOut(request: CiRecheckRequest): boolean {
+    const startedAt = Date.parse(request.startedAt);
+    if (!Number.isFinite(startedAt)) {
+      return false;
+    }
+    return Date.now() - startedAt >= this.config.ciRecheckTimeoutMs;
+  }
+
   private async runAnswer(
     octokit: Octokit,
     repo: RepoRef,
@@ -833,9 +1215,10 @@ export class PrBot {
       "- Treat `Current Changed File Contents` as the source of truth for the post-change file state when present. Do not claim code or configuration is missing if it is present there; GitHub file patches may be abbreviated.",
       "- Each finding must include severity, file/function or line reference when available, impact, and concrete fix direction.",
       "- Failing tests, builds, lint, typecheck, or required status checks are actionable findings unless the context clearly proves an external infrastructure-only failure.",
-      "- Treat pending or queued checks as approval blockers, but do not infer a workflow defect from a transient queued check unless the context proves the job is stuck, unroutable, or using an ineligible runner.",
+      "- Pending or queued checks are merge gates, not code review findings. Do not ask the PR author to wait for transient pending CI unless the context proves the job is stuck, unroutable, or using an ineligible runner.",
       "- Do not flag Seorilabs ARC/self-hosted runner usage solely because it is self-hosted when the PR context shows a private repository and an eligible JS/TS lint, test, typecheck, or build job.",
-      `- Do not say \`${NO_ACTIONABLE_FINDINGS_TEXT}\` while any status check is failing or pending.`,
+      `- Do not say \`${NO_ACTIONABLE_FINDINGS_TEXT}\` while any status check is failing.`,
+      `- It is allowed to say \`${NO_ACTIONABLE_FINDINGS_TEXT}\` while checks are only pending; the system will hold approval until CI settles.`,
       "- Do not include praise, broad summaries, style-only preferences, or nits.",
       "- Do not mention that you are an AI model.",
       "- Keep code quotes short: quote identifiers or a minimal expression only when useful.",
@@ -902,8 +1285,9 @@ export class PrBot {
       "- Choose close when the same acceptance criterion has already failed across repeated rounds and the latest diff still does not address it. Tell the PR author to stop iterating on this PR and reopen a smaller, clearer PR if they still want to continue.",
       "- Never approve if any correctness, runtime, security, data loss, regression, required validation, or required test concern remains.",
       "- Never approve if GitHub mergeable is `false` or mergeable_state is `dirty`/`conflicting`; choose comment and give conflict-resolution steps.",
-      "- Never approve while tests, build, lint, typecheck, or status checks are failing or pending unless the conversation clearly identifies them as infrastructure-only and a maintainer explicitly accepts that risk.",
-      "- Treat pending or queued checks as approval blockers, but do not infer a workflow defect from a transient queued check unless the context proves the job is stuck, unroutable, or using an ineligible runner.",
+      "- Never approve while tests, build, lint, typecheck, or status checks are failing unless the conversation clearly identifies them as infrastructure-only and a maintainer explicitly accepts that risk.",
+      "- Pending or queued checks are merge gates, not code review findings. Do not ask the PR author to wait for transient pending CI unless the context proves the job is stuck, unroutable, or using an ineligible runner.",
+      "- It is allowed to choose approve while checks are only pending; the system will hold approval until CI settles.",
       "- Do not flag Seorilabs ARC/self-hosted runner usage solely because it is self-hosted when the PR context shows a private repository and an eligible JS/TS lint, test, typecheck, or build job.",
       "- If evidence is insufficient, choose comment and state exactly what is missing.",
       "- If prior comments contain `seorilabs-gemini-pr-bot:status=no-action-required`, prefer markers whose recorded HEAD SHA matches the current PR Head SHA.",
@@ -1270,7 +1654,25 @@ export class PrBot {
   }
 
   private hasBlockingStatusChecks(status: PullRequestStatus): boolean {
-    return status.statusChecks.failing.length > 0 || status.statusChecks.pending.length > 0;
+    return this.hasFailingStatusChecks(status) || this.hasPendingStatusChecks(status);
+  }
+
+  private hasFailingStatusChecks(status: PullRequestStatus): boolean {
+    return status.statusChecks.failing.length > 0;
+  }
+
+  private hasPendingStatusChecks(status: PullRequestStatus): boolean {
+    return status.statusChecks.pending.length > 0;
+  }
+
+  private shouldDeferApprovalForCi(trigger: ReviewTrigger, status: PullRequestStatus): boolean {
+    return this.hasPendingStatusChecks(status) || (
+      status.statusChecks.total === 0 && this.isAutomaticReviewTrigger(trigger.source)
+    );
+  }
+
+  private isAutomaticReviewTrigger(source: string): boolean {
+    return ["pull_request.opened", "pull_request.reopened", "pull_request.synchronize"].includes(source);
   }
 
   private statusCheckBlockerText(status: PullRequestStatus): string {

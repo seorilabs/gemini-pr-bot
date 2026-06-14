@@ -13,6 +13,9 @@ export type Config = {
   workflowPollIntervalMs: number;
   workflowLeaseMs: number;
   workflowMaxAttempts: number;
+  ciInitialWaitMs: number;
+  ciRecheckIntervalMs: number;
+  ciRecheckTimeoutMs: number;
   geminiProvider: "api" | "cli";
   geminiApiKey?: string;
   geminiModel?: string;
@@ -213,6 +216,9 @@ export function loadConfig(): Config {
     workflowPollIntervalMs: optionalInt("WORKFLOW_POLL_INTERVAL_MS", 5_000),
     workflowLeaseMs: optionalInt("WORKFLOW_LEASE_MS", 10 * 60 * 1000),
     workflowMaxAttempts: optionalInt("WORKFLOW_MAX_ATTEMPTS", 3),
+    ciInitialWaitMs: optionalInt("CI_INITIAL_WAIT_MS", 60_000),
+    ciRecheckIntervalMs: optionalInt("CI_RECHECK_INTERVAL_MS", 60_000),
+    ciRecheckTimeoutMs: optionalInt("CI_RECHECK_TIMEOUT_MS", 20 * 60 * 1000),
     geminiProvider: geminiProvider as "api" | "cli",
     geminiApiKey,
     geminiModel: process.env.GEMINI_MODEL?.trim(),

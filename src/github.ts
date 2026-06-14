@@ -87,6 +87,7 @@ export type StatusCheckSummary = {
   markdown: string;
   failing: string[];
   pending: string[];
+  total: number;
 };
 
 export function repoFromPayload(payload: any): RepoRef {
@@ -603,6 +604,29 @@ export async function createInProgressCheck(
   }
 }
 
+export async function updateInProgressCheck(
+  octokit: Octokit,
+  repo: RepoRef,
+  checkRunId: number | null,
+  title: string,
+  summary: string,
+): Promise<void> {
+  if (!checkRunId) {
+    return;
+  }
+
+  await octokit.rest.checks.update({
+    owner: repo.owner,
+    repo: repo.repo,
+    check_run_id: checkRunId,
+    status: "in_progress",
+    output: {
+      title,
+      summary: truncate(summary, 65000),
+    },
+  });
+}
+
 async function buildStatusCheckSummary(
   octokit: Octokit,
   repo: RepoRef,
@@ -611,6 +635,7 @@ async function buildStatusCheckSummary(
   const failing: string[] = [];
   const pending: string[] = [];
   const lines: string[] = [];
+  let total = 0;
 
   const [checkRunsResult, statusesResult] = await Promise.allSettled([
     octokit.rest.checks.listForRef({
@@ -634,6 +659,7 @@ async function buildStatusCheckSummary(
         continue;
       }
 
+      total += 1;
       const state = run.status === "completed" ? run.conclusion || "unknown" : run.status || "unknown";
       const name = `check:${run.name}`;
       lines.push(`- ${name}: ${state}`);
@@ -652,6 +678,7 @@ async function buildStatusCheckSummary(
     for (const status of latestStatuses) {
       const name = `status:${status.context || "unknown"}`;
       const state = String(status.state || "unknown").toLowerCase();
+      total += 1;
       lines.push(`- ${name}: ${state}${status.description ? ` - ${truncate(status.description, 200)}` : ""}`);
       if (["error", "failure"].includes(state)) {
         failing.push(`${name} (${state})`);
@@ -677,6 +704,7 @@ async function buildStatusCheckSummary(
     markdown: lines.join("\n"),
     failing,
     pending,
+    total,
   };
 }
 
