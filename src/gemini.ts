@@ -197,7 +197,9 @@ export class GeminiClient {
   }
 
   private reviewProviderAttemptOrder(selectedProvider: AiReviewProviderName): AiReviewProviderName[] {
-    const enabled = new Set(this.config.aiReviewProviders);
+    const enabled = new Set(
+      this.config.aiReviewProviders.filter((provider) => this.config.aiReviewProviderWeights[provider] > 0),
+    );
     const providers: AiReviewProviderName[] = [];
     for (const provider of [
       selectedProvider,

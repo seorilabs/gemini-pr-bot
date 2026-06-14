@@ -9,6 +9,7 @@ import mysql, {
 import type { App } from "octokit";
 import type { Config } from "./config.js";
 import type { PrBot, WorkflowCheckRecord } from "./bot.js";
+import { completeCheck, type RepoRef } from "./github.js";
 import { metrics, type ActiveWorkflowMetric, type WorkflowQueueMetric } from "./metrics.js";
 
 type Logger = {
@@ -31,6 +32,24 @@ type WorkflowRow = RowDataPacket & {
   attempts: number;
   max_attempts: number;
   check_run_id: number | null;
+};
+
+type ExpiredWorkflowRow = WorkflowRow & {
+  repo_full_name: string | null;
+  pr_number: number | null;
+  head_sha: string | null;
+  check_kind: string | null;
+  lease_owner: string | null;
+  lease_expires_at: Date | string | null;
+};
+
+export type ExpiredWorkflowRun = WorkflowRun & {
+  repoFullName: string | null;
+  prNumber: number | null;
+  headSha: string | null;
+  checkKind: string | null;
+  leaseOwner: string | null;
+  leaseExpiresAt: Date | string | null;
 };
 
 type WorkflowQueueMetricRow = RowDataPacket & {
@@ -196,6 +215,79 @@ export class MysqlWorkflowStore {
     }
   }
 
+  async leaseExpiredFinalAttempt(workerId: string): Promise<ExpiredWorkflowRun | null> {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [rows] = await connection.execute<ExpiredWorkflowRow[]>(
+        `
+        SELECT
+          id,
+          dedupe_key,
+          event_name,
+          payload_json,
+          attempts,
+          max_attempts,
+          check_run_id,
+          repo_full_name,
+          pr_number,
+          head_sha,
+          check_kind,
+          lease_owner,
+          lease_expires_at
+        FROM gemini_pr_bot_workflows
+        WHERE
+          status = 'running'
+          AND attempts >= max_attempts
+          AND lease_expires_at < CURRENT_TIMESTAMP(3)
+        ORDER BY lease_expires_at ASC, updated_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+        `,
+      );
+
+      const row = rows[0];
+      if (!row) {
+        await connection.commit();
+        return null;
+      }
+
+      await connection.execute(
+        `
+        UPDATE gemini_pr_bot_workflows
+        SET
+          lease_owner = ?,
+          lease_expires_at = TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(3))
+        WHERE id = ?
+        `,
+        [workerId, this.config.workflowLeaseMs * 1000, row.id],
+      );
+
+      await connection.commit();
+
+      return {
+        id: Number(row.id),
+        dedupeKey: row.dedupe_key,
+        eventName: row.event_name,
+        payload: JSON.parse(row.payload_json),
+        attempts: Number(row.attempts),
+        maxAttempts: Number(row.max_attempts),
+        checkRunId: row.check_run_id === null ? null : Number(row.check_run_id),
+        repoFullName: row.repo_full_name,
+        prNumber: row.pr_number === null ? null : Number(row.pr_number),
+        headSha: row.head_sha,
+        checkKind: row.check_kind,
+        leaseOwner: row.lease_owner,
+        leaseExpiresAt: row.lease_expires_at,
+      };
+    } catch (error) {
+      await rollbackQuietly(connection, this.logger);
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
   async recordCheckRun(id: number, record: WorkflowCheckRecord): Promise<void> {
     await this.pool.execute(
       `
@@ -255,6 +347,22 @@ export class MysqlWorkflowStore {
     );
   }
 
+  async failExpiredFinalAttempt(run: ExpiredWorkflowRun, message: string): Promise<void> {
+    await this.pool.execute(
+      `
+      UPDATE gemini_pr_bot_workflows
+      SET
+        status = 'failed',
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        completed_at = CURRENT_TIMESTAMP(3),
+        last_error = ?
+      WHERE id = ?
+      `,
+      [truncateError(message), run.id],
+    );
+  }
+
   async end(): Promise<void> {
     await this.pool.end();
   }
@@ -306,6 +414,7 @@ export class MysqlWorkflowStore {
 
     return rows.map((row) => activeWorkflowMetricFromRow(row));
   }
+
 }
 
 export class WorkflowEngine {
@@ -382,12 +491,20 @@ export class WorkflowEngine {
     return this.store.activeWorkflowMetrics();
   }
 
+  async leaseExpiredFinalAttempt(): Promise<ExpiredWorkflowRun | null> {
+    return this.store.leaseExpiredFinalAttempt(this.workerId);
+  }
+
+  async failExpiredFinalAttempt(run: ExpiredWorkflowRun, message: string): Promise<void> {
+    await this.store.failExpiredFinalAttempt(run, message);
+  }
+
   private async loop(): Promise<void> {
     while (this.running) {
       try {
         let processed = false;
         do {
-          processed = await this.processOne();
+          processed = (await this.processExpiredFinalAttempt()) || (await this.processOne());
         } while (this.running && processed);
       } catch (error) {
         this.logger.error({ error }, "workflow worker loop failed");
@@ -397,6 +514,83 @@ export class WorkflowEngine {
         await delay(this.config.workflowPollIntervalMs);
       }
     }
+  }
+
+  private async processExpiredFinalAttempt(): Promise<boolean> {
+    const run = await this.leaseExpiredFinalAttempt();
+    if (!run) {
+      return false;
+    }
+
+    const message = [
+      `Workflow ${run.id} expired while marked running after ${run.attempts}/${run.maxAttempts} attempts.`,
+      `Previous lease owner: ${run.leaseOwner || "unknown"}`,
+      `Previous lease expired at: ${run.leaseExpiresAt || "unknown"}`,
+    ].join("\n");
+
+    this.logger.warn(
+      {
+        workflowId: run.id,
+        event: run.eventName,
+        attempt: run.attempts,
+        maxAttempts: run.maxAttempts,
+        checkRunId: run.checkRunId,
+        repo: run.repoFullName,
+        prNumber: run.prNumber,
+      },
+      "expired final-attempt workflow recovered as failed",
+    );
+
+    try {
+      await this.completeExpiredCheckRun(run, message);
+    } catch (error) {
+      this.logger.warn(
+        {
+          error,
+          workflowId: run.id,
+          checkRunId: run.checkRunId,
+          repo: run.repoFullName,
+          prNumber: run.prNumber,
+        },
+        "expired workflow check-run completion failed",
+      );
+    }
+
+    await this.failExpiredFinalAttempt(run, message);
+    metrics.recordWorkflowFailed(run.eventName, true, 0);
+    return true;
+  }
+
+  private async completeExpiredCheckRun(run: ExpiredWorkflowRun, message: string): Promise<void> {
+    if (!run.checkRunId) {
+      return;
+    }
+
+    const installationId = run.payload.installation?.id;
+    if (!installationId) {
+      throw new Error("Webhook payload does not include installation.id");
+    }
+
+    const repo = repoFromWorkflowRun(run);
+    if (!repo) {
+      throw new Error("Workflow payload does not include repository identity");
+    }
+
+    const octokit = await this.app.getInstallationOctokit(installationId);
+    await completeCheck(
+      octokit,
+      repo,
+      run.checkRunId,
+      "failure",
+      "Review workflow expired",
+      [
+        "Seori review workflow lease expired after the maximum attempt count.",
+        "",
+        message,
+        "",
+        "Request a new review after checking bot logs or provider health.",
+      ].join("\n"),
+    );
   }
 
   private async processOne(): Promise<boolean> {
@@ -496,6 +690,25 @@ function delay(ms: number): Promise<void> {
 
 function elapsedSecondsSince(startedAtMs: number): number {
   return (Date.now() - startedAtMs) / 1000;
+}
+
+function repoFromWorkflowRun(run: ExpiredWorkflowRun): RepoRef | null {
+  const fullName = run.repoFullName || run.payload.repository?.full_name || run.payload.repository?.fullName;
+  if (!fullName || typeof fullName !== "string" || !fullName.includes("/")) {
+    return null;
+  }
+
+  const [owner, repo] = fullName.split("/", 2);
+  if (!owner || !repo) {
+    return null;
+  }
+
+  return {
+    owner,
+    repo,
+    fullName,
+    isPrivate: Boolean(run.payload.repository?.private),
+  };
 }
 
 function activeWorkflowMetricFromRow(row: ActiveWorkflowMetricRow): ActiveWorkflowMetric {
