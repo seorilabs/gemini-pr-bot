@@ -1,6 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import { spawn } from "node:child_process";
 import type { AiReviewProviderName, Config } from "./config.js";
+import { metrics } from "./metrics.js";
 import { truncate } from "./text.js";
 
 type Logger = {
@@ -120,12 +121,15 @@ export class GeminiClient {
     for (const provider of providers) {
       const cooldownRemainingMs = this.providerCooldownRemainingMs(provider);
       if (cooldownRemainingMs > 0) {
+        metrics.recordAiProviderAttempt(kind, selectedProvider, provider, "cooldown");
         errors.push(`${provider}: cooldown ${cooldownRemainingMs}ms`);
         continue;
       }
 
+      const startedAt = Date.now();
       try {
         const text = await this.runProvider(provider, kind, prompt);
+        metrics.recordAiProviderAttempt(kind, selectedProvider, provider, "success", elapsedSecondsSince(startedAt));
         this.logger?.info(
           {
             kind,
@@ -138,6 +142,7 @@ export class GeminiClient {
         return text;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        metrics.recordAiProviderAttempt(kind, selectedProvider, provider, "failure", elapsedSecondsSince(startedAt));
         errors.push(`${provider}: ${message}`);
         const cooldownUntil = this.cooldownProvider(provider);
         this.logger?.warn(
@@ -446,4 +451,8 @@ function isQuotaLikeError(message: string): boolean {
     /limit exceeded/i,
     /rateLimitExceeded/i,
   ].some((pattern) => pattern.test(message));
+}
+
+function elapsedSecondsSince(startedAtMs: number): number {
+  return (Date.now() - startedAtMs) / 1000;
 }

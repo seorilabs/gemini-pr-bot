@@ -55,6 +55,7 @@ export type Config = {
   approvalTelegramChannel: string;
   deliveryTtlMs: number;
   shutdownGraceMs: number;
+  metricsAllowForwarded: boolean;
   maxWebhookBodyBytes: number;
   maxPatchChars: number;
   maxContextChars: number;
@@ -264,6 +265,7 @@ export function loadConfig(): Config {
     approvalTelegramChannel: process.env.APPROVAL_TELEGRAM_CHANNEL?.trim() || "syous",
     deliveryTtlMs: optionalInt("DELIVERY_TTL_MS", 60 * 60 * 1000),
     shutdownGraceMs: optionalInt("SHUTDOWN_GRACE_MS", 25_000),
+    metricsAllowForwarded: optionalBool("METRICS_ALLOW_FORWARDED", false),
     maxWebhookBodyBytes: optionalInt("MAX_WEBHOOK_BODY_BYTES", 5 * 1024 * 1024),
     maxPatchChars: optionalInt("MAX_PATCH_CHARS", 120_000),
     maxContextChars: optionalInt("MAX_CONTEXT_CHARS", 160_000),

@@ -1,6 +1,7 @@
 import type { Config } from "./config.js";
 import { CI_RECHECK_EVENT, STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
 import { GeminiClient } from "./gemini.js";
+import { metrics, type GaugeSample } from "./metrics.js";
 import {
   approvePullRequest,
   buildPullRequestContext,
@@ -141,6 +142,19 @@ export class PrBot {
     this.background("pull_request", event.payload, async () => {
       await this.handlePullRequest(event.octokit, event.payload);
     });
+  }
+
+  metricSamples(): GaugeSample[] {
+    return [
+      {
+        name: "gemini_pr_bot_active_tasks",
+        value: this.activeTasks.size,
+      },
+      {
+        name: "gemini_pr_bot_active_check_runs",
+        value: this.activeChecks.size,
+      },
+    ];
   }
 
   async processEvent(
@@ -889,8 +903,10 @@ export class PrBot {
     workflow?: WorkflowExecution,
   ): Promise<ActiveCheckRun | null> {
     let checkRunId = workflow?.checkRunId ?? null;
+    let createdCheckRun = false;
     if (!checkRunId) {
       checkRunId = await createInProgressCheck(octokit, repo, headSha);
+      createdCheckRun = Boolean(checkRunId);
       if (checkRunId && workflow) {
         await workflow.recordCheckRun({
           checkRunId,
@@ -918,6 +934,9 @@ export class PrBot {
     };
     this.nextActiveCheckKey += 1;
     this.activeChecks.set(check.key, check);
+    if (createdCheckRun) {
+      metrics.recordCheckRunStarted(kind);
+    }
     return check;
   }
 
@@ -933,6 +952,7 @@ export class PrBot {
 
     try {
       await completeCheck(check.octokit, check.repo, check.checkRunId, conclusion, title, summary);
+      metrics.recordCheckRunCompleted(check.kind, conclusion);
     } finally {
       this.activeChecks.delete(check.key);
     }

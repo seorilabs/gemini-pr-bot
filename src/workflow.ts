@@ -9,6 +9,7 @@ import mysql, {
 import type { App } from "octokit";
 import type { Config } from "./config.js";
 import type { PrBot, WorkflowCheckRecord } from "./bot.js";
+import { metrics, type WorkflowQueueMetric } from "./metrics.js";
 
 type Logger = {
   info: (value: unknown, message?: string) => void;
@@ -30,6 +31,14 @@ type WorkflowRow = RowDataPacket & {
   attempts: number;
   max_attempts: number;
   check_run_id: number | null;
+};
+
+type WorkflowQueueMetricRow = RowDataPacket & {
+  status: string;
+  event_name: string;
+  row_count: number | string;
+  ready_count: number | string;
+  oldest_age_seconds: number | string | null;
 };
 
 export type WorkflowRun = {
@@ -235,6 +244,28 @@ export class MysqlWorkflowStore {
   async end(): Promise<void> {
     await this.pool.end();
   }
+
+  async queueMetrics(): Promise<WorkflowQueueMetric[]> {
+    const [rows] = await this.pool.execute<WorkflowQueueMetricRow[]>(`
+      SELECT
+        status,
+        event_name,
+        COUNT(*) AS row_count,
+        SUM(CASE WHEN status = 'queued' AND next_run_at <= CURRENT_TIMESTAMP(3) THEN 1 ELSE 0 END) AS ready_count,
+        MAX(TIMESTAMPDIFF(MICROSECOND, created_at, CURRENT_TIMESTAMP(3))) / 1000000 AS oldest_age_seconds
+      FROM gemini_pr_bot_workflows
+      GROUP BY status, event_name
+      ORDER BY status, event_name
+    `);
+
+    return rows.map((row) => ({
+      status: row.status,
+      eventName: row.event_name,
+      count: Number(row.row_count || 0),
+      readyCount: Number(row.ready_count || 0),
+      oldestAgeSeconds: Number(row.oldest_age_seconds || 0),
+    }));
+  }
 }
 
 export class WorkflowEngine {
@@ -267,6 +298,7 @@ export class WorkflowEngine {
   async enqueue(eventName: string, event: WebhookEvent): Promise<void> {
     const dedupeKey = this.dedupeKey(eventName, event);
     const inserted = await this.store.enqueue(eventName, dedupeKey, event.payload);
+    metrics.recordWorkflowEnqueued(eventName, "webhook", inserted);
     this.logger.info(
       {
         event: eventName,
@@ -281,6 +313,7 @@ export class WorkflowEngine {
 
   async enqueueSynthetic(eventName: string, dedupeKey: string, payload: any, delayMs = 0): Promise<boolean> {
     const inserted = await this.store.enqueue(eventName, dedupeKey, payload, delayMs);
+    metrics.recordWorkflowEnqueued(eventName, "synthetic", inserted);
     this.logger.info(
       {
         event: eventName,
@@ -299,6 +332,10 @@ export class WorkflowEngine {
     this.running = false;
     await this.loopPromise;
     await this.store.end();
+  }
+
+  async queueMetrics(): Promise<WorkflowQueueMetric[]> {
+    return this.store.queueMetrics();
   }
 
   private async loop(): Promise<void> {
@@ -333,7 +370,9 @@ export class WorkflowEngine {
       },
       "workflow leased",
     );
+    metrics.recordWorkflowLeased(run.eventName);
 
+    const startedAt = Date.now();
     try {
       const installationId = run.payload.installation?.id;
       if (!installationId) {
@@ -351,9 +390,11 @@ export class WorkflowEngine {
           this.enqueueSynthetic(eventName, dedupeKey, payload, delayMs),
       });
       await this.store.complete(run.id);
+      metrics.recordWorkflowCompleted(run.eventName, elapsedSecondsSince(startedAt));
       this.logger.info({ workflowId: run.id, event: run.eventName }, "workflow completed");
     } catch (error) {
       await this.store.fail(run, error);
+      metrics.recordWorkflowFailed(run.eventName, run.attempts >= run.maxAttempts, elapsedSecondsSince(startedAt));
       this.logger.error(
         {
           error,
@@ -407,4 +448,8 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function elapsedSecondsSince(startedAtMs: number): number {
+  return (Date.now() - startedAtMs) / 1000;
 }

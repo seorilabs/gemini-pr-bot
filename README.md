@@ -128,6 +128,21 @@ The workflow table stores delivery dedupe keys, payload JSON, attempts, lease ow
 
 When a review finds no actionable code issue but external CI is still pending, `Seori Review` stays `in_progress` and the bot schedules a delayed `ci_recheck` workflow instead of posting a "CI is still running" PR comment. The recheck submits approval and marks `Seori Review` successful once CI passes. It posts a PR comment only when CI fails or exceeds `CI_RECHECK_TIMEOUT_MS`.
 
+## Metrics
+
+The daemon exposes Prometheus metrics at `/metrics`. Production Kubernetes includes a `ServiceMonitor` for the `apps/gemini-pr-bot` service, selected by the `rpi-monitoring` Prometheus stack.
+
+By default, `/metrics` rejects requests that arrive through a forwarded ingress header. Set `METRICS_ALLOW_FORWARDED=true` only if metrics must be reachable through the public ingress.
+
+Key metric groups:
+
+- `gemini_pr_bot_workflow_rows`: MySQL workflow rows by status and event.
+- `gemini_pr_bot_workflow_ready_rows`: queued workflows ready to lease now.
+- `gemini_pr_bot_workflow_run_duration_seconds`: workflow processing latency.
+- `gemini_pr_bot_ai_provider_attempts_total`: provider success, failure, and cooldown counts.
+- `gemini_pr_bot_check_runs_completed_total`: `Seori Review` outcomes by kind and conclusion.
+- `gemini_pr_bot_active_tasks` and `gemini_pr_bot_active_check_runs`: in-process work gauges.
+
 ## Required Secrets
 
 Create an organization-owned GitHub App using [docs/github-app-settings.md](docs/github-app-settings.md).

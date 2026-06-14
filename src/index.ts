@@ -8,6 +8,7 @@ import { STALE_REVIEW_SELF_TRIGGER_EVENT } from "./events.js";
 import { PrBot } from "./bot.js";
 import { StaleReviewMonitor, staleSelfTriggerDedupeKey, staleSelfTriggerPayload } from "./stale.js";
 import { MysqlWorkflowStore, WorkflowEngine } from "./workflow.js";
+import { metrics, metricsContentType, type WorkflowQueueMetric } from "./metrics.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const config = loadConfig();
@@ -85,6 +86,36 @@ function writeText(res: ServerResponse, statusCode: number, body: string): void 
   res.end(body);
 }
 
+function writeMetrics(res: ServerResponse, body: string): void {
+  res.writeHead(200, {
+    "content-type": metricsContentType(),
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+function hasForwardedHeaders(req: IncomingMessage): boolean {
+  return Boolean(req.headers["x-forwarded-for"] || req.headers["forwarded"]);
+}
+
+async function renderMetrics(): Promise<string> {
+  let workflowQueue: WorkflowQueueMetric[] = [];
+  try {
+    workflowQueue = workflowEngine ? await workflowEngine.queueMetrics() : [];
+  } catch (error) {
+    logger.warn({ error }, "workflow queue metrics unavailable");
+  }
+
+  return metrics.render({
+    infoLabels: {
+      workflow_store: config.workflowStore,
+      gemini_provider: config.geminiProvider,
+    },
+    gauges: bot.metricSamples(),
+    workflowQueue,
+  });
+}
+
 async function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -102,11 +133,22 @@ async function readBody(req: IncomingMessage, maxBytes: number): Promise<string>
 }
 
 const server = createServer(async (req, res) => {
+  let metricEvent = "unknown";
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
     if (req.method === "GET" && (url.pathname === "/healthz" || url.pathname === "/readyz")) {
       writeText(res, 200, "ok\n");
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/metrics") {
+      if (!config.metricsAllowForwarded && hasForwardedHeaders(req)) {
+        writeText(res, 403, "forbidden\n");
+        return;
+      }
+
+      writeMetrics(res, await renderMetrics());
       return;
     }
 
@@ -117,14 +159,17 @@ const server = createServer(async (req, res) => {
 
     const delivery = String(req.headers["x-github-delivery"] || "");
     const name = String(req.headers["x-github-event"] || "");
+    metricEvent = name || "unknown";
     const signature = String(req.headers["x-hub-signature-256"] || "");
     if (!delivery || !name || !signature) {
+      metrics.recordWebhookRequest(metricEvent, "rejected_missing_headers");
       writeText(res, 400, "missing github webhook headers\n");
       return;
     }
 
     if (deliveries.has(delivery)) {
       logger.info({ delivery, event: name }, "duplicate webhook delivery ignored");
+      metrics.recordWebhookRequest(metricEvent, "duplicate");
       writeText(res, 202, "duplicate\n");
       return;
     }
@@ -144,10 +189,12 @@ const server = createServer(async (req, res) => {
       throw error;
     }
 
+    metrics.recordWebhookRequest(metricEvent, "accepted");
     writeText(res, 202, "accepted\n");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.warn({ error }, "webhook request rejected");
+    metrics.recordWebhookRequest(metricEvent, "rejected");
     writeText(res, 400, `${message}\n`);
   }
 });
@@ -230,6 +277,7 @@ server.listen(config.port, () => {
       staleReviewCloseEnabled: config.staleReviewCloseEnabled,
       staleReviewThresholdMs: config.staleReviewThresholdMs,
       staleReviewScanIntervalMs: config.staleReviewScanIntervalMs,
+      metricsAllowForwarded: config.metricsAllowForwarded,
     },
     "Seori review bot listening",
   );
