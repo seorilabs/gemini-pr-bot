@@ -206,6 +206,7 @@ server.listen(config.port, () => {
       allowPublicRepos: config.allowPublicRepos,
       autoReviewOnOpen: config.autoReviewOnOpen,
       autoReviewOnSynchronize: config.autoReviewOnSynchronize,
+      autoReviewIgnoredRepositories: [...config.autoReviewIgnoredRepositories],
     },
     "Seori review bot listening",
   );

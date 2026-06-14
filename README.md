@@ -135,9 +135,11 @@ AI_REVIEW_PROVIDER_WEIGHTS=gemini:100,copilot:0,cursor:0
 AI_REVIEW_PROVIDER_FALLBACK_ORDER=gemini,cursor,copilot
 COPILOT_MODEL=auto
 CURSOR_MODEL=gpt-5.2
+AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot
 ```
 
 Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions all use the multi-provider router. This keeps `/agent` approval decisions working when Gemini CLI is temporarily quota-blocked.
+Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
 
 ## Build And Deploy
 

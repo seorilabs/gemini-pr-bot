@@ -118,6 +118,8 @@ spec:
               value: "true"
             - name: AUTO_REVIEW_ON_SYNCHRONIZE
               value: "true"
+            - name: AUTO_REVIEW_IGNORED_REPOSITORIES
+              value: seorilabs/gemini-pr-bot
             - name: LOG_LEVEL
               value: info
             - name: MYSQL_USER

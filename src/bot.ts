@@ -392,9 +392,15 @@ export class PrBot {
       return;
     }
 
+    const repo = repoFromPayload(payload);
     const action = payload.action;
+    if (this.isAutoReviewIgnored(repo) && ["opened", "reopened", "synchronize"].includes(action)) {
+      this.logger.info({ repo: repo.fullName, action }, "automatic pull request review ignored for repository");
+      return;
+    }
+
     if (["opened", "reopened"].includes(action) && this.config.autoReviewOnOpen) {
-      await this.runReview(octokit, repoFromPayload(payload), payload.pull_request.number, {
+      await this.runReview(octokit, repo, payload.pull_request.number, {
         source: `pull_request.${action}`,
         sender: payload.sender.login,
       }, workflow);
@@ -402,11 +408,16 @@ export class PrBot {
     }
 
     if (action === "synchronize" && this.config.autoReviewOnSynchronize) {
-      await this.runReview(octokit, repoFromPayload(payload), payload.pull_request.number, {
+      await this.runReview(octokit, repo, payload.pull_request.number, {
         source: "pull_request.synchronize",
         sender: payload.sender.login,
       }, workflow);
     }
+  }
+
+  private isAutoReviewIgnored(repo: RepoRef): boolean {
+    const ignored = this.config.autoReviewIgnoredRepositories;
+    return ignored.has(repo.fullName.toLowerCase()) || ignored.has(repo.repo.toLowerCase());
   }
 
   private async runReview(

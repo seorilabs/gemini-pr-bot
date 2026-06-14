@@ -38,6 +38,7 @@ export type Config = {
   allowPublicRepos: boolean;
   autoReviewOnOpen: boolean;
   autoReviewOnSynchronize: boolean;
+  autoReviewIgnoredRepositories: Set<string>;
   deliveryTtlMs: number;
   shutdownGraceMs: number;
   maxWebhookBodyBytes: number;
@@ -83,6 +84,10 @@ function optionalList(name: string, fallback: string[]): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function optionalRepositorySet(name: string, fallback: string[]): Set<string> {
+  return new Set(optionalList(name, fallback).map((item) => item.toLowerCase()));
 }
 
 function isAiReviewProviderName(value: string): value is AiReviewProviderName {
@@ -213,6 +218,7 @@ export function loadConfig(): Config {
     allowPublicRepos: optionalBool("ALLOW_PUBLIC_REPOS", false),
     autoReviewOnOpen: optionalBool("AUTO_REVIEW_ON_OPEN", true),
     autoReviewOnSynchronize: optionalBool("AUTO_REVIEW_ON_SYNCHRONIZE", false),
+    autoReviewIgnoredRepositories: optionalRepositorySet("AUTO_REVIEW_IGNORED_REPOSITORIES", []),
     deliveryTtlMs: optionalInt("DELIVERY_TTL_MS", 60 * 60 * 1000),
     shutdownGraceMs: optionalInt("SHUTDOWN_GRACE_MS", 25_000),
     maxWebhookBodyBytes: optionalInt("MAX_WEBHOOK_BODY_BYTES", 5 * 1024 * 1024),
