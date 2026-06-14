@@ -39,6 +39,10 @@ export type Config = {
   autoReviewOnOpen: boolean;
   autoReviewOnSynchronize: boolean;
   autoReviewIgnoredRepositories: Set<string>;
+  approvalTelegramNotifyEnabled: boolean;
+  natsServerUrl: string;
+  approvalTelegramBot: string;
+  approvalTelegramChannel: string;
   deliveryTtlMs: number;
   shutdownGraceMs: number;
   maxWebhookBodyBytes: number;
@@ -219,6 +223,10 @@ export function loadConfig(): Config {
     autoReviewOnOpen: optionalBool("AUTO_REVIEW_ON_OPEN", true),
     autoReviewOnSynchronize: optionalBool("AUTO_REVIEW_ON_SYNCHRONIZE", false),
     autoReviewIgnoredRepositories: optionalRepositorySet("AUTO_REVIEW_IGNORED_REPOSITORIES", []),
+    approvalTelegramNotifyEnabled: optionalBool("APPROVAL_TELEGRAM_NOTIFY_ENABLED", false),
+    natsServerUrl: process.env.NATS_SERVER_URL?.trim() || "nats://localhost:4222",
+    approvalTelegramBot: process.env.APPROVAL_TELEGRAM_BOT?.trim() || "seolee_bot",
+    approvalTelegramChannel: process.env.APPROVAL_TELEGRAM_CHANNEL?.trim() || "syous",
     deliveryTtlMs: optionalInt("DELIVERY_TTL_MS", 60 * 60 * 1000),
     shutdownGraceMs: optionalInt("SHUTDOWN_GRACE_MS", 25_000),
     maxWebhookBodyBytes: optionalInt("MAX_WEBHOOK_BODY_BYTES", 5 * 1024 * 1024),

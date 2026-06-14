@@ -9,6 +9,8 @@ flowchart LR
   Bot --> GitHubAPI["GitHub App Installation API"]
   Bot --> Providers["Gemini / Cursor / Copilot"]
   Bot --> Comment["PR comments / inline replies / check runs"]
+  Bot --> NATS["NATS telegram subject"]
+  NATS --> Telegram["Telegram"]
 ```
 
 ## Behavior
@@ -18,6 +20,7 @@ flowchart LR
 - Runs explicit review on `@gemini-cli /review`; if there are no actionable findings, it submits an approval review instead of only commenting.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]`.
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
+- Keeps review loops bounded by stating acceptance criteria first, narrowing follow-up checks to new changes plus stability regressions once those criteria are met, and closing PRs that repeatedly fail the same criteria.
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Seori Review` check run for review and agent jobs.
@@ -27,6 +30,7 @@ flowchart LR
 - Ignores resolved inline review threads.
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
 - Persists active check-run IDs so a restarted worker can resume a job instead of leaving stale pending checks.
+- Publishes a best-effort Telegram notification through NATS after the bot successfully submits an approval review.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default.
 
@@ -140,6 +144,15 @@ AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot
 
 Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions all use the multi-provider router. This keeps `/agent` approval decisions working when Gemini CLI is temporarily quota-blocked.
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
+
+Optional approval Telegram notifications use the same NATS message contract as `fundevel/cronjobs`: publish `{ "text": "..." }` to `telegram.<bot>.<channel>`.
+
+```text
+APPROVAL_TELEGRAM_NOTIFY_ENABLED=true
+NATS_SERVER_URL=nats://nats.data.svc.cluster.local:4222
+APPROVAL_TELEGRAM_BOT=seolee_bot
+APPROVAL_TELEGRAM_CHANNEL=syous
+```
 
 ## Build And Deploy
 

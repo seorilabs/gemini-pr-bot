@@ -573,6 +573,19 @@ export async function requestChangesPullRequest(
   });
 }
 
+export async function closePullRequest(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+): Promise<void> {
+  await octokit.rest.pulls.update({
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: prNumber,
+    state: "closed",
+  });
+}
+
 export async function postPrComment(
   octokit: Octokit,
   repo: RepoRef,

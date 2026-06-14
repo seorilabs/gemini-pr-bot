@@ -3,6 +3,7 @@ import { GeminiClient } from "./gemini.js";
 import {
   approvePullRequest,
   buildPullRequestContext,
+  closePullRequest,
   completeCheck,
   createInProgressCheck,
   getPullRequestStatus,
@@ -21,12 +22,14 @@ import {
   type RepoRef,
   type ReviewTrigger,
 } from "./github.js";
+import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./telegram.js";
 import { parseBotCommand } from "./text.js";
 
 const NO_ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=no-action-required";
 const MERGE_CONFLICT_MARKER = "seorilabs-gemini-pr-bot:status=merge-conflict";
 const AGENT_APPROVE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=approve -->";
 const AGENT_COMMENT_MARKER = "<!-- seorilabs-gemini-pr-bot:action=comment -->";
+const AGENT_CLOSE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=close -->";
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 
 type AgentReplyTarget =
@@ -72,6 +75,7 @@ export type WorkflowExecution = {
 
 export class PrBot {
   private readonly gemini: GeminiClient;
+  private readonly approvalNotifier: ApprovalTelegramNotifier;
   private readonly activeTasks = new Set<Promise<void>>();
   private readonly activeChecks = new Map<number, ActiveCheckRun>();
   private nextActiveCheckKey = 1;
@@ -82,6 +86,7 @@ export class PrBot {
     private readonly logger: Logger,
   ) {
     this.gemini = new GeminiClient(config, logger);
+    this.approvalNotifier = new ApprovalTelegramNotifier(config, logger);
   }
 
   scheduleIssueComment(event: any): void {
@@ -204,6 +209,7 @@ export class PrBot {
         ),
       ),
     );
+    await this.approvalNotifier.close();
 
     const failed = results.filter((result) => result.status === "rejected").length;
     this.logger.warn(
@@ -487,12 +493,18 @@ export class PrBot {
       }
 
       if (this.shouldApproveReviewText(reviewText, latest)) {
-        await approvePullRequest(
+        await this.approveAndNotify(
           octokit,
           repo,
           prNumber,
+          latest,
           this.approvalText(trigger.sender, "리뷰 결과 조치할 항목이 없습니다.", latest.headSha, reviewText),
-          latest.headSha,
+          {
+            mode: "review",
+            sender: trigger.sender,
+            source: trigger.source,
+            reason: "리뷰 결과 조치할 항목이 없습니다.",
+          },
         );
         await this.completeTrackedCheck(check, "success", "PR 승인 완료", reviewText);
         return;
@@ -577,14 +589,27 @@ export class PrBot {
       }
 
       if (this.shouldApproveAgentText(agentText, latest)) {
-        await approvePullRequest(
+        await this.approveAndNotify(
           octokit,
           repo,
           prNumber,
+          latest,
           this.approvalText(trigger.sender, "에이전트 판단 결과 조치할 항목이 없습니다.", latest.headSha, publicText),
-          latest.headSha,
+          {
+            mode: "agent",
+            sender: trigger.sender,
+            source: trigger.source,
+            reason: "에이전트 판단 결과 조치할 항목이 없습니다.",
+          },
         );
         await this.completeTrackedCheck(check, "success", "PR 승인 완료", publicText);
+        return;
+      }
+
+      if (this.shouldCloseAgentText(agentText, latest)) {
+        await requestChangesPullRequest(octokit, repo, prNumber, publicText, latest.headSha);
+        await closePullRequest(octokit, repo, prNumber);
+        await this.completeTrackedCheck(check, "action_required", "반복 미충족으로 PR 종료", publicText);
         return;
       }
 
@@ -700,6 +725,10 @@ export class PrBot {
       "- Find actionable defects that a maintainer should fix before merge.",
       "- Prefer fewer high-confidence findings over many low-confidence comments.",
       "- If a possible concern is not directly supported by the diff, put it under verification suggestions instead of findings.",
+      "- Make the acceptance criteria explicit before judging the PR. Derive them only from the PR title/body, user request, recent maintainer comments, and unresolved review context.",
+      "- Avoid long review loops. If the PR now satisfies the acceptance criteria, narrow the review to defects introduced by the new changes made to satisfy those criteria, plus any clear stability regression those changes cause.",
+      "- Do not reopen settled or unrelated issues just because older context is present. Reopen only when the latest diff contradicts a prior resolution or creates a new stability risk.",
+      "- If the same acceptance criterion has already failed across repeated rounds and the latest diff still does not address it, say that the PR should be abandoned or resubmitted with a smaller scope instead of requesting another vague retry.",
       "",
       "Finding rules:",
       "- Findings must be grounded in the supplied diff/context.",
@@ -723,6 +752,9 @@ export class PrBot {
       "",
       "Output format:",
       "## 리뷰",
+      "",
+      "### 인수조건",
+      "- 이 PR이 merge되기 위해 반드시 만족해야 하는 조건만 1-4개로 명확히 쓰세요.",
       "",
       "### 발견사항",
       "- `[심각도] file_or_symbol`: 영향과 근거. 수정 방향.",
@@ -758,11 +790,16 @@ export class PrBot {
       "Possible actions:",
       "- comment: answer, explain, ask for clarification, or report actionable findings.",
       "- approve: submit an approval review because the PR has no actionable findings remaining.",
+      "- close: submit a request-changes review and close the PR because the same acceptance criteria remain unmet after repeated rounds.",
       "",
       "Decision rules:",
       "- If the user asks a direct question, answer it and choose comment unless the same message clearly asks for readiness or approval.",
       "- If the user says fixes were applied, thanks after addressing review feedback, asks for another look, or asks whether anything remains, perform a review-quality assessment.",
+      "- Start by making the acceptance criteria explicit. Derive them only from the PR title/body, user request, recent maintainer comments, and unresolved review context.",
+      "- If the PR now satisfies the acceptance criteria, narrow the review to defects introduced by the new changes made to satisfy those criteria, plus any clear stability regression those changes cause.",
+      "- Do not reopen settled or unrelated issues just because older context is present. Reopen only when the latest diff contradicts a prior resolution or creates a new stability risk.",
       "- Choose approve only when the supplied diff and conversation show no actionable findings remain.",
+      "- Choose close when the same acceptance criterion has already failed across repeated rounds and the latest diff still does not address it. Tell the PR author to stop iterating on this PR and reopen a smaller, clearer PR if they still want to continue.",
       "- Never approve if any correctness, runtime, security, data loss, regression, required validation, or required test concern remains.",
       "- Never approve if GitHub mergeable is `false` or mergeable_state is `dirty`/`conflicting`; choose comment and give conflict-resolution steps.",
       "- Never approve while tests, build, lint, typecheck, or status checks are failing or pending unless the conversation clearly identifies them as infrastructure-only and a maintainer explicitly accepts that risk.",
@@ -775,14 +812,19 @@ export class PrBot {
       "- Include exactly one hidden action marker as the first non-empty line:",
       `  ${AGENT_APPROVE_MARKER}`,
       `  ${AGENT_COMMENT_MARKER}`,
+      `  ${AGENT_CLOSE_MARKER}`,
       `- If action is approve, the Findings section must contain exactly: \`${NO_ACTIONABLE_FINDINGS_TEXT}\``,
       "- If action is comment because findings remain, list findings first, ordered by severity.",
+      "- If action is close, the `### 판단` section must say the PR is being closed, identify the repeated unmet acceptance criterion, and tell the author not to keep iterating in this PR.",
       "",
       "Output format:",
       "## 에이전트 판단",
       "",
       "### 판단",
-      "- `approve` 또는 `comment`와 짧은 이유.",
+      "- `approve`, `comment`, 또는 `close`와 짧은 이유.",
+      "",
+      "### 인수조건",
+      "- 이 PR이 merge되기 위해 반드시 만족해야 하는 조건만 1-4개로 명확히 쓰세요.",
       "",
       "### 발견사항",
       "- `[심각도] file_or_symbol`: 영향과 근거. 수정 방향.",
@@ -856,13 +898,46 @@ export class PrBot {
       return;
     }
 
-    await approvePullRequest(
+    await this.approveAndNotify(
       octokit,
       repo,
       prNumber,
+      status,
       this.approvalText(sender, reason, status.headSha),
-      status.headSha,
+      {
+        mode: "manual",
+        sender,
+        source: "approve_command",
+        reason,
+      },
     );
+  }
+
+  private async approveAndNotify(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    status: PullRequestStatus,
+    body: string,
+    notification: {
+      mode: ApprovalNotificationMode;
+      sender: string;
+      source: string;
+      reason: string;
+    },
+  ): Promise<void> {
+    await approvePullRequest(octokit, repo, prNumber, body, status.headSha);
+    await this.approvalNotifier.notifyApproval({
+      repoFullName: repo.fullName,
+      prNumber,
+      prTitle: status.title,
+      prUrl: `https://github.com/${repo.fullName}/pull/${prNumber}`,
+      headSha: status.headSha,
+      sender: notification.sender,
+      source: notification.source,
+      reason: notification.reason,
+      mode: notification.mode,
+    });
   }
 
   private async shouldIgnoreClosedPullRequest(
@@ -1070,6 +1145,14 @@ export class PrBot {
     );
   }
 
+  private shouldCloseAgentText(text: string, status: PullRequestStatus): boolean {
+    return (
+      !this.isClosedPullRequest(status) &&
+      !this.hasMergeConflict(status) &&
+      text.includes(AGENT_CLOSE_MARKER)
+    );
+  }
+
   private wantsApproval(text: string): boolean {
     return /\bNo actionable findings\./iu.test(text) || text.includes(NO_ACTIONABLE_FINDINGS_TEXT);
   }
@@ -1077,7 +1160,11 @@ export class PrBot {
   private publicAgentText(text: string): string {
     return text
       .split("\n")
-      .filter((line) => line.trim() !== AGENT_APPROVE_MARKER && line.trim() !== AGENT_COMMENT_MARKER)
+      .filter((line) =>
+        line.trim() !== AGENT_APPROVE_MARKER &&
+        line.trim() !== AGENT_COMMENT_MARKER &&
+        line.trim() !== AGENT_CLOSE_MARKER
+      )
       .join("\n")
       .trim();
   }
