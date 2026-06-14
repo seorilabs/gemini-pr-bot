@@ -8,7 +8,17 @@ type Logger = {
   warn: (value: unknown, message?: string) => void;
 };
 
-type AiTaskKind = "review" | "answer" | "agent";
+export type AiTaskKind = "review" | "answer" | "agent";
+
+export type AiProviderQuotaEvent = {
+  provider: AiReviewProviderName;
+  selectedProvider: AiReviewProviderName;
+  kind: AiTaskKind;
+  errorMessage: string;
+  cooldownMs: number;
+  cooldownUntil: string;
+  occurredAt: string;
+};
 
 export class GeminiClient {
   private readonly ai?: GoogleGenAI;
@@ -17,6 +27,7 @@ export class GeminiClient {
   constructor(
     private readonly config: Config,
     private readonly logger?: Logger,
+    private readonly quotaReporter?: (event: AiProviderQuotaEvent) => Promise<void> | void,
   ) {
     if (config.geminiProvider === "api") {
       this.ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
@@ -128,7 +139,7 @@ export class GeminiClient {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         errors.push(`${provider}: ${message}`);
-        this.cooldownProvider(provider);
+        const cooldownUntil = this.cooldownProvider(provider);
         this.logger?.warn(
           {
             kind,
@@ -139,6 +150,17 @@ export class GeminiClient {
           },
           "AI provider failed",
         );
+        if (isQuotaLikeError(message)) {
+          this.reportQuotaEvent({
+            provider,
+            selectedProvider,
+            kind,
+            errorMessage: truncate(message, 600),
+            cooldownMs: this.config.aiReviewProviderCooldownMs,
+            cooldownUntil: new Date(cooldownUntil).toISOString(),
+            occurredAt: new Date().toISOString(),
+          });
+        }
       }
     }
 
@@ -188,8 +210,23 @@ export class GeminiClient {
     return Math.max(0, (this.providerCooldownUntil.get(provider) || 0) - Date.now());
   }
 
-  private cooldownProvider(provider: AiReviewProviderName): void {
-    this.providerCooldownUntil.set(provider, Date.now() + this.config.aiReviewProviderCooldownMs);
+  private cooldownProvider(provider: AiReviewProviderName): number {
+    const cooldownUntil = Date.now() + this.config.aiReviewProviderCooldownMs;
+    this.providerCooldownUntil.set(provider, cooldownUntil);
+    return cooldownUntil;
+  }
+
+  private reportQuotaEvent(event: AiProviderQuotaEvent): void {
+    try {
+      const result = this.quotaReporter?.(event);
+      if (result) {
+        void result.catch((error) => {
+          this.logger?.warn({ error, provider: event.provider, kind: event.kind }, "AI quota report failed");
+        });
+      }
+    } catch (error) {
+      this.logger?.warn({ error, provider: event.provider, kind: event.kind }, "AI quota report failed");
+    }
   }
 
   private runProvider(provider: AiReviewProviderName, kind: AiTaskKind, prompt: string): Promise<string> {
@@ -395,4 +432,18 @@ export class GeminiClient {
       child.stdin.end(options.stdin);
     });
   }
+}
+
+function isQuotaLikeError(message: string): boolean {
+  return [
+    /\b429\b/i,
+    /quota/i,
+    /rate[\s_-]*limit/i,
+    /resource exhausted/i,
+    /too many requests/i,
+    /insufficient[_\s-]*quota/i,
+    /usage limit/i,
+    /limit exceeded/i,
+    /rateLimitExceeded/i,
+  ].some((pattern) => pattern.test(message));
 }

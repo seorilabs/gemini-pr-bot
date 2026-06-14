@@ -122,6 +122,20 @@ spec:
               value: seorilabs/gemini-pr-bot
             - name: APPROVAL_TELEGRAM_NOTIFY_ENABLED
               value: "true"
+            - name: QUOTA_TELEGRAM_NOTIFY_ENABLED
+              value: "true"
+            - name: QUOTA_TELEGRAM_SUMMARY_INTERVAL_MS
+              value: "3600000"
+            - name: STALE_REVIEW_CLOSE_ENABLED
+              value: "true"
+            - name: STALE_REVIEW_THRESHOLD_MS
+              value: "86400000"
+            - name: STALE_REVIEW_SCAN_INTERVAL_MS
+              value: "1800000"
+            - name: STALE_REVIEW_MAX_PRS_PER_SCAN
+              value: "100"
+            - name: STALE_REVIEW_IGNORED_REPOSITORIES
+              value: seorilabs/gemini-pr-bot
             - name: NATS_SERVER_URL
               value: nats://nats.data.svc.cluster.local:4222
             - name: APPROVAL_TELEGRAM_BOT

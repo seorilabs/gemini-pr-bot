@@ -31,6 +31,8 @@ flowchart LR
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
 - Persists active check-run IDs so a restarted worker can resume a job instead of leaving stale pending checks.
 - Publishes a best-effort Telegram notification through NATS after the bot successfully submits an approval review.
+- Publishes a throttled Telegram quota summary when provider errors look like quota or rate-limit failures.
+- Periodically closes stale PRs when a bot action-required review/comment has had no new commit or human response for more than 24 hours.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default.
 
@@ -149,10 +151,26 @@ Optional approval Telegram notifications use the same NATS message contract as `
 
 ```text
 APPROVAL_TELEGRAM_NOTIFY_ENABLED=true
+QUOTA_TELEGRAM_NOTIFY_ENABLED=true
+QUOTA_TELEGRAM_SUMMARY_INTERVAL_MS=3600000
 NATS_SERVER_URL=nats://nats.data.svc.cluster.local:4222
 APPROVAL_TELEGRAM_BOT=seolee_bot
 APPROVAL_TELEGRAM_CHANNEL=syous
 ```
+
+Quota summaries are based on provider error text and cooldown state. The Gemini/Copilot/Cursor CLI paths do not expose exact remaining quota, so the bot reports the detected quota-like failure, provider routing, weights, fallback order, and cooldown release time.
+
+Optional stale review closing:
+
+```text
+STALE_REVIEW_CLOSE_ENABLED=true
+STALE_REVIEW_THRESHOLD_MS=86400000
+STALE_REVIEW_SCAN_INTERVAL_MS=1800000
+STALE_REVIEW_MAX_PRS_PER_SCAN=100
+STALE_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot
+```
+
+The stale scanner only considers hidden bot markers for the current PR HEAD. A new commit or a non-bot issue/review/review-comment response after the marker keeps the PR open.
 
 ## Build And Deploy
 

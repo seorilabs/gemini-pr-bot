@@ -26,6 +26,7 @@ import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./teleg
 import { parseBotCommand } from "./text.js";
 
 const NO_ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=no-action-required";
+const ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=action-required";
 const MERGE_CONFLICT_MARKER = "seorilabs-gemini-pr-bot:status=merge-conflict";
 const AGENT_APPROVE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=approve -->";
 const AGENT_COMMENT_MARKER = "<!-- seorilabs-gemini-pr-bot:action=comment -->";
@@ -85,8 +86,8 @@ export class PrBot {
     private readonly config: Config,
     private readonly logger: Logger,
   ) {
-    this.gemini = new GeminiClient(config, logger);
     this.approvalNotifier = new ApprovalTelegramNotifier(config, logger);
+    this.gemini = new GeminiClient(config, logger, (event) => this.approvalNotifier.notifyQuotaEvent(event));
   }
 
   scheduleIssueComment(event: any): void {
@@ -486,7 +487,7 @@ export class PrBot {
       }
 
       if (this.wantsApproval(reviewText) && this.hasBlockingStatusChecks(latest)) {
-        const blockerText = this.statusCheckBlockerText(latest);
+        const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
         await postPrComment(octokit, repo, prNumber, blockerText);
         await this.completeTrackedCheck(check, "action_required", "상태 체크 확인 필요", blockerText);
         return;
@@ -510,8 +511,9 @@ export class PrBot {
         return;
       }
 
-      await postPrComment(octokit, repo, prNumber, reviewText);
-      await this.completeTrackedCheck(check, "success", "리뷰 완료", reviewText);
+      const actionRequiredText = this.actionRequiredText("review", latest.headSha, reviewText);
+      await postPrComment(octokit, repo, prNumber, actionRequiredText);
+      await this.completeTrackedCheck(check, "success", "리뷰 완료", actionRequiredText);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.completeTrackedCheck(check, "failure", "리뷰 실패", message);
@@ -582,7 +584,7 @@ export class PrBot {
       }
 
       if (this.wantsApproval(agentText) && this.hasBlockingStatusChecks(latest)) {
-        const blockerText = this.statusCheckBlockerText(latest);
+        const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
         await postPrComment(octokit, repo, prNumber, blockerText);
         await this.completeTrackedCheck(check, "action_required", "상태 체크 확인 필요", blockerText);
         return;
@@ -1066,6 +1068,10 @@ export class PrBot {
       analysis ? "## 판단 근거" : undefined,
       analysis || undefined,
     ].filter((line): line is string => line !== undefined).join("\n");
+  }
+
+  private actionRequiredText(kind: string, headSha: string, body: string): string {
+    return [`<!-- ${ACTION_REQUIRED_MARKER} kind=${kind} head=${headSha} -->`, body].join("\n");
   }
 
   private mergeConflictText(repo: RepoRef, prNumber: number, status: PullRequestStatus): string {

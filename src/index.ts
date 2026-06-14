@@ -5,6 +5,7 @@ import pino from "pino";
 import { loadConfig } from "./config.js";
 import { TtlSet } from "./dedupe.js";
 import { PrBot } from "./bot.js";
+import { StaleReviewMonitor } from "./stale.js";
 import { MysqlWorkflowStore, WorkflowEngine } from "./workflow.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -20,6 +21,7 @@ const app = new App({
 });
 
 const bot = new PrBot(config, logger);
+const staleReviewMonitor = new StaleReviewMonitor(app, config, logger);
 const workflowEngine =
   config.workflowStore === "mysql"
     ? new WorkflowEngine(app, bot, new MysqlWorkflowStore(config, logger), config, logger)
@@ -168,7 +170,7 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   }, config.shutdownGraceMs).unref();
 
   try {
-    await Promise.all([closeServer(), workflowEngine?.stop(), bot.shutdown(signal)]);
+    await Promise.all([closeServer(), staleReviewMonitor.stop(), workflowEngine?.stop(), bot.shutdown(signal)]);
     clearTimeout(forceExitTimer);
     process.exit(0);
   } catch (error) {
@@ -189,6 +191,7 @@ process.on("SIGINT", () => {
 if (workflowEngine) {
   await workflowEngine.start();
 }
+staleReviewMonitor.start();
 
 server.listen(config.port, () => {
   logger.info(
@@ -207,6 +210,10 @@ server.listen(config.port, () => {
       autoReviewOnOpen: config.autoReviewOnOpen,
       autoReviewOnSynchronize: config.autoReviewOnSynchronize,
       autoReviewIgnoredRepositories: [...config.autoReviewIgnoredRepositories],
+      quotaTelegramNotifyEnabled: config.quotaTelegramNotifyEnabled,
+      staleReviewCloseEnabled: config.staleReviewCloseEnabled,
+      staleReviewThresholdMs: config.staleReviewThresholdMs,
+      staleReviewScanIntervalMs: config.staleReviewScanIntervalMs,
     },
     "Seori review bot listening",
   );

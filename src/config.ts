@@ -40,6 +40,13 @@ export type Config = {
   autoReviewOnSynchronize: boolean;
   autoReviewIgnoredRepositories: Set<string>;
   approvalTelegramNotifyEnabled: boolean;
+  quotaTelegramNotifyEnabled: boolean;
+  quotaTelegramSummaryIntervalMs: number;
+  staleReviewCloseEnabled: boolean;
+  staleReviewThresholdMs: number;
+  staleReviewScanIntervalMs: number;
+  staleReviewMaxPrsPerScan: number;
+  staleReviewIgnoredRepositories: Set<string>;
   natsServerUrl: string;
   approvalTelegramBot: string;
   approvalTelegramChannel: string;
@@ -224,6 +231,13 @@ export function loadConfig(): Config {
     autoReviewOnSynchronize: optionalBool("AUTO_REVIEW_ON_SYNCHRONIZE", false),
     autoReviewIgnoredRepositories: optionalRepositorySet("AUTO_REVIEW_IGNORED_REPOSITORIES", []),
     approvalTelegramNotifyEnabled: optionalBool("APPROVAL_TELEGRAM_NOTIFY_ENABLED", false),
+    quotaTelegramNotifyEnabled: optionalBool("QUOTA_TELEGRAM_NOTIFY_ENABLED", false),
+    quotaTelegramSummaryIntervalMs: optionalInt("QUOTA_TELEGRAM_SUMMARY_INTERVAL_MS", 60 * 60 * 1000),
+    staleReviewCloseEnabled: optionalBool("STALE_REVIEW_CLOSE_ENABLED", false),
+    staleReviewThresholdMs: optionalInt("STALE_REVIEW_THRESHOLD_MS", 24 * 60 * 60 * 1000),
+    staleReviewScanIntervalMs: optionalInt("STALE_REVIEW_SCAN_INTERVAL_MS", 30 * 60 * 1000),
+    staleReviewMaxPrsPerScan: optionalInt("STALE_REVIEW_MAX_PRS_PER_SCAN", 100),
+    staleReviewIgnoredRepositories: optionalRepositorySet("STALE_REVIEW_IGNORED_REPOSITORIES", []),
     natsServerUrl: process.env.NATS_SERVER_URL?.trim() || "nats://localhost:4222",
     approvalTelegramBot: process.env.APPROVAL_TELEGRAM_BOT?.trim() || "seolee_bot",
     approvalTelegramChannel: process.env.APPROVAL_TELEGRAM_CHANNEL?.trim() || "syous",
