@@ -10,7 +10,8 @@
     "contents": "read",
     "issues": "write",
     "metadata": "read",
-    "pull_requests": "write"
+    "pull_requests": "write",
+    "statuses": "read"
   },
   "default_events": [
     "issue_comment",

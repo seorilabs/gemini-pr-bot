@@ -438,7 +438,7 @@ export class PrBot {
           await this.completeTrackedCheck(
             check,
             "cancelled",
-            "오래된 병합 충돌 결과를 건너뜀",
+            "오래된 병합 충돌 결과 취소",
             "병합 충돌 리뷰를 게시하기 전에 PR 상태가 바뀌었습니다. 필요하면 현재 HEAD 기준으로 다시 리뷰를 요청하세요.",
           );
           return;
@@ -527,7 +527,7 @@ export class PrBot {
           await this.completeTrackedCheck(
             check,
             "cancelled",
-            "오래된 병합 충돌 응답을 건너뜀",
+            "오래된 병합 충돌 응답 취소",
             "병합 충돌 응답을 게시하기 전에 PR 상태가 바뀌었습니다. 필요하면 현재 HEAD 기준으로 다시 리뷰를 요청하세요.",
           );
           return;
@@ -694,6 +694,8 @@ export class PrBot {
       "- Findings must be grounded in the supplied diff/context.",
       "- Each finding must include severity, file/function or line reference when available, impact, and concrete fix direction.",
       "- Failing tests, builds, lint, typecheck, or required status checks are actionable findings unless the context clearly proves an external infrastructure-only failure.",
+      "- Treat pending or queued checks as approval blockers, but do not infer a workflow defect from a transient queued check unless the context proves the job is stuck, unroutable, or using an ineligible runner.",
+      "- Do not flag Seorilabs ARC/self-hosted runner usage solely because it is self-hosted when the PR context shows a private repository and an eligible JS/TS lint, test, typecheck, or build job.",
       `- Do not say \`${NO_ACTIONABLE_FINDINGS_TEXT}\` while any status check is failing or pending.`,
       "- Do not include praise, broad summaries, style-only preferences, or nits.",
       "- Do not mention that you are an AI model.",
@@ -753,6 +755,8 @@ export class PrBot {
       "- Never approve if any correctness, runtime, security, data loss, regression, required validation, or required test concern remains.",
       "- Never approve if GitHub mergeable is `false` or mergeable_state is `dirty`/`conflicting`; choose comment and give conflict-resolution steps.",
       "- Never approve while tests, build, lint, typecheck, or status checks are failing or pending unless the conversation clearly identifies them as infrastructure-only and a maintainer explicitly accepts that risk.",
+      "- Treat pending or queued checks as approval blockers, but do not infer a workflow defect from a transient queued check unless the context proves the job is stuck, unroutable, or using an ineligible runner.",
+      "- Do not flag Seorilabs ARC/self-hosted runner usage solely because it is self-hosted when the PR context shows a private repository and an eligible JS/TS lint, test, typecheck, or build job.",
       "- If evidence is insufficient, choose comment and state exactly what is missing.",
       "- If prior comments contain `seorilabs-gemini-pr-bot:status=no-action-required`, prefer markers whose recorded HEAD SHA matches the current PR Head SHA.",
       "",
@@ -917,7 +921,7 @@ export class PrBot {
       await this.completeTrackedCheck(
         check,
         "cancelled",
-        "닫힌 PR 응답 건너뜀",
+        "닫힌 PR 응답 취소",
         [
           "이 응답을 게시하기 전에 PR이 닫히거나 병합됐습니다.",
           "",
@@ -933,7 +937,7 @@ export class PrBot {
       await this.completeTrackedCheck(
         check,
         "cancelled",
-        "오래된 PR 맥락 응답 건너뜀",
+        "오래된 PR 맥락 응답 취소",
         [
           "이 응답을 게시하기 전에 PR HEAD가 바뀌었습니다.",
           "",

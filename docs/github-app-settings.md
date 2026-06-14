@@ -17,6 +17,7 @@ Create this as an organization-owned GitHub App under `seorilabs`.
 - Issues: `Read and write`
 - Metadata: `Read-only`
 - Pull requests: `Read and write`
+- Commit statuses: `Read-only`
 
 ## Subscribe To Events
 

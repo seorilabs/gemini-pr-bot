@@ -256,6 +256,9 @@ export async function buildPullRequestContext(
     "# Pull Request Context",
     "",
     `Repository: ${repo.fullName}`,
+    `Repository private: ${repo.isPrivate}`,
+    `Public repository handling: ${config.allowPublicRepos ? "allowed" : "disabled"}`,
+    `Seorilabs ARC policy: private JS/TS lint, test, typecheck, and build jobs may use self-hosted ARC runners; public PR jobs must not.`,
     `Pull request: #${prNumber}`,
     `Title: ${pr.title}`,
     `Author: ${pr.user?.login || "unknown"}`,
@@ -445,7 +448,13 @@ async function buildStatusCheckSummary(
       }
     }
   } else {
-    lines.push(`- commit-statuses: unable to read (${errorMessage(statusesResult.reason)})`);
+    lines.push(
+      [
+        "- commit-statuses: unavailable to this installation",
+        `(${errorMessage(statusesResult.reason)}).`,
+        "Grant Commit statuses read permission if legacy commit status contexts must be considered.",
+      ].join(" "),
+    );
   }
 
   if (lines.length === 0) {
