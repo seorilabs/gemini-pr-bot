@@ -186,7 +186,13 @@ STALE_REVIEW_MAX_PRS_PER_SCAN=100
 STALE_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot
 ```
 
-The stale scanner only considers hidden bot markers for the current PR HEAD. A new commit or a non-bot issue/review/review-comment response after the marker keeps the PR open.
+The stale scanner only considers hidden bot markers for the current PR HEAD. If a non-bot response appears after an action-required marker but does not mention the bot, the scanner queues one synthetic agent follow-up instead of closing immediately. If that follow-up still leaves action required, the bot writes:
+
+```html
+<!-- seorilabs-gemini-pr-bot:status=action-required kind=stale-self-trigger blocked_kind=<review|status-check|merge-conflict> head=<head-sha> response_at=<timestamp> -->
+```
+
+After a `stale-self-trigger` marker is present for the current HEAD, later unmentioned comments do not reset the stale close window. A new commit or an explicit bot mention starts a fresh review path.
 
 ## Build And Deploy
 

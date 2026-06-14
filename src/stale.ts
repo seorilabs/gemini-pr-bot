@@ -1,5 +1,6 @@
 import type { App } from "octokit";
 import type { Config } from "./config.js";
+import { STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
 import {
   closePullRequest,
   getPullRequestStatus,
@@ -26,16 +27,25 @@ type PullRequest = {
   };
 };
 
-type ReviewSignal = {
+export type ReviewSignal = {
   kind: "action-required" | "merge-conflict";
   at: string;
   author: string;
   headSha?: string;
   actionKind?: string;
+  blockedKind?: string;
   summary: string;
 };
 
-type StaleReviewCandidate = {
+type ReviewResponse = {
+  kind: "issue-comment" | "review-comment" | "review" | "commit";
+  at: string;
+  atMs: number;
+  author: string;
+  summary: string;
+};
+
+export type StaleReviewCandidate = {
   repo: RepoRef;
   prNumber: number;
   title: string;
@@ -45,6 +55,20 @@ type StaleReviewCandidate = {
   thresholdMs: number;
   staleMs: number;
 };
+
+export type StaleReviewSelfTriggerRequest = StaleReviewCandidate & {
+  installationId: number;
+  response: ReviewResponse;
+};
+
+type StaleReviewAction =
+  | { type: "close"; candidate: StaleReviewCandidate }
+  | { type: "self-trigger"; request: StaleReviewSelfTriggerRequest };
+
+type StaleReviewSelfTriggerHandler = (
+  octokit: Octokit,
+  request: StaleReviewSelfTriggerRequest,
+) => Promise<boolean | void>;
 
 const ACTION_REQUIRED_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=action-required";
 const MERGE_CONFLICT_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=merge-conflict";
@@ -59,6 +83,7 @@ export class StaleReviewMonitor {
     private readonly app: App,
     private readonly config: Config,
     private readonly logger: Logger,
+    private readonly selfTrigger?: StaleReviewSelfTriggerHandler,
   ) {}
 
   start(): void {
@@ -120,60 +145,105 @@ export class StaleReviewMonitor {
 
   private async scan(): Promise<void> {
     const startedAt = Date.now();
+    let installationsChecked = 0;
     let repositoriesChecked = 0;
     let prsChecked = 0;
+    let prsSelfTriggered = 0;
     let prsClosed = 0;
 
-    for await (const { octokit, repository } of this.app.eachRepository.iterator()) {
+    for await (const { octokit, installation } of this.app.eachInstallation.iterator()) {
       if (prsChecked >= this.config.staleReviewMaxPrsPerScan) {
         break;
       }
 
-      const repo = repoFromRepository(repository);
-      if (!this.shouldScanRepository(repo, repository)) {
-        continue;
-      }
-      repositoriesChecked += 1;
-
-      const openPrs = await listOpenPullRequests(octokit, repo);
-      for (const pr of openPrs) {
+      installationsChecked += 1;
+      const repositories = await listInstallationRepositories(octokit);
+      for (const repository of repositories) {
         if (prsChecked >= this.config.staleReviewMaxPrsPerScan) {
           break;
         }
-        prsChecked += 1;
 
-        const candidate = await findStaleReviewCandidate(
-          octokit,
-          repo,
-          pr,
-          this.config.staleReviewThresholdMs,
-          Date.now(),
-        );
-        if (!candidate) {
+        const repo = repoFromRepository(repository);
+        if (!this.shouldScanRepository(repo, repository)) {
           continue;
         }
+        repositoriesChecked += 1;
 
-        const body = staleCloseText(candidate);
-        await requestChangesPullRequest(octokit, repo, candidate.prNumber, body, candidate.headSha);
-        await closePullRequest(octokit, repo, candidate.prNumber);
-        prsClosed += 1;
-        this.logger.warn(
-          {
-            repo: repo.fullName,
-            prNumber: candidate.prNumber,
-            headSha: candidate.headSha,
-            signalAt: candidate.signal.at,
-            staleMs: candidate.staleMs,
-          },
-          "stale review pull request closed",
-        );
+        const openPrs = await listOpenPullRequests(octokit, repo);
+        for (const pr of openPrs) {
+          if (prsChecked >= this.config.staleReviewMaxPrsPerScan) {
+            break;
+          }
+          prsChecked += 1;
+
+          const action = await findStaleReviewAction(
+            octokit,
+            repo,
+            pr,
+            installation.id,
+            this.config.staleReviewThresholdMs,
+            Date.now(),
+          );
+          if (!action) {
+            continue;
+          }
+
+          if (action.type === "self-trigger") {
+            if (!this.selfTrigger) {
+              this.logger.warn(
+                {
+                  repo: repo.fullName,
+                  prNumber: action.request.prNumber,
+                  headSha: action.request.headSha,
+                },
+                "stale review self-trigger skipped because no handler is configured",
+              );
+              continue;
+            }
+            const queued = await this.selfTrigger?.(octokit, action.request);
+            if (queued !== false) {
+              prsSelfTriggered += 1;
+            }
+            this.logger.info(
+              {
+                repo: repo.fullName,
+                prNumber: action.request.prNumber,
+                headSha: action.request.headSha,
+                signalAt: action.request.signal.at,
+                responseAt: action.request.response.at,
+                responseKind: action.request.response.kind,
+                queued: queued !== false,
+              },
+              "stale review self-trigger queued",
+            );
+            continue;
+          }
+
+          const { candidate } = action;
+          const body = staleCloseText(candidate);
+          await requestChangesPullRequest(octokit, repo, candidate.prNumber, body, candidate.headSha);
+          await closePullRequest(octokit, repo, candidate.prNumber);
+          prsClosed += 1;
+          this.logger.warn(
+            {
+              repo: repo.fullName,
+              prNumber: candidate.prNumber,
+              headSha: candidate.headSha,
+              signalAt: candidate.signal.at,
+              staleMs: candidate.staleMs,
+            },
+            "stale review pull request closed",
+          );
+        }
       }
     }
 
     this.logger.info(
       {
+        installationsChecked,
         repositoriesChecked,
         prsChecked,
+        prsSelfTriggered,
         prsClosed,
         elapsedMs: Date.now() - startedAt,
       },
@@ -199,6 +269,12 @@ export class StaleReviewMonitor {
   }
 }
 
+async function listInstallationRepositories(octokit: Octokit): Promise<any[]> {
+  return octokit.paginate(octokit.rest.apps.listReposAccessibleToInstallation, {
+    per_page: 100,
+  });
+}
+
 async function listOpenPullRequests(octokit: Octokit, repo: RepoRef): Promise<PullRequest[]> {
   return octokit.paginate(octokit.rest.pulls.list, {
     owner: repo.owner,
@@ -210,13 +286,14 @@ async function listOpenPullRequests(octokit: Octokit, repo: RepoRef): Promise<Pu
   });
 }
 
-async function findStaleReviewCandidate(
+async function findStaleReviewAction(
   octokit: Octokit,
   repo: RepoRef,
   pr: PullRequest,
+  installationId: number,
   thresholdMs: number,
   nowMs: number,
-): Promise<StaleReviewCandidate | null> {
+): Promise<StaleReviewAction | null> {
   const [issueComments, reviewComments, reviews, commits] = await Promise.all([
     octokit.paginate(octokit.rest.issues.listComments, {
       owner: repo.owner,
@@ -254,20 +331,16 @@ async function findStaleReviewCandidate(
     return null;
   }
 
-  const responseAtMs = latestResponseAfterSignalMs(signalAtMs, issueComments, reviewComments, reviews, commits);
-  if (responseAtMs && responseAtMs > signalAtMs) {
-    return null;
-  }
-
   const status = await getPullRequestStatus(octokit, repo, pr.number);
-  if (signal.actionKind === "status-check" && !hasBlockingStatusChecks(status)) {
+  const blockingKind = signal.blockedKind || signal.actionKind;
+  if (blockingKind === "status-check" && !hasBlockingStatusChecks(status)) {
     return null;
   }
-  if (signal.kind === "merge-conflict" && !hasMergeConflict(status)) {
+  if ((signal.kind === "merge-conflict" || blockingKind === "merge-conflict") && !hasMergeConflict(status)) {
     return null;
   }
 
-  return {
+  const candidate: StaleReviewCandidate = {
     repo,
     prNumber: pr.number,
     title: pr.title,
@@ -277,6 +350,24 @@ async function findStaleReviewCandidate(
     thresholdMs,
     staleMs: nowMs - signalAtMs,
   };
+
+  if (signal.actionKind === STALE_SELF_TRIGGER_ACTION_KIND) {
+    return { type: "close", candidate };
+  }
+
+  const response = latestResponseAfterSignal(signalAtMs, issueComments, reviewComments, reviews, commits);
+  if (response && response.atMs > signalAtMs) {
+    return {
+      type: "self-trigger",
+      request: {
+        ...candidate,
+        installationId,
+        response,
+      },
+    };
+  }
+
+  return { type: "close", candidate };
 }
 
 function latestReviewSignal(issueComments: any[], reviews: any[], headSha: string): ReviewSignal | null {
@@ -306,6 +397,7 @@ function signalFromBody(body: string | undefined, at: string | undefined, user: 
       author: user.login || "unknown",
       headSha: markerHeadSha,
       actionKind: markerActionKindFromBody(body),
+      blockedKind: markerAttributeFromBody(body, "blocked_kind"),
       summary: firstMeaningfulLine(body),
     }];
   }
@@ -323,24 +415,53 @@ function signalFromBody(body: string | undefined, at: string | undefined, user: 
   return [];
 }
 
-function latestResponseAfterSignalMs(
+function latestResponseAfterSignal(
   signalAtMs: number,
   issueComments: any[],
   reviewComments: any[],
   reviews: any[],
   commits: any[],
-): number | null {
-  const responseTimes = [
-    ...issueComments.filter((comment) => !isBotUser(comment.user)).map((comment) => Date.parse(comment.created_at)),
-    ...reviewComments.filter((comment) => !isBotUser(comment.user)).map((comment) => Date.parse(comment.created_at)),
-    ...reviews.filter((review) => !isBotUser(review.user)).map((review) => Date.parse(review.submitted_at)),
-    ...commits.map((commit) => Date.parse(commit.commit?.committer?.date || commit.commit?.author?.date)),
-  ].filter((time) => Number.isFinite(time) && time > signalAtMs);
+): ReviewResponse | null {
+  const responses: ReviewResponse[] = [
+    ...issueComments.filter((comment) => !isBotUser(comment.user)).map((comment) => ({
+      kind: "issue-comment" as const,
+      at: comment.created_at,
+      atMs: Date.parse(comment.created_at),
+      author: comment.user?.login || "unknown",
+      summary: firstMeaningfulLine(comment.body || ""),
+    })),
+    ...reviewComments.filter((comment) => !isBotUser(comment.user)).map((comment) => ({
+      kind: "review-comment" as const,
+      at: comment.created_at,
+      atMs: Date.parse(comment.created_at),
+      author: comment.user?.login || "unknown",
+      summary: firstMeaningfulLine(comment.body || ""),
+    })),
+    ...reviews.filter((review) => !isBotUser(review.user)).map((review) => ({
+      kind: "review" as const,
+      at: review.submitted_at,
+      atMs: Date.parse(review.submitted_at),
+      author: review.user?.login || "unknown",
+      summary: firstMeaningfulLine(review.body || ""),
+    })),
+    ...commits.map((commit) => {
+      const at = commit.commit?.committer?.date || commit.commit?.author?.date;
+      return {
+        kind: "commit" as const,
+        at,
+        atMs: Date.parse(at),
+        author: commit.author?.login || commit.commit?.author?.name || "unknown",
+        summary: commit.commit?.message?.split("\n")[0] || commit.sha || "(commit)",
+      };
+    }),
+  ].filter((response) => Number.isFinite(response.atMs) && response.atMs > signalAtMs);
 
-  if (responseTimes.length === 0) {
+  if (responses.length === 0) {
     return null;
   }
-  return Math.max(...responseTimes);
+
+  responses.sort((left, right) => right.atMs - left.atMs);
+  return responses[0]!;
 }
 
 function staleCloseText(candidate: StaleReviewCandidate): string {
@@ -360,6 +481,58 @@ function staleCloseText(candidate: StaleReviewCandidate): string {
     "",
     "필요하면 변경 범위를 줄이고 현재 피드백을 반영한 새 PR로 다시 열어주세요.",
   ].join("\n");
+}
+
+export function staleSelfTriggerDedupeKey(request: StaleReviewSelfTriggerRequest): string {
+  return [
+    STALE_REVIEW_SELF_TRIGGER_EVENT,
+    request.repo.fullName,
+    request.prNumber,
+    request.headSha,
+    request.response.at,
+  ].join(":");
+}
+
+export function staleSelfTriggerPayload(request: StaleReviewSelfTriggerRequest): any {
+  return {
+    action: "stale_self_trigger",
+    installation: {
+      id: request.installationId,
+    },
+    repository: {
+      owner: {
+        login: request.repo.owner,
+      },
+      name: request.repo.repo,
+      full_name: request.repo.fullName,
+      private: request.repo.isPrivate,
+    },
+    pull_request: {
+      number: request.prNumber,
+      title: request.title,
+      html_url: request.url,
+      head: {
+        sha: request.headSha,
+      },
+    },
+    stale_review: {
+      head_sha: request.headSha,
+      signal_at: request.signal.at,
+      signal_kind: request.signal.kind,
+      signal_action_kind: request.signal.actionKind,
+      signal_author: request.signal.author,
+      response_at: request.response.at,
+      response_kind: request.response.kind,
+      response_author: request.response.author,
+      response_summary: request.response.summary,
+      threshold_ms: request.thresholdMs,
+      stale_ms: request.staleMs,
+    },
+    sender: {
+      login: "seorilabs-gemini-pr-bot",
+      type: "Bot",
+    },
+  };
 }
 
 function formatDuration(ms: number): string {
@@ -385,7 +558,11 @@ function markerHeadShaFromBody(body: string): string | undefined {
 }
 
 function markerActionKindFromBody(body: string): string | undefined {
-  return body.match(/\bkind=([a-z-]+)\b/i)?.[1];
+  return markerAttributeFromBody(body, "kind");
+}
+
+function markerAttributeFromBody(body: string, name: string): string | undefined {
+  return body.match(new RegExp(`\\b${name}=([^\\s>]+)`, "i"))?.[1];
 }
 
 function hasBlockingStatusChecks(status: PullRequestStatus): boolean {

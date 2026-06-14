@@ -1,4 +1,5 @@
 import type { Config } from "./config.js";
+import { STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
 import { GeminiClient } from "./gemini.js";
 import {
   approvePullRequest,
@@ -37,6 +38,14 @@ const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 type AgentReplyTarget =
   | { type: "pr_comment" }
   | { type: "review_comment"; commentId: number };
+
+type AgentRunOptions = {
+  staleSelfTrigger?: {
+    signalAt?: string;
+    responseAt?: string;
+    responseKind?: string;
+  };
+};
 
 type GeneratedText = {
   text: string;
@@ -139,6 +148,11 @@ export class PrBot {
 
     if (eventName === "pull_request") {
       await this.handlePullRequest(octokit, payload, workflow);
+      return;
+    }
+
+    if (eventName === STALE_REVIEW_SELF_TRIGGER_EVENT) {
+      await this.handleStaleReviewSelfTrigger(octokit, payload, workflow);
       return;
     }
 
@@ -424,6 +438,57 @@ export class PrBot {
     }
   }
 
+  private async handleStaleReviewSelfTrigger(
+    octokit: Octokit,
+    payload: any,
+    workflow?: WorkflowExecution,
+  ): Promise<void> {
+    if (!shouldHandleRepository(payload, this.config)) {
+      return;
+    }
+
+    const repo = repoFromPayload(payload);
+    const prNumber = Number(payload.pull_request?.number);
+    if (!Number.isFinite(prNumber)) {
+      this.logger.warn({ repo: repo.fullName, payload }, "stale self-trigger payload missing PR number");
+      return;
+    }
+    if (await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) {
+      return;
+    }
+
+    const stale = payload.stale_review || {};
+    const request = [
+      "이 PR은 이전 Seori 조치 요청 이후 사람이 멘션 없이 응답했지만 후속 리뷰가 호출되지 않아 stale scanner가 자동 재확인을 시작했습니다.",
+      `원래 조치 요청: ${stale.signal_at || "unknown"} (${stale.signal_action_kind || stale.signal_kind || "unknown"})`,
+      `최근 응답: ${stale.response_at || "unknown"} (${stale.response_kind || "unknown"}) by @${stale.response_author || "unknown"}`,
+      stale.response_summary ? `최근 응답 요약: ${stale.response_summary}` : "",
+      "",
+      "현재 HEAD 기준으로 남은 조치가 있는지 판단하세요.",
+      "해결됐으면 approve, 문제가 남았으면 comment, 같은 인수조건이 반복 미충족이면 close를 선택하세요.",
+    ].filter(Boolean).join("\n");
+
+    await this.runAgent(
+      octokit,
+      repo,
+      prNumber,
+      request,
+      {
+        source: STALE_REVIEW_SELF_TRIGGER_EVENT,
+        sender: "seorilabs-gemini-pr-bot",
+      },
+      { type: "pr_comment" },
+      workflow,
+      {
+        staleSelfTrigger: {
+          signalAt: stale.signal_at,
+          responseAt: stale.response_at,
+          responseKind: stale.response_kind,
+        },
+      },
+    );
+  }
+
   private isAutoReviewIgnored(repo: RepoRef): boolean {
     const ignored = this.config.autoReviewIgnoredRepositories;
     return ignored.has(repo.fullName.toLowerCase()) || ignored.has(repo.repo.toLowerCase());
@@ -531,6 +596,7 @@ export class PrBot {
     trigger: ReviewTrigger,
     target: AgentReplyTarget,
     workflow?: WorkflowExecution,
+    options: AgentRunOptions = {},
   ): Promise<void> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config, this.contextOptions(workflow, request));
     if (this.shuttingDown || (this.isClosedPullRequest(context) && !workflow?.checkRunId)) {
@@ -560,7 +626,14 @@ export class PrBot {
           return;
         }
 
-        const conflictText = this.mergeConflictText(repo, prNumber, latest);
+        const conflictText = options.staleSelfTrigger
+          ? this.agentActionRequiredText(
+              "merge-conflict",
+              latest.headSha,
+              this.mergeConflictText(repo, prNumber, latest),
+              options,
+            )
+          : this.mergeConflictText(repo, prNumber, latest);
         if (this.shuttingDown) {
           return;
         }
@@ -586,7 +659,12 @@ export class PrBot {
       }
 
       if (this.wantsApproval(agentText) && this.hasBlockingStatusChecks(latest)) {
-        const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
+        const blockerText = this.agentActionRequiredText(
+          "status-check",
+          latest.headSha,
+          this.statusCheckBlockerText(latest),
+          options,
+        );
         await postPrComment(octokit, repo, prNumber, blockerText);
         await this.completeTrackedCheck(check, "action_required", "상태 체크 확인 필요", blockerText);
         return;
@@ -617,13 +695,14 @@ export class PrBot {
         return;
       }
 
+      const commentText = this.agentCommentText(latest.headSha, publicText, options);
       if (target.type === "review_comment") {
-        await postReviewCommentReply(octokit, repo, prNumber, target.commentId, publicText);
+        await postReviewCommentReply(octokit, repo, prNumber, target.commentId, commentText);
       } else {
-        await postPrComment(octokit, repo, prNumber, publicText);
+        await postPrComment(octokit, repo, prNumber, commentText);
       }
 
-      await this.completeTrackedCheck(check, "success", "댓글 작성 완료", publicText);
+      await this.completeTrackedCheck(check, "success", "댓글 작성 완료", commentText);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.completeTrackedCheck(check, "failure", "에이전트 처리 실패", message);
@@ -1085,8 +1164,57 @@ export class PrBot {
     ].filter((line): line is string => line !== undefined).join("\n");
   }
 
-  private actionRequiredText(kind: string, headSha: string, body: string): string {
-    return [`<!-- ${ACTION_REQUIRED_MARKER} kind=${kind} head=${headSha} -->`, body].join("\n");
+  private agentActionRequiredText(
+    kind: string,
+    headSha: string,
+    body: string,
+    options: AgentRunOptions,
+  ): string {
+    if (!options.staleSelfTrigger) {
+      return this.actionRequiredText(kind, headSha, body);
+    }
+
+    return this.actionRequiredText(STALE_SELF_TRIGGER_ACTION_KIND, headSha, body, {
+      blocked_kind: kind,
+      signal_at: options.staleSelfTrigger.signalAt,
+      response_at: options.staleSelfTrigger.responseAt,
+      response_kind: options.staleSelfTrigger.responseKind,
+    });
+  }
+
+  private agentCommentText(headSha: string, body: string, options: AgentRunOptions): string {
+    if (!options.staleSelfTrigger) {
+      return body;
+    }
+
+    return this.actionRequiredText(STALE_SELF_TRIGGER_ACTION_KIND, headSha, body, {
+      blocked_kind: "review",
+      signal_at: options.staleSelfTrigger.signalAt,
+      response_at: options.staleSelfTrigger.responseAt,
+      response_kind: options.staleSelfTrigger.responseKind,
+    });
+  }
+
+  private actionRequiredText(
+    kind: string,
+    headSha: string,
+    body: string,
+    attrs: Record<string, string | undefined> = {},
+  ): string {
+    const markerAttrs = {
+      kind,
+      head: headSha,
+      ...attrs,
+    };
+    const marker = Object.entries(markerAttrs)
+      .filter((entry): entry is [string, string] => Boolean(entry[1]))
+      .map(([key, value]) => `${key}=${this.markerAttributeValue(value)}`)
+      .join(" ");
+    return [`<!-- ${ACTION_REQUIRED_MARKER} ${marker} -->`, body].join("\n");
+  }
+
+  private markerAttributeValue(value: string): string {
+    return value.trim().replace(/\s+/g, "_");
   }
 
   private mergeConflictText(repo: RepoRef, prNumber: number, status: PullRequestStatus): string {

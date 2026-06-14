@@ -279,6 +279,21 @@ export class WorkflowEngine {
     );
   }
 
+  async enqueueSynthetic(eventName: string, dedupeKey: string, payload: any): Promise<boolean> {
+    const inserted = await this.store.enqueue(eventName, dedupeKey, payload);
+    this.logger.info(
+      {
+        event: eventName,
+        dedupeKey,
+        inserted,
+        repo: payload.repository?.full_name,
+        action: payload.action,
+      },
+      "synthetic workflow enqueued",
+    );
+    return inserted;
+  }
+
   async stop(): Promise<void> {
     this.running = false;
     await this.loopPromise;

@@ -4,8 +4,9 @@ import { App } from "octokit";
 import pino from "pino";
 import { loadConfig } from "./config.js";
 import { TtlSet } from "./dedupe.js";
+import { STALE_REVIEW_SELF_TRIGGER_EVENT } from "./events.js";
 import { PrBot } from "./bot.js";
-import { StaleReviewMonitor } from "./stale.js";
+import { StaleReviewMonitor, staleSelfTriggerDedupeKey, staleSelfTriggerPayload } from "./stale.js";
 import { MysqlWorkflowStore, WorkflowEngine } from "./workflow.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -21,11 +22,23 @@ const app = new App({
 });
 
 const bot = new PrBot(config, logger);
-const staleReviewMonitor = new StaleReviewMonitor(app, config, logger);
 const workflowEngine =
   config.workflowStore === "mysql"
     ? new WorkflowEngine(app, bot, new MysqlWorkflowStore(config, logger), config, logger)
     : null;
+const staleReviewMonitor = new StaleReviewMonitor(app, config, logger, async (octokit, request) => {
+  const payload = staleSelfTriggerPayload(request);
+  if (workflowEngine) {
+    return workflowEngine.enqueueSynthetic(
+      STALE_REVIEW_SELF_TRIGGER_EVENT,
+      staleSelfTriggerDedupeKey(request),
+      payload,
+    );
+  }
+
+  await bot.processEvent(octokit, STALE_REVIEW_SELF_TRIGGER_EVENT, payload);
+  return true;
+});
 
 function deliveryIdFromEvent(event: any): string | undefined {
   return event.id || event.delivery || event.payload?.delivery;
