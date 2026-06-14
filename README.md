@@ -22,7 +22,7 @@ flowchart LR
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Seori Review` check run for review and agent jobs.
 - Can route AI jobs across Gemini CLI, GitHub Copilot CLI, and Cursor Agent with weighted fallback.
-- Skips stale output when a PR is merged, closed, or updated while a review is running.
+- Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks approval while tests, build, lint, typecheck, or status checks are failing or pending.
 - Ignores resolved inline review threads.
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.

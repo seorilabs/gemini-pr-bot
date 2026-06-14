@@ -437,7 +437,7 @@ export class PrBot {
         if (!this.hasMergeConflict(latest)) {
           await this.completeTrackedCheck(
             check,
-            "skipped",
+            "cancelled",
             "오래된 병합 충돌 결과를 건너뜀",
             "병합 충돌 리뷰를 게시하기 전에 PR 상태가 바뀌었습니다. 필요하면 현재 HEAD 기준으로 다시 리뷰를 요청하세요.",
           );
@@ -526,7 +526,7 @@ export class PrBot {
         if (!this.hasMergeConflict(latest)) {
           await this.completeTrackedCheck(
             check,
-            "skipped",
+            "cancelled",
             "오래된 병합 충돌 응답을 건너뜀",
             "병합 충돌 응답을 게시하기 전에 PR 상태가 바뀌었습니다. 필요하면 현재 HEAD 기준으로 다시 리뷰를 요청하세요.",
           );
@@ -916,7 +916,7 @@ export class PrBot {
     if (this.isClosedPullRequest(status)) {
       await this.completeTrackedCheck(
         check,
-        "skipped",
+        "cancelled",
         "닫힌 PR 응답 건너뜀",
         [
           "이 응답을 게시하기 전에 PR이 닫히거나 병합됐습니다.",
@@ -932,7 +932,7 @@ export class PrBot {
     if (status.headSha !== expectedHeadSha) {
       await this.completeTrackedCheck(
         check,
-        "skipped",
+        "cancelled",
         "오래된 PR 맥락 응답 건너뜀",
         [
           "이 응답을 게시하기 전에 PR HEAD가 바뀌었습니다.",
