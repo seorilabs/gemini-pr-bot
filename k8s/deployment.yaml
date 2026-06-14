@@ -15,7 +15,7 @@ spec:
       labels:
         app.kubernetes.io/name: gemini-pr-bot
     spec:
-      terminationGracePeriodSeconds: 35
+      terminationGracePeriodSeconds: 260
       nodeSelector:
         kubernetes.io/hostname: rpi5
       securityContext:
@@ -72,6 +72,8 @@ spec:
               value: "600000"
             - name: WORKFLOW_MAX_ATTEMPTS
               value: "3"
+            - name: SHUTDOWN_GRACE_MS
+              value: "240000"
             - name: MYSQL_HOST
               value: mysql.data.svc.cluster.local
             - name: MYSQL_PORT
@@ -84,10 +86,30 @@ spec:
               value: gemini-3-flash-preview
             - name: GEMINI_CLI_COMMAND
               value: /app/node_modules/.bin/gemini
+            - name: AI_REVIEW_PROVIDERS
+              value: gemini,copilot,cursor
+            - name: AI_REVIEW_PROVIDER_WEIGHTS
+              value: gemini:100,copilot:0,cursor:0
+            - name: AI_REVIEW_PROVIDER_FALLBACK_ORDER
+              value: gemini,cursor,copilot
+            - name: AI_REVIEW_PROVIDER_COOLDOWN_MS
+              value: "300000"
+            - name: COPILOT_CLI_COMMAND
+              value: /app/node_modules/.bin/copilot
+            - name: COPILOT_CLI_TIMEOUT_MS
+              value: "180000"
+            - name: COPILOT_MODEL
+              value: auto
+            - name: CURSOR_CLI_COMMAND
+              value: /usr/local/bin/agent
+            - name: CURSOR_CLI_TIMEOUT_MS
+              value: "180000"
+            - name: CURSOR_MODEL
+              value: gpt-5.2
             - name: HOME
               value: /home/app
             - name: BOT_MENTIONS
-              value: "@gemini-cli,@gemini,@seorilabs-gemini-pr-bot"
+              value: "@seorilabs-seori,@seori,@gemini-cli,@gemini,@seorilabs-gemini-pr-bot"
             - name: TRUSTED_ASSOCIATIONS
               value: "OWNER,MEMBER,COLLABORATOR"
             - name: ALLOW_PUBLIC_REPOS
@@ -95,7 +117,7 @@ spec:
             - name: AUTO_REVIEW_ON_OPEN
               value: "true"
             - name: AUTO_REVIEW_ON_SYNCHRONIZE
-              value: "false"
+              value: "true"
             - name: LOG_LEVEL
               value: info
             - name: MYSQL_USER
@@ -123,6 +145,18 @@ spec:
                 secretKeyRef:
                   name: gemini-pr-bot-secrets
                   key: GITHUB_WEBHOOK_SECRET
+            - name: COPILOT_GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gemini-pr-bot-provider-secrets
+                  key: COPILOT_GITHUB_TOKEN
+                  optional: true
+            - name: CURSOR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gemini-pr-bot-provider-secrets
+                  key: CURSOR_API_KEY
+                  optional: true
           readinessProbe:
             httpGet:
               path: /readyz
@@ -138,10 +172,10 @@ spec:
           resources:
             requests:
               cpu: 50m
-              memory: 128Mi
+              memory: 256Mi
             limits:
               cpu: 500m
-              memory: 512Mi
+              memory: 2Gi
           volumeMounts:
             - name: gemini-home
               mountPath: /home/app

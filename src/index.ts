@@ -197,11 +197,16 @@ server.listen(config.port, () => {
       org: config.githubOrg,
       provider: config.geminiProvider,
       model: config.geminiModel || "default",
+      reviewProviders: config.aiReviewProviders,
+      reviewProviderWeights: config.aiReviewProviderWeights,
+      reviewProviderFallbackOrder: config.aiReviewProviderFallbackOrder,
+      copilotModel: config.copilotModel || "default",
+      cursorModel: config.cursorModel || "default",
       workflowStore: config.workflowStore,
       allowPublicRepos: config.allowPublicRepos,
       autoReviewOnOpen: config.autoReviewOnOpen,
       autoReviewOnSynchronize: config.autoReviewOnSynchronize,
     },
-    "Gemini PR Bot listening",
+    "Seori review bot listening",
   );
 });

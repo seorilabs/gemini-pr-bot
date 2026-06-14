@@ -6,11 +6,13 @@ import {
   completeCheck,
   createInProgressCheck,
   getPullRequestStatus,
+  isReviewThreadResolved,
   isPullRequestIssue,
   isTrustedAssociation,
   postPrComment,
   postReviewCommentReply,
   requestChangesPullRequest,
+  REVIEW_AGENT_NAME,
   repoFromPayload,
   shouldHandleRepository,
   type CheckConclusion,
@@ -25,10 +27,16 @@ const NO_ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=no-action-requ
 const MERGE_CONFLICT_MARKER = "seorilabs-gemini-pr-bot:status=merge-conflict";
 const AGENT_APPROVE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=approve -->";
 const AGENT_COMMENT_MARKER = "<!-- seorilabs-gemini-pr-bot:action=comment -->";
+const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 
 type AgentReplyTarget =
   | { type: "pr_comment" }
   | { type: "review_comment"; commentId: number };
+
+type GeneratedText = {
+  text: string;
+  headSha: string;
+};
 
 type Logger = {
   info: (value: unknown, message?: string) => void;
@@ -73,7 +81,7 @@ export class PrBot {
     private readonly config: Config,
     private readonly logger: Logger,
   ) {
-    this.gemini = new GeminiClient(config);
+    this.gemini = new GeminiClient(config, logger);
   }
 
   scheduleIssueComment(event: any): void {
@@ -174,16 +182,16 @@ export class PrBot {
         activeTasks: this.activeTasks.size,
         activeChecks: activeChecks.length,
       },
-      "Gemini PR Bot shutdown started",
+      `${REVIEW_AGENT_NAME} shutdown started`,
     );
 
     const summary = [
-      `Gemini PR Bot stopped while this job was running.`,
+      `${REVIEW_AGENT_NAME} 작업 실행 중 봇이 중지되었습니다.`,
       "",
-      `Reason: ${reason}`,
+      `사유: ${reason}`,
       "",
-      "The job was marked as cancelled so GitHub does not keep a stale pending check.",
-      "Request another review after the bot is back online.",
+      "GitHub에 오래된 pending check가 남지 않도록 이 작업은 cancelled로 표시했습니다.",
+      "봇이 다시 올라온 뒤 필요하면 리뷰를 다시 요청하세요.",
     ].join("\n");
 
     const results = await Promise.allSettled(
@@ -191,7 +199,7 @@ export class PrBot {
         this.completeTrackedCheck(
           check,
           "cancelled",
-          "Gemini job cancelled during bot shutdown",
+          `${REVIEW_AGENT_NAME} job cancelled during bot shutdown`,
           summary,
         ),
       ),
@@ -204,7 +212,7 @@ export class PrBot {
         cancelledChecks: activeChecks.length - failed,
         failed,
       },
-      "Gemini PR Bot shutdown completed",
+      `${REVIEW_AGENT_NAME} shutdown completed`,
     );
   }
 
@@ -221,6 +229,9 @@ export class PrBot {
     const repo = repoFromPayload(payload);
     const issueNumber = payload.issue.number;
     if (!payload.issue.pull_request && !(await isPullRequestIssue(octokit, repo, issueNumber))) {
+      return;
+    }
+    if (await this.shouldIgnoreClosedPullRequest(octokit, repo, issueNumber)) {
       return;
     }
 
@@ -275,6 +286,12 @@ export class PrBot {
 
     const repo = repoFromPayload(payload);
     const prNumber = payload.pull_request.number;
+    if (
+      (await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) ||
+      (await this.shouldIgnoreResolvedReviewThread(octokit, repo, prNumber, payload.comment.id))
+    ) {
+      return;
+    }
 
     if (command.mode === "help") {
       await postReviewCommentReply(octokit, repo, prNumber, payload.comment.id, this.helpText());
@@ -300,7 +317,7 @@ export class PrBot {
       return;
     }
 
-    const answer =
+    const generated =
       command.mode === "review"
         ? await this.createReviewText(octokit, repo, prNumber, {
             source: "review_comment",
@@ -312,7 +329,11 @@ export class PrBot {
             sender: payload.sender.login,
           });
 
-    await postReviewCommentReply(octokit, repo, prNumber, payload.comment.id, answer);
+    if (!(await this.currentStatusForPublish(octokit, repo, prNumber, generated.headSha, null))) {
+      return;
+    }
+
+    await postReviewCommentReply(octokit, repo, prNumber, payload.comment.id, generated.text);
   }
 
   private async handlePullRequestReview(octokit: Octokit, payload: any, workflow?: WorkflowExecution): Promise<void> {
@@ -328,6 +349,9 @@ export class PrBot {
 
     const repo = repoFromPayload(payload);
     const prNumber = payload.pull_request.number;
+    if (await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) {
+      return;
+    }
 
     if (command.mode === "review") {
       await this.runReview(octokit, repo, prNumber, {
@@ -393,24 +417,43 @@ export class PrBot {
     workflow?: WorkflowExecution,
   ): Promise<void> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
-    if (this.shuttingDown) {
+    if (this.shuttingDown || (this.isClosedPullRequest(context) && !workflow?.checkRunId)) {
       return;
     }
 
     const check = await this.createTrackedCheck(octokit, repo, prNumber, context.headSha, "review", workflow);
 
     try {
+      if (this.isClosedPullRequest(context)) {
+        await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+        return;
+      }
+
       if (this.hasMergeConflict(context)) {
-        const conflictText = this.mergeConflictText(repo, prNumber, context);
+        const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+        if (!latest) {
+          return;
+        }
+        if (!this.hasMergeConflict(latest)) {
+          await this.completeTrackedCheck(
+            check,
+            "skipped",
+            "오래된 병합 충돌 결과를 건너뜀",
+            "병합 충돌 리뷰를 게시하기 전에 PR 상태가 바뀌었습니다. 필요하면 현재 HEAD 기준으로 다시 리뷰를 요청하세요.",
+          );
+          return;
+        }
+
+        const conflictText = this.mergeConflictText(repo, prNumber, latest);
         if (this.shuttingDown) {
           return;
         }
 
-        await requestChangesPullRequest(octokit, repo, prNumber, conflictText, context.headSha);
+        await requestChangesPullRequest(octokit, repo, prNumber, conflictText, latest.headSha);
         await this.completeTrackedCheck(
           check,
           "action_required",
-          "Merge conflict requires resolution",
+          "병합 충돌 해결 필요",
           conflictText,
         );
         return;
@@ -420,24 +463,35 @@ export class PrBot {
       if (this.shuttingDown) {
         return;
       }
+      const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+      if (!latest) {
+        return;
+      }
 
-      if (this.shouldApproveReviewText(reviewText, context)) {
+      if (this.wantsApproval(reviewText) && this.hasBlockingStatusChecks(latest)) {
+        const blockerText = this.statusCheckBlockerText(latest);
+        await postPrComment(octokit, repo, prNumber, blockerText);
+        await this.completeTrackedCheck(check, "action_required", "상태 체크 확인 필요", blockerText);
+        return;
+      }
+
+      if (this.shouldApproveReviewText(reviewText, latest)) {
         await approvePullRequest(
           octokit,
           repo,
           prNumber,
-          this.approvalText(trigger.sender, "Review found no actionable findings.", context.headSha, reviewText),
-          context.headSha,
+          this.approvalText(trigger.sender, "리뷰 결과 조치할 항목이 없습니다.", latest.headSha, reviewText),
+          latest.headSha,
         );
-        await this.completeTrackedCheck(check, "success", "Gemini review approved PR", reviewText);
+        await this.completeTrackedCheck(check, "success", "PR 승인 완료", reviewText);
         return;
       }
 
       await postPrComment(octokit, repo, prNumber, reviewText);
-      await this.completeTrackedCheck(check, "success", "Gemini review completed", reviewText);
+      await this.completeTrackedCheck(check, "success", "리뷰 완료", reviewText);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.completeTrackedCheck(check, "failure", "Gemini review failed", message);
+      await this.completeTrackedCheck(check, "failure", "리뷰 실패", message);
       throw error;
     }
   }
@@ -452,24 +506,43 @@ export class PrBot {
     workflow?: WorkflowExecution,
   ): Promise<void> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
-    if (this.shuttingDown) {
+    if (this.shuttingDown || (this.isClosedPullRequest(context) && !workflow?.checkRunId)) {
       return;
     }
 
     const check = await this.createTrackedCheck(octokit, repo, prNumber, context.headSha, "agent", workflow);
 
     try {
+      if (this.isClosedPullRequest(context)) {
+        await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+        return;
+      }
+
       if (this.hasMergeConflict(context)) {
-        const conflictText = this.mergeConflictText(repo, prNumber, context);
+        const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+        if (!latest) {
+          return;
+        }
+        if (!this.hasMergeConflict(latest)) {
+          await this.completeTrackedCheck(
+            check,
+            "skipped",
+            "오래된 병합 충돌 응답을 건너뜀",
+            "병합 충돌 응답을 게시하기 전에 PR 상태가 바뀌었습니다. 필요하면 현재 HEAD 기준으로 다시 리뷰를 요청하세요.",
+          );
+          return;
+        }
+
+        const conflictText = this.mergeConflictText(repo, prNumber, latest);
         if (this.shuttingDown) {
           return;
         }
 
-        await requestChangesPullRequest(octokit, repo, prNumber, conflictText, context.headSha);
+        await requestChangesPullRequest(octokit, repo, prNumber, conflictText, latest.headSha);
         await this.completeTrackedCheck(
           check,
           "action_required",
-          "Merge conflict requires resolution",
+          "병합 충돌 해결 필요",
           conflictText,
         );
         return;
@@ -480,16 +553,27 @@ export class PrBot {
       if (this.shuttingDown) {
         return;
       }
+      const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+      if (!latest) {
+        return;
+      }
 
-      if (this.shouldApproveAgentText(agentText, context)) {
+      if (this.wantsApproval(agentText) && this.hasBlockingStatusChecks(latest)) {
+        const blockerText = this.statusCheckBlockerText(latest);
+        await postPrComment(octokit, repo, prNumber, blockerText);
+        await this.completeTrackedCheck(check, "action_required", "상태 체크 확인 필요", blockerText);
+        return;
+      }
+
+      if (this.shouldApproveAgentText(agentText, latest)) {
         await approvePullRequest(
           octokit,
           repo,
           prNumber,
-          this.approvalText(trigger.sender, "Agent mention analysis found no actionable findings.", context.headSha, publicText),
-          context.headSha,
+          this.approvalText(trigger.sender, "에이전트 판단 결과 조치할 항목이 없습니다.", latest.headSha, publicText),
+          latest.headSha,
         );
-        await this.completeTrackedCheck(check, "success", "Gemini agent approved PR", publicText);
+        await this.completeTrackedCheck(check, "success", "PR 승인 완료", publicText);
         return;
       }
 
@@ -499,10 +583,10 @@ export class PrBot {
         await postPrComment(octokit, repo, prNumber, publicText);
       }
 
-      await this.completeTrackedCheck(check, "success", "Gemini agent commented", publicText);
+      await this.completeTrackedCheck(check, "success", "댓글 작성 완료", publicText);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.completeTrackedCheck(check, "failure", "Gemini agent failed", message);
+      await this.completeTrackedCheck(check, "failure", "에이전트 처리 실패", message);
       throw error;
     }
   }
@@ -572,8 +656,12 @@ export class PrBot {
     request: string,
     trigger: ReviewTrigger,
   ): Promise<void> {
-    const answer = await this.createAnswerText(octokit, repo, prNumber, request, trigger);
-    await postPrComment(octokit, repo, prNumber, answer);
+    const generated = await this.createAnswerText(octokit, repo, prNumber, request, trigger);
+    if (!(await this.currentStatusForPublish(octokit, repo, prNumber, generated.headSha, null))) {
+      return;
+    }
+
+    await postPrComment(octokit, repo, prNumber, generated.text);
   }
 
   private async createReviewText(
@@ -581,13 +669,13 @@ export class PrBot {
     repo: RepoRef,
     prNumber: number,
     trigger: ReviewTrigger,
-  ): Promise<string> {
+  ): Promise<GeneratedText> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
     if (this.hasMergeConflict(context)) {
-      return this.mergeConflictText(repo, prNumber, context);
+      return { text: this.mergeConflictText(repo, prNumber, context), headSha: context.headSha };
     }
 
-    return this.createReviewTextFromContext(context, trigger);
+    return { text: await this.createReviewTextFromContext(context, trigger), headSha: context.headSha };
   }
 
   private async createReviewTextFromContext(
@@ -605,12 +693,14 @@ export class PrBot {
       "Finding rules:",
       "- Findings must be grounded in the supplied diff/context.",
       "- Each finding must include severity, file/function or line reference when available, impact, and concrete fix direction.",
+      "- Failing tests, builds, lint, typecheck, or required status checks are actionable findings unless the context clearly proves an external infrastructure-only failure.",
+      `- Do not say \`${NO_ACTIONABLE_FINDINGS_TEXT}\` while any status check is failing or pending.`,
       "- Do not include praise, broad summaries, style-only preferences, or nits.",
       "- Do not mention that you are an AI model.",
       "- Keep code quotes short: quote identifiers or a minimal expression only when useful.",
       "- If a Mermaid diagram helps explain a bug path, state machine, or architecture flow, include one compact diagram.",
       "- If the PR conversation contains the marker `seorilabs-gemini-pr-bot:status=no-action-required`, treat it as a prior human/agent approval signal. Prefer markers whose recorded HEAD SHA matches the current PR Head SHA. Still review if this request explicitly asks for `/review`, but avoid reopening already-settled issues unless the new diff contradicts the marker.",
-      "- If GitHub mergeable is `false` or mergeable_state is `dirty`/`conflicting`, treat the merge conflict as a blocking finding. Do not write `No actionable findings.`; include concrete conflict-resolution steps.",
+      `- If GitHub mergeable is \`false\` or mergeable_state is \`dirty\`/\`conflicting\`, treat the merge conflict as a blocking finding. Do not write \`${NO_ACTIONABLE_FINDINGS_TEXT}\`; include concrete conflict-resolution steps.`,
       "",
       "Severity guide:",
       "- Critical: data loss, security exposure, crash on common path, or broken release path.",
@@ -619,20 +709,20 @@ export class PrBot {
       "- Low: minor but actionable correctness or maintainability issue.",
       "",
       "Output format:",
-      "## Gemini Review",
+      "## 리뷰",
       "",
-      "### Findings",
-      "- `[Severity] file_or_symbol`: impact and evidence. Suggested fix.",
+      "### 발견사항",
+      "- `[심각도] file_or_symbol`: 영향과 근거. 수정 방향.",
       "",
       "If there are no actionable findings, write exactly:",
-      "### Findings",
-      "No actionable findings.",
+      "### 발견사항",
+      NO_ACTIONABLE_FINDINGS_TEXT,
       "",
-      "### Verification",
-      "- Only include concrete checks that are useful for this PR.",
+      "### 검증",
+      "- 이 PR에 유용한 구체적인 확인 항목만 포함하세요.",
       "",
-      "### Coordination",
-      "- If no further agent action appears needed, include: `No further agent action required unless new commits arrive.`",
+      "### 후속 조치",
+      "- 추가 에이전트 작업이 필요 없어 보이면 `새 커밋이 올라오지 않는 한 추가 에이전트 작업은 필요 없습니다.`를 포함하세요.",
       "",
       `Trigger: ${trigger.source}`,
       `Requested by: ${trigger.sender}`,
@@ -662,7 +752,7 @@ export class PrBot {
       "- Choose approve only when the supplied diff and conversation show no actionable findings remain.",
       "- Never approve if any correctness, runtime, security, data loss, regression, required validation, or required test concern remains.",
       "- Never approve if GitHub mergeable is `false` or mergeable_state is `dirty`/`conflicting`; choose comment and give conflict-resolution steps.",
-      "- CI failures do not automatically block approval when the conversation clearly identifies them as infrastructure-only, but mention that status under Verification.",
+      "- Never approve while tests, build, lint, typecheck, or status checks are failing or pending unless the conversation clearly identifies them as infrastructure-only and a maintainer explicitly accepts that risk.",
       "- If evidence is insufficient, choose comment and state exactly what is missing.",
       "- If prior comments contain `seorilabs-gemini-pr-bot:status=no-action-required`, prefer markers whose recorded HEAD SHA matches the current PR Head SHA.",
       "",
@@ -670,27 +760,27 @@ export class PrBot {
       "- Include exactly one hidden action marker as the first non-empty line:",
       `  ${AGENT_APPROVE_MARKER}`,
       `  ${AGENT_COMMENT_MARKER}`,
-      "- If action is approve, the Findings section must contain exactly: `No actionable findings.`",
+      `- If action is approve, the Findings section must contain exactly: \`${NO_ACTIONABLE_FINDINGS_TEXT}\``,
       "- If action is comment because findings remain, list findings first, ordered by severity.",
       "",
       "Output format:",
-      "## Gemini Agent",
+      "## 에이전트 판단",
       "",
-      "### Decision",
-      "- `approve` or `comment`, with one short reason.",
+      "### 판단",
+      "- `approve` 또는 `comment`와 짧은 이유.",
       "",
-      "### Findings",
-      "- `[Severity] file_or_symbol`: impact and evidence. Suggested fix.",
+      "### 발견사항",
+      "- `[심각도] file_or_symbol`: 영향과 근거. 수정 방향.",
       "",
       "If there are no actionable findings, write exactly:",
-      "### Findings",
-      "No actionable findings.",
+      "### 발견사항",
+      NO_ACTIONABLE_FINDINGS_TEXT,
       "",
-      "### Verification",
-      "- Only include concrete checks useful for this PR.",
+      "### 검증",
+      "- 이 PR에 유용한 구체적인 확인 항목만 포함하세요.",
       "",
-      "### Coordination",
-      "- State whether further agent action is needed.",
+      "### 후속 조치",
+      "- 추가 에이전트 작업이 필요한지 명시하세요.",
       "",
       `Trigger: ${trigger.source}`,
       `Requested by: ${trigger.sender}`,
@@ -708,7 +798,7 @@ export class PrBot {
     prNumber: number,
     request: string,
     trigger: ReviewTrigger,
-  ): Promise<string> {
+  ): Promise<GeneratedText> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config);
     const prompt = [
       "Answer the user's pull request question.",
@@ -722,7 +812,7 @@ export class PrBot {
       context.markdown,
     ].join("\n");
 
-    return this.gemini.answer(prompt);
+    return { text: await this.gemini.answer(prompt), headSha: context.headSha };
   }
 
   private async runApprove(
@@ -733,6 +823,9 @@ export class PrBot {
     reason: string,
   ): Promise<void> {
     const status = await getPullRequestStatus(octokit, repo, prNumber);
+    if (this.isClosedPullRequest(status)) {
+      return;
+    }
     if (this.hasMergeConflict(status)) {
       await requestChangesPullRequest(
         octokit,
@@ -741,6 +834,10 @@ export class PrBot {
         this.mergeConflictText(repo, prNumber, status),
         status.headSha,
       );
+      return;
+    }
+    if (this.hasBlockingStatusChecks(status)) {
+      await postPrComment(octokit, repo, prNumber, this.statusCheckBlockerText(status));
       return;
     }
 
@@ -753,31 +850,130 @@ export class PrBot {
     );
   }
 
+  private async shouldIgnoreClosedPullRequest(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+  ): Promise<boolean> {
+    const status = await getPullRequestStatus(octokit, repo, prNumber);
+    const ignored = this.isClosedPullRequest(status);
+    if (ignored) {
+      this.logger.info(
+        {
+          repo: repo.fullName,
+          prNumber,
+          state: status.state,
+          merged: status.merged,
+          headSha: status.headSha,
+        },
+        "closed pull request event ignored",
+      );
+    }
+    return ignored;
+  }
+
+  private async shouldIgnoreResolvedReviewThread(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    commentId: number,
+  ): Promise<boolean> {
+    try {
+      const resolved = await isReviewThreadResolved(octokit, repo, prNumber, commentId);
+      if (resolved) {
+        this.logger.info(
+          {
+            repo: repo.fullName,
+            prNumber,
+            commentId,
+          },
+          "resolved review thread mention ignored",
+        );
+      }
+      return resolved;
+    } catch (error) {
+      this.logger.warn(
+        {
+          error,
+          repo: repo.fullName,
+          prNumber,
+          commentId,
+        },
+        "review thread state lookup failed",
+      );
+      return false;
+    }
+  }
+
+  private async currentStatusForPublish(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    expectedHeadSha: string,
+    check: ActiveCheckRun | null,
+  ): Promise<PullRequestStatus | null> {
+    const status = await getPullRequestStatus(octokit, repo, prNumber);
+    if (this.isClosedPullRequest(status)) {
+      await this.completeTrackedCheck(
+        check,
+        "skipped",
+        "닫힌 PR 응답 건너뜀",
+        [
+          "이 응답을 게시하기 전에 PR이 닫히거나 병합됐습니다.",
+          "",
+          `상태: \`${status.state}\``,
+          `병합 여부: \`${status.merged}\``,
+          `HEAD: \`${status.headSha}\``,
+        ].join("\n"),
+      );
+      return null;
+    }
+
+    if (status.headSha !== expectedHeadSha) {
+      await this.completeTrackedCheck(
+        check,
+        "skipped",
+        "오래된 PR 맥락 응답 건너뜀",
+        [
+          "이 응답을 게시하기 전에 PR HEAD가 바뀌었습니다.",
+          "",
+          `기존 HEAD: \`${expectedHeadSha}\``,
+          `현재 HEAD: \`${status.headSha}\``,
+          "",
+          "필요하면 현재 HEAD 기준으로 다시 리뷰를 요청하세요.",
+        ].join("\n"),
+      );
+      return null;
+    }
+
+    return status;
+  }
+
   private helpText(): string {
     return [
       "사용 가능한 명령:",
       "",
-      "- `@gemini-cli /review`: 현재 PR을 리뷰합니다.",
-      "- `@gemini-cli /approve [사유]`: GitHub approval review와 agent coordination marker를 남깁니다.",
-      "- `@gemini-cli 질문`: PR 맥락을 분석하고 comment 또는 approve를 결정합니다.",
-      "- inline review comment에서 `@gemini-cli 질문`: 해당 review comment 맥락으로 답하거나 PR을 approve합니다.",
+      "- `@seorilabs-seori /review`: 현재 PR을 리뷰합니다.",
+      "- `@seorilabs-seori /approve [사유]`: GitHub approval review와 agent coordination marker를 남깁니다.",
+      "- `@seorilabs-seori 질문`: PR 맥락을 분석하고 comment 또는 approve를 결정합니다.",
+      "- inline review comment에서 `@seorilabs-seori 질문`: 해당 review comment 맥락으로 답하거나 PR을 approve합니다.",
     ].join("\n");
   }
 
   private approvalText(sender: string, reason: string, headSha: string, analysis?: string): string {
     return [
       `<!-- ${NO_ACTION_REQUIRED_MARKER} head=${headSha} -->`,
-      "## Agent Coordination",
+      "## 승인 상태",
       "",
-      `Approved by: @${sender}`,
-      `Applies to HEAD: \`${headSha}\``,
-      `Reason: ${reason}`,
+      `승인 요청자: @${sender}`,
+      `적용 HEAD: \`${headSha}\``,
+      `사유: ${reason}`,
       "",
-      "No further agent action required unless new commits arrive or a maintainer explicitly requests another review.",
+      "새 커밋이 올라오거나 maintainer가 명시적으로 다시 리뷰를 요청하지 않는 한 추가 에이전트 작업은 필요 없습니다.",
       "",
-      "Note: stale approval dismissal depends on the repository branch protection setting.",
+      "참고: stale approval 해제 여부는 repository branch protection 설정을 따릅니다.",
       analysis ? "" : undefined,
-      analysis ? "## Agent Analysis" : undefined,
+      analysis ? "## 판단 근거" : undefined,
       analysis || undefined,
     ].filter((line): line is string => line !== undefined).join("\n");
   }
@@ -785,9 +981,9 @@ export class PrBot {
   private mergeConflictText(repo: RepoRef, prNumber: number, status: PullRequestStatus): string {
     return [
       `<!-- ${MERGE_CONFLICT_MARKER} head=${status.headSha} -->`,
-      "## Merge Conflict",
+      "## 병합 충돌",
       "",
-      "GitHub reports that this PR cannot currently be merged cleanly.",
+      "GitHub 기준으로 현재 이 PR은 깨끗하게 병합할 수 없습니다.",
       "",
       `- PR: \`${repo.fullName}#${prNumber}\``,
       `- Base: \`${status.baseRepoFullName}:${status.baseRef}\``,
@@ -796,13 +992,13 @@ export class PrBot {
       `- GitHub mergeable: \`${status.mergeable ?? "unknown"}\``,
       `- GitHub mergeable_state: \`${status.mergeableState}\``,
       "",
-      "### Suggested Action",
+      "### 권장 조치",
       "",
       "```bash",
       `gh pr checkout ${prNumber} -R ${repo.fullName}`,
       `git fetch origin ${status.baseRef}`,
       `git merge origin/${status.baseRef}`,
-      "# resolve conflict markers in the files Git reports",
+      "# Git이 알려준 파일의 conflict marker를 해결",
       "git status",
       "git add <resolved-files>",
       "git commit",
@@ -815,10 +1011,10 @@ export class PrBot {
       "  B --> C[\"Resolve conflict markers\"]",
       "  C --> D[\"Run repo checks\"]",
       "  D --> E[\"Commit and push\"]",
-      "  E --> F[\"Ask Gemini to review again\"]",
+      "  E --> F[\"Request another review\"]",
       "```",
       "",
-      "No approval was submitted. Resolve the merge conflict first, then request another review.",
+      "approval은 제출하지 않았습니다. 병합 충돌을 먼저 해결한 뒤 다시 리뷰를 요청하세요.",
     ].join("\n");
   }
 
@@ -826,12 +1022,50 @@ export class PrBot {
     return status.mergeable === false || ["dirty", "conflicting"].includes(status.mergeableState.toLowerCase());
   }
 
+  private isClosedPullRequest(status: PullRequestStatus): boolean {
+    return status.merged || status.state.toLowerCase() !== "open";
+  }
+
+  private hasBlockingStatusChecks(status: PullRequestStatus): boolean {
+    return status.statusChecks.failing.length > 0 || status.statusChecks.pending.length > 0;
+  }
+
+  private statusCheckBlockerText(status: PullRequestStatus): string {
+    return [
+      "## 상태 체크",
+      "",
+      "현재 HEAD의 검증이 아직 통과하지 않아 approval review를 제출하지 않았습니다.",
+      "",
+      status.statusChecks.failing.length > 0 ? "### 실패" : undefined,
+      ...status.statusChecks.failing.map((check) => `- ${check}`),
+      status.statusChecks.pending.length > 0 ? "### 대기 중" : undefined,
+      ...status.statusChecks.pending.map((check) => `- ${check}`),
+      "",
+      "실패한 체크를 고치거나 대기 중인 체크가 끝난 뒤 다시 리뷰를 요청하세요.",
+    ].filter((line): line is string => line !== undefined).join("\n");
+  }
+
   private shouldApproveAgentText(text: string, status: PullRequestStatus): boolean {
-    return !this.hasMergeConflict(status) && text.includes(AGENT_APPROVE_MARKER) && /\bNo actionable findings\./iu.test(text);
+    return (
+      !this.isClosedPullRequest(status) &&
+      !this.hasMergeConflict(status) &&
+      !this.hasBlockingStatusChecks(status) &&
+      text.includes(AGENT_APPROVE_MARKER) &&
+      this.wantsApproval(text)
+    );
   }
 
   private shouldApproveReviewText(text: string, status: PullRequestStatus): boolean {
-    return !this.hasMergeConflict(status) && /\bNo actionable findings\./iu.test(text);
+    return (
+      !this.isClosedPullRequest(status) &&
+      !this.hasMergeConflict(status) &&
+      !this.hasBlockingStatusChecks(status) &&
+      this.wantsApproval(text)
+    );
+  }
+
+  private wantsApproval(text: string): boolean {
+    return /\bNo actionable findings\./iu.test(text) || text.includes(NO_ACTIONABLE_FINDINGS_TEXT);
   }
 
   private publicAgentText(text: string): string {

@@ -1,3 +1,8 @@
+export const AI_REVIEW_PROVIDER_NAMES = ["gemini", "copilot", "cursor"] as const;
+
+export type AiReviewProviderName = (typeof AI_REVIEW_PROVIDER_NAMES)[number];
+export type AiReviewProviderWeights = Record<AiReviewProviderName, number>;
+
 export type Config = {
   port: number;
   githubAppId: string;
@@ -13,6 +18,16 @@ export type Config = {
   geminiModel?: string;
   geminiCliCommand: string;
   geminiCliTimeoutMs: number;
+  aiReviewProviders: AiReviewProviderName[];
+  aiReviewProviderWeights: AiReviewProviderWeights;
+  aiReviewProviderFallbackOrder: AiReviewProviderName[];
+  aiReviewProviderCooldownMs: number;
+  copilotCliCommand: string;
+  copilotCliTimeoutMs: number;
+  copilotModel?: string;
+  cursorCliCommand: string;
+  cursorCliTimeoutMs: number;
+  cursorModel?: string;
   mysqlHost?: string;
   mysqlPort: number;
   mysqlUser?: string;
@@ -70,6 +85,60 @@ function optionalList(name: string, fallback: string[]): string[] {
     .filter(Boolean);
 }
 
+function isAiReviewProviderName(value: string): value is AiReviewProviderName {
+  return (AI_REVIEW_PROVIDER_NAMES as readonly string[]).includes(value);
+}
+
+function optionalProviderList(name: string, fallback: AiReviewProviderName[]): AiReviewProviderName[] {
+  const values = optionalList(name, fallback);
+  const providers: AiReviewProviderName[] = [];
+  for (const value of values) {
+    const normalized = value.toLowerCase();
+    if (!isAiReviewProviderName(normalized)) {
+      throw new Error(`Invalid ${name} value: ${value}`);
+    }
+    if (!providers.includes(normalized)) {
+      providers.push(normalized);
+    }
+  }
+
+  if (providers.length === 0) {
+    throw new Error(`${name} must include at least one provider`);
+  }
+  return providers;
+}
+
+function optionalProviderWeights(
+  name: string,
+  fallback: Partial<AiReviewProviderWeights>,
+): AiReviewProviderWeights {
+  const weights: AiReviewProviderWeights = {
+    gemini: 0,
+    copilot: 0,
+    cursor: 0,
+    ...fallback,
+  };
+  const raw = process.env[name];
+  if (!raw) {
+    return weights;
+  }
+
+  for (const entry of raw.split(",")) {
+    const [providerRaw, weightRaw] = entry.split(":");
+    const provider = providerRaw?.trim().toLowerCase();
+    const weight = Number.parseInt(weightRaw?.trim() || "", 10);
+    if (!provider || !isAiReviewProviderName(provider)) {
+      throw new Error(`Invalid ${name} provider: ${providerRaw}`);
+    }
+    if (!Number.isFinite(weight) || weight < 0) {
+      throw new Error(`Invalid ${name} weight for ${provider}: ${weightRaw}`);
+    }
+    weights[provider] = weight;
+  }
+
+  return weights;
+}
+
 export function loadConfig(): Config {
   const privateKey = requiredEnv("GITHUB_PRIVATE_KEY").replace(/\\n/g, "\n");
   const workflowStore = (process.env.WORKFLOW_STORE?.trim() || "memory").toLowerCase();
@@ -95,6 +164,14 @@ export function loadConfig(): Config {
     throw new Error("Missing required environment variable: GEMINI_API_KEY");
   }
 
+  const aiReviewProviders = optionalProviderList("AI_REVIEW_PROVIDERS", ["gemini"]);
+  const aiReviewProviderWeights = optionalProviderWeights("AI_REVIEW_PROVIDER_WEIGHTS", {
+    gemini: 100,
+  });
+  if (aiReviewProviders.every((provider) => aiReviewProviderWeights[provider] <= 0)) {
+    throw new Error("AI_REVIEW_PROVIDER_WEIGHTS must give at least one enabled provider a positive weight");
+  }
+
   return {
     port: optionalInt("PORT", 3000),
     githubAppId: requiredEnv("GITHUB_APP_ID"),
@@ -110,6 +187,16 @@ export function loadConfig(): Config {
     geminiModel: process.env.GEMINI_MODEL?.trim(),
     geminiCliCommand: process.env.GEMINI_CLI_COMMAND?.trim() || "/app/node_modules/.bin/gemini",
     geminiCliTimeoutMs: optionalInt("GEMINI_CLI_TIMEOUT_MS", 180_000),
+    aiReviewProviders,
+    aiReviewProviderWeights,
+    aiReviewProviderFallbackOrder: optionalProviderList("AI_REVIEW_PROVIDER_FALLBACK_ORDER", ["gemini"]),
+    aiReviewProviderCooldownMs: optionalInt("AI_REVIEW_PROVIDER_COOLDOWN_MS", 5 * 60 * 1000),
+    copilotCliCommand: process.env.COPILOT_CLI_COMMAND?.trim() || "/app/node_modules/.bin/copilot",
+    copilotCliTimeoutMs: optionalInt("COPILOT_CLI_TIMEOUT_MS", 180_000),
+    copilotModel: process.env.COPILOT_MODEL?.trim(),
+    cursorCliCommand: process.env.CURSOR_CLI_COMMAND?.trim() || "/usr/local/bin/agent",
+    cursorCliTimeoutMs: optionalInt("CURSOR_CLI_TIMEOUT_MS", 180_000),
+    cursorModel: process.env.CURSOR_MODEL?.trim(),
     mysqlHost,
     mysqlPort: optionalInt("MYSQL_PORT", 3306),
     mysqlUser,

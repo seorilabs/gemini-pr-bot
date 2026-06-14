@@ -3,6 +3,14 @@ import { githubCommentBody, truncate } from "./text.js";
 
 type Octokit = any;
 
+export const REVIEW_AGENT_NAME = "Seori";
+export const REVIEW_CHECK_NAME = "Seori Review";
+
+const LEGACY_REVIEW_CHECK_NAME = "Gemini PR Bot";
+const NO_ACTION_REQUIRED_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=no-action-required";
+const MERGE_CONFLICT_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=merge-conflict";
+const FAILING_CHECK_CONCLUSIONS = new Set(["action_required", "cancelled", "failure", "timed_out"]);
+
 export type CheckConclusion =
   | "success"
   | "failure"
@@ -26,6 +34,8 @@ export type ReviewTrigger = {
 };
 
 export type PullRequestStatus = {
+  state: string;
+  merged: boolean;
   headSha: string;
   title: string;
   draft: boolean;
@@ -35,10 +45,17 @@ export type PullRequestStatus = {
   headRef: string;
   baseRepoFullName: string;
   headRepoFullName: string;
+  statusChecks: StatusCheckSummary;
 };
 
 export type PullRequestContext = PullRequestStatus & {
   markdown: string;
+};
+
+export type StatusCheckSummary = {
+  markdown: string;
+  failing: string[];
+  pending: string[];
 };
 
 export function repoFromPayload(payload: any): RepoRef {
@@ -90,7 +107,10 @@ export async function getPullRequestStatus(
   prNumber: number,
 ): Promise<PullRequestStatus> {
   const pr = await getPullRequestWithMergeability(octokit, repo, prNumber);
+  const statusChecks = await buildStatusCheckSummary(octokit, repo, pr.head.sha);
   return {
+    state: String(pr.state || "unknown"),
+    merged: Boolean(pr.merged),
     headSha: pr.head.sha,
     title: pr.title,
     draft: Boolean(pr.draft),
@@ -100,6 +120,7 @@ export async function getPullRequestStatus(
     headRef: pr.head.ref,
     baseRepoFullName: pr.base.repo?.full_name || repo.fullName,
     headRepoFullName: pr.head.repo?.full_name || repo.fullName,
+    statusChecks,
   };
 }
 
@@ -148,7 +169,8 @@ export async function buildPullRequestContext(
 ): Promise<PullRequestContext> {
   const pr = await getPullRequestWithMergeability(octokit, repo, prNumber);
 
-  const [files, commits, issueComments, reviewComments] = await Promise.all([
+  const [statusChecks, files, commits, issueComments, reviewComments, reviews] = await Promise.all([
+    buildStatusCheckSummary(octokit, repo, pr.head.sha),
     paginate(octokit, octokit.rest.pulls.listFiles, {
       owner: repo.owner,
       repo: repo.repo,
@@ -168,6 +190,12 @@ export async function buildPullRequestContext(
       per_page: 100,
     }),
     paginate(octokit, octokit.rest.pulls.listReviewComments, {
+      owner: repo.owner,
+      repo: repo.repo,
+      pull_number: prNumber,
+      per_page: 100,
+    }),
+    paginate(octokit, octokit.rest.pulls.listReviews, {
       owner: repo.owner,
       repo: repo.repo,
       pull_number: prNumber,
@@ -201,17 +229,28 @@ export async function buildPullRequestContext(
   }
 
   const recentIssueComments = issueComments
-    .slice(-20)
+    .slice(-50)
     .map((comment: any) => `- ${comment.user.login}: ${truncate(comment.body || "", 1000)}`)
     .join("\n");
 
   const recentReviewComments = reviewComments
-    .slice(-20)
+    .slice(-50)
     .map((comment: any) => {
       const line = comment.line ?? comment.original_line ?? "?";
       return `- ${comment.user.login} on ${comment.path}:${line}: ${truncate(comment.body || "", 1000)}`;
     })
     .join("\n");
+
+  const recentReviews = reviews
+    .slice(-30)
+    .map((review: any) => {
+      const submittedAt = review.submitted_at || review.submittedAt || "unknown-time";
+      const body = truncate(review.body || "", 700);
+      return `- ${review.user?.login || "unknown"} ${review.state || "UNKNOWN"} at ${submittedAt}: ${body || "(empty)"}`;
+    })
+    .join("\n");
+
+  const conversationState = buildConversationState(pr.head.sha, issueComments, reviewComments, reviews);
 
   const markdown = [
     "# Pull Request Context",
@@ -220,6 +259,8 @@ export async function buildPullRequestContext(
     `Pull request: #${prNumber}`,
     `Title: ${pr.title}`,
     `Author: ${pr.user?.login || "unknown"}`,
+    `State: ${pr.state || "unknown"}`,
+    `Merged: ${Boolean(pr.merged)}`,
     `Draft: ${Boolean(pr.draft)}`,
     `Base: ${pr.base.repo?.full_name || repo.fullName}:${pr.base.ref}`,
     `Head: ${pr.head.repo?.full_name || repo.fullName}:${pr.head.ref}`,
@@ -227,12 +268,21 @@ export async function buildPullRequestContext(
     `GitHub mergeable: ${pr.mergeable ?? "unknown"}`,
     `GitHub mergeable_state: ${pr.mergeable_state || "unknown"}`,
     "",
+    "## Status Checks",
+    statusChecks.markdown,
+    "",
+    "## Conversation State",
+    conversationState,
+    "",
     "## PR Body",
     pr.body || "(empty)",
     "",
     "## Commits",
     commits.map((commit: any) => `- ${commit.sha.slice(0, 7)} ${commit.commit.message.split("\n")[0]}`).join("\n") ||
       "(none)",
+    "",
+    "## Recent Reviews",
+    recentReviews || "(none)",
     "",
     "## Recent PR Comments",
     recentIssueComments || "(none)",
@@ -245,6 +295,8 @@ export async function buildPullRequestContext(
   ].join("\n");
 
   return {
+    state: String(pr.state || "unknown"),
+    merged: Boolean(pr.merged),
     headSha: pr.head.sha,
     title: pr.title,
     draft: Boolean(pr.draft),
@@ -254,8 +306,62 @@ export async function buildPullRequestContext(
     headRef: pr.head.ref,
     baseRepoFullName: pr.base.repo?.full_name || repo.fullName,
     headRepoFullName: pr.head.repo?.full_name || repo.fullName,
+    statusChecks,
     markdown: truncate(markdown, config.maxContextChars),
   };
+}
+
+export async function isReviewThreadResolved(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+  commentDatabaseId: number,
+): Promise<boolean> {
+  const query = `
+    query($owner: String!, $repo: String!, $prNumber: Int!, $after: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $prNumber) {
+          reviewThreads(first: 100, after: $after) {
+            nodes {
+              isResolved
+              comments(first: 100) {
+                nodes {
+                  databaseId
+                }
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  let after: string | null = null;
+  do {
+    const result: any = await octokit.graphql(query, {
+      owner: repo.owner,
+      repo: repo.repo,
+      prNumber,
+      after,
+    });
+    const threads = result.repository?.pullRequest?.reviewThreads;
+    for (const thread of threads?.nodes || []) {
+      const containsComment = (thread.comments?.nodes || []).some(
+        (comment: any) => Number(comment.databaseId) === Number(commentDatabaseId),
+      );
+      if (containsComment) {
+        return Boolean(thread.isResolved);
+      }
+    }
+
+    after = threads?.pageInfo?.hasNextPage ? threads.pageInfo.endCursor : null;
+  } while (after);
+
+  return false;
 }
 
 export async function createInProgressCheck(
@@ -267,19 +373,135 @@ export async function createInProgressCheck(
     const { data } = await octokit.rest.checks.create({
       owner: repo.owner,
       repo: repo.repo,
-      name: "Gemini PR Bot",
+      name: REVIEW_CHECK_NAME,
       head_sha: headSha,
       status: "in_progress",
       started_at: new Date().toISOString(),
       output: {
-        title: "Gemini review is running",
-        summary: "Gemini PR Bot is reviewing the pull request context.",
+        title: `${REVIEW_AGENT_NAME}가 리뷰 중입니다`,
+        summary: `${REVIEW_AGENT_NAME}가 PR 맥락을 검토하고 있습니다.`,
       },
     });
     return data.id;
   } catch {
     return null;
   }
+}
+
+async function buildStatusCheckSummary(
+  octokit: Octokit,
+  repo: RepoRef,
+  headSha: string,
+): Promise<StatusCheckSummary> {
+  const failing: string[] = [];
+  const pending: string[] = [];
+  const lines: string[] = [];
+
+  const [checkRunsResult, statusesResult] = await Promise.allSettled([
+    octokit.rest.checks.listForRef({
+      owner: repo.owner,
+      repo: repo.repo,
+      ref: headSha,
+      per_page: 100,
+    }),
+    octokit.rest.repos.listCommitStatusesForRef({
+      owner: repo.owner,
+      repo: repo.repo,
+      ref: headSha,
+      per_page: 100,
+    }),
+  ]);
+
+  if (checkRunsResult.status === "fulfilled") {
+    const checkRuns = checkRunsResult.value.data.check_runs || [];
+    for (const run of checkRuns) {
+      if (isOwnReviewCheck(run.name)) {
+        continue;
+      }
+
+      const state = run.status === "completed" ? run.conclusion || "unknown" : run.status || "unknown";
+      const name = `check:${run.name}`;
+      lines.push(`- ${name}: ${state}`);
+      if (run.status !== "completed") {
+        pending.push(`${name} (${state})`);
+      } else if (FAILING_CHECK_CONCLUSIONS.has(String(run.conclusion || "").toLowerCase())) {
+        failing.push(`${name} (${state})`);
+      }
+    }
+  } else {
+    lines.push(`- check-runs: unable to read (${errorMessage(checkRunsResult.reason)})`);
+  }
+
+  if (statusesResult.status === "fulfilled") {
+    const latestStatuses = latestCommitStatuses(statusesResult.value.data || []);
+    for (const status of latestStatuses) {
+      const name = `status:${status.context || "unknown"}`;
+      const state = String(status.state || "unknown").toLowerCase();
+      lines.push(`- ${name}: ${state}${status.description ? ` - ${truncate(status.description, 200)}` : ""}`);
+      if (["error", "failure"].includes(state)) {
+        failing.push(`${name} (${state})`);
+      } else if (state === "pending") {
+        pending.push(`${name} (${state})`);
+      }
+    }
+  } else {
+    lines.push(`- commit-statuses: unable to read (${errorMessage(statusesResult.reason)})`);
+  }
+
+  if (lines.length === 0) {
+    lines.push("(none)");
+  }
+
+  return {
+    markdown: lines.join("\n"),
+    failing,
+    pending,
+  };
+}
+
+function latestCommitStatuses(statuses: any[]): any[] {
+  const byContext = new Map<string, any>();
+  for (const status of statuses) {
+    const context = status.context || "unknown";
+    if (!byContext.has(context)) {
+      byContext.set(context, status);
+    }
+  }
+  return [...byContext.values()];
+}
+
+function buildConversationState(headSha: string, issueComments: any[], reviewComments: any[], reviews: any[]): string {
+  const bodies = [
+    ...issueComments.map((comment: any) => comment.body || ""),
+    ...reviewComments.map((comment: any) => comment.body || ""),
+    ...reviews.map((review: any) => review.body || ""),
+  ];
+  const currentNoActionMarkers = bodies.filter((body) =>
+    body.includes(NO_ACTION_REQUIRED_MARKER_TEXT) && body.includes(`head=${headSha}`),
+  ).length;
+  const staleNoActionMarkers = bodies.filter((body) =>
+    body.includes(NO_ACTION_REQUIRED_MARKER_TEXT) && !body.includes(`head=${headSha}`),
+  ).length;
+  const currentMergeConflictMarkers = bodies.filter((body) =>
+    body.includes(MERGE_CONFLICT_MARKER_TEXT) && body.includes(`head=${headSha}`),
+  ).length;
+
+  return [
+    `Current no-action marker count: ${currentNoActionMarkers}`,
+    `Stale no-action marker count: ${staleNoActionMarkers}`,
+    `Current merge-conflict marker count: ${currentMergeConflictMarkers}`,
+    `Total PR comments considered: ${issueComments.length}`,
+    `Total review comments considered: ${reviewComments.length}`,
+    `Total reviews considered: ${reviews.length}`,
+  ].join("\n");
+}
+
+function isOwnReviewCheck(name: string | undefined): boolean {
+  return name === REVIEW_CHECK_NAME || name === LEGACY_REVIEW_CHECK_NAME;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export async function completeCheck(

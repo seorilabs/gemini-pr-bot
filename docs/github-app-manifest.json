@@ -1,5 +1,5 @@
 {
-  "name": "Seorilabs Gemini PR Bot",
+  "name": "Seorilabs Seori",
   "url": "https://github.com/seorilabs/gemini-pr-bot",
   "hook_attributes": {
     "url": "https://gemini-pr-bot.vzyx.xyz/github/webhook"
@@ -19,4 +19,3 @@
     "pull_request_review_comment"
   ]
 }
-

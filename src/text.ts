@@ -73,5 +73,5 @@ export function parseBotCommand(body: string, config: Config): BotCommand | null
 }
 
 export function githubCommentBody(body: string, maxChars = 60_000): string {
-  return truncate(`${body.trim()}\n\n---\n_Gemini PR Bot_`, maxChars);
+  return truncate(`${body.trim()}\n\n<!-- seorilabs-review-agent -->`, maxChars);
 }

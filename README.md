@@ -1,13 +1,13 @@
-# Gemini PR Bot
+# Seori Review Bot
 
-Seorilabs organization-wide GitHub App webhook daemon for Gemini-backed PR review and PR conversation replies.
+Seorilabs organization-wide GitHub App webhook daemon for multi-provider PR review and PR conversation replies.
 
 ```mermaid
 flowchart LR
   GitHub["GitHub App Webhook"] --> Ingress["K8s Ingress"]
   Ingress --> Bot["gemini-pr-bot"]
   Bot --> GitHubAPI["GitHub App Installation API"]
-  Bot --> Gemini["Gemini CLI or API"]
+  Bot --> Providers["Gemini / Cursor / Copilot"]
   Bot --> Comment["PR comments / inline replies / check runs"]
 ```
 
@@ -20,7 +20,11 @@ flowchart LR
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
-- Creates a `Gemini PR Bot` check run for review and agent jobs.
+- Creates a `Seori Review` check run for review and agent jobs.
+- Can route AI jobs across Gemini CLI, GitHub Copilot CLI, and Cursor Agent with weighted fallback.
+- Skips stale output when a PR is merged, closed, or updated while a review is running.
+- Blocks approval while tests, build, lint, typecheck, or status checks are failing or pending.
+- Ignores resolved inline review threads.
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
 - Persists active check-run IDs so a restarted worker can resume a job instead of leaving stale pending checks.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
@@ -30,12 +34,14 @@ flowchart LR
 
 ```text
 @gemini-cli /review
+@seorilabs-seori /review
 @seorilabs-gemini-pr-bot /review
 /gemini review
 @gemini-cli /approve [reason]
 /gemini approve [reason]
 @gemini-cli /help
 @gemini-cli <question>
+@seorilabs-seori <question or handoff>
 @seorilabs-gemini-pr-bot <question or handoff>
 ```
 
@@ -45,15 +51,15 @@ flowchart LR
 <!-- seorilabs-gemini-pr-bot:status=no-action-required head=<head-sha> -->
 ```
 
-Other review agents should treat the latest non-stale Gemini approval as "no further agent action required". A new commit makes the marker stale when the repository's branch protection dismisses stale approvals.
+Other review agents should treat the latest non-stale approval marker as "no further agent action required". A new commit makes the marker stale when the repository's branch protection dismisses stale approvals.
 
 ```mermaid
 flowchart TD
   Review["/review or PR opened"] --> Context["Build PR context"]
   Context --> Conflict{"Merge conflict?"}
   Conflict -->|Yes| RequestChanges["REQUEST_CHANGES review with resolution steps"]
-  Conflict -->|No| Gemini["Gemini strict review prompt"]
-  Gemini --> Decision{"Actionable findings?"}
+  Conflict -->|No| AI["Strict review prompt"]
+  AI --> Decision{"Actionable findings?"}
   Decision -->|Yes| Output["Post findings comment + check run"]
   Decision -->|No| Approval["GitHub APPROVE review with HEAD marker"]
   Output --> Approve["Maintainer or trusted agent runs /approve"]
@@ -63,15 +69,15 @@ flowchart TD
   Agent -->|New commit or stale approval| Review
 ```
 
-Normal mentions use agent mode. The bot asks Gemini to choose one action:
+Normal mentions use agent mode. The bot asks the configured AI provider chain to choose one action:
 
 ```mermaid
 flowchart TD
   Mention["Bot mentioned"] --> Context["Build PR context"]
-  Context --> Decide["Gemini agent decision"]
+  Context --> Decide["Agent decision"]
   Decide -->|Action: comment| Comment["Post PR comment or inline reply"]
   Decide -->|Action: approve + no actionable findings| Approval["Submit GitHub APPROVE review"]
-  Decide --> Check["Complete Gemini PR Bot check"]
+  Decide --> Check["Complete Seori Review check"]
 ```
 
 Approval from agent mode is guarded: the model output must include the approval action marker and the exact `No actionable findings.` finding result. Otherwise the bot only comments.
@@ -86,7 +92,7 @@ flowchart TD
   Enqueue --> Ack["Return 202 accepted"]
   Worker["Daemon worker"] --> Lease["Lease queued or expired workflow"]
   Lease --> Bot["Run PR review/agent logic"]
-  Bot --> Check["Create or reuse Gemini PR Bot check-run"]
+  Bot --> Check["Create or reuse Seori Review check-run"]
   Check --> Done["Complete workflow row"]
   Lease -->|worker dies| Expire["Lease expires"]
   Expire --> Lease
@@ -109,6 +115,29 @@ export GITHUB_WEBHOOK_SECRET="..."
 ./scripts/create-gemini-cli-oauth-secret.sh
 ./scripts/copy-mysql-app-secret.sh
 ```
+
+Optional multi-provider review routing:
+
+```bash
+kubectl -n apps create secret generic gemini-pr-bot-provider-secrets \
+  --from-literal=COPILOT_GITHUB_TOKEN="$COPILOT_GITHUB_TOKEN" \
+  --from-literal=CURSOR_API_KEY="$CURSOR_API_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Use a dedicated automation account for these credentials. Personal tokens are acceptable for a short smoke test, but not for steady production use.
+
+The production default is:
+
+```text
+AI_REVIEW_PROVIDERS=gemini,copilot,cursor
+AI_REVIEW_PROVIDER_WEIGHTS=gemini:100,copilot:0,cursor:0
+AI_REVIEW_PROVIDER_FALLBACK_ORDER=gemini,cursor,copilot
+COPILOT_MODEL=auto
+CURSOR_MODEL=gpt-5.2
+```
+
+Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions all use the multi-provider router. This keeps `/agent` approval decisions working when Gemini CLI is temporarily quota-blocked.
 
 ## Build And Deploy
 
