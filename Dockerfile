@@ -15,7 +15,7 @@ WORKDIR /app
 RUN groupadd --system --gid 10001 app \
   && useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/app app \
   && apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl git tar \
+  && apt-get install -y --no-install-recommends ca-certificates curl git ripgrep tar \
   && rm -rf /var/lib/apt/lists/*
 RUN curl https://cursor.com/install -fsS | bash \
   && cursor_dir="$(find /root/.local/share/cursor-agent/versions -mindepth 1 -maxdepth 1 -type d | head -n 1)" \

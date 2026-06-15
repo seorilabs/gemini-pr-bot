@@ -21,6 +21,20 @@ export type AiProviderQuotaEvent = {
   occurredAt: string;
 };
 
+export class AiProviderCooldownError extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterMs: number,
+  ) {
+    super(message);
+    this.name = "AiProviderCooldownError";
+  }
+}
+
+export function isAiProviderCooldownError(error: unknown): error is AiProviderCooldownError {
+  return error instanceof AiProviderCooldownError;
+}
+
 export class GeminiClient {
   private readonly ai?: GoogleGenAI;
   private readonly providerCooldownUntil = new Map<AiReviewProviderName, number>();
@@ -117,12 +131,15 @@ export class GeminiClient {
     const selectedProvider = this.pickReviewProvider();
     const providers = this.reviewProviderAttemptOrder(selectedProvider);
     const errors: string[] = [];
+    const cooldownDelaysMs: number[] = [];
+    let failedAttempts = 0;
 
     for (const provider of providers) {
       const cooldownRemainingMs = this.providerCooldownRemainingMs(provider);
       if (cooldownRemainingMs > 0) {
         metrics.recordAiProviderAttempt(kind, selectedProvider, provider, "cooldown");
         errors.push(`${provider}: cooldown ${cooldownRemainingMs}ms`);
+        cooldownDelaysMs.push(cooldownRemainingMs);
         continue;
       }
 
@@ -141,6 +158,7 @@ export class GeminiClient {
         );
         return text;
       } catch (error) {
+        failedAttempts += 1;
         const message = error instanceof Error ? error.message : String(error);
         metrics.recordAiProviderAttempt(kind, selectedProvider, provider, "failure", elapsedSecondsSince(startedAt));
         errors.push(`${provider}: ${message}`);
@@ -160,13 +178,21 @@ export class GeminiClient {
             provider,
             selectedProvider,
             kind,
-            errorMessage: truncate(message, 600),
+            errorMessage: truncate(providerAlertErrorMessage(message), 600),
             cooldownMs: this.config.aiReviewProviderCooldownMs,
             cooldownUntil: new Date(cooldownUntil).toISOString(),
             occurredAt: new Date().toISOString(),
           });
         }
       }
+    }
+
+    if (failedAttempts === 0 && cooldownDelaysMs.length > 0) {
+      const retryAfterMs = Math.max(1_000, Math.min(...cooldownDelaysMs) + 1_000);
+      throw new AiProviderCooldownError(
+        `All AI ${kind} providers are cooling down; retry after ${Math.ceil(retryAfterMs / 1000)}s: ${errors.join(" | ")}`,
+        retryAfterMs,
+      );
     }
 
     throw new Error(`All AI ${kind} providers failed: ${errors.join(" | ")}`);
@@ -453,6 +479,24 @@ function isQuotaLikeError(message: string): boolean {
     /limit exceeded/i,
     /rateLimitExceeded/i,
   ].some((pattern) => pattern.test(message));
+}
+
+function providerAlertErrorMessage(message: string): string {
+  const normalized = message.replace(/\s+/g, " ").trim();
+  const terminalQuota = normalized.match(/TerminalQuotaError:\s*.*?(?=\s+at\s+[\w$.]+|\s*$)/i);
+  if (terminalQuota) {
+    return terminalQuota[0].trim();
+  }
+
+  const cleaned = normalized
+    .replace(/^Gemini CLI exited with code \d+:\s*/i, "")
+    .replace(/Warning: True color \(24-bit\) support not detected\. Using a terminal with true color enabled will result in a better visual experience\.\s*/gi, "")
+    .replace(/Ripgrep is not available\. Falling back to GrepTool\.\s*/gi, "")
+    .replace(/Full report available at:\s+\S+\s*/gi, "")
+    .replace(/\s+at\s+[\w$.]+.*$/s, "")
+    .trim();
+
+  return cleaned || normalized;
 }
 
 function elapsedSecondsSince(startedAtMs: number): number {

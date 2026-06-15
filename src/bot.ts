@@ -1,6 +1,6 @@
 import type { Config } from "./config.js";
 import { CI_RECHECK_EVENT, STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
-import { GeminiClient } from "./gemini.js";
+import { GeminiClient, isAiProviderCooldownError } from "./gemini.js";
 import { metrics, type GaugeSample } from "./metrics.js";
 import {
   approvePullRequest,
@@ -746,6 +746,11 @@ export class PrBot {
       await postPrComment(octokit, repo, prNumber, actionRequiredText);
       await this.completeTrackedCheck(check, "action_required", "조치 필요", actionRequiredText);
     } catch (error) {
+      if (workflow && isAiProviderCooldownError(error)) {
+        this.releaseTrackedCheck(check);
+        throw error;
+      }
+
       const message = error instanceof Error ? error.message : String(error);
       await this.completeTrackedCheck(check, "failure", "리뷰 실패", message);
       throw error;
@@ -888,6 +893,11 @@ export class PrBot {
 
       await this.completeTrackedCheck(check, "action_required", "조치 필요", commentText);
     } catch (error) {
+      if (workflow && isAiProviderCooldownError(error)) {
+        this.releaseTrackedCheck(check);
+        throw error;
+      }
+
       const message = error instanceof Error ? error.message : String(error);
       await this.completeTrackedCheck(check, "failure", "에이전트 처리 실패", message);
       throw error;
@@ -954,6 +964,12 @@ export class PrBot {
       await completeCheck(check.octokit, check.repo, check.checkRunId, conclusion, title, summary);
       metrics.recordCheckRunCompleted(check.kind, conclusion);
     } finally {
+      this.activeChecks.delete(check.key);
+    }
+  }
+
+  private releaseTrackedCheck(check: ActiveCheckRun | null): void {
+    if (check) {
       this.activeChecks.delete(check.key);
     }
   }

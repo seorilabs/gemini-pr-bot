@@ -9,6 +9,7 @@ import mysql, {
 import type { App } from "octokit";
 import type { Config } from "./config.js";
 import type { PrBot, WorkflowCheckRecord } from "./bot.js";
+import { isAiProviderCooldownError } from "./gemini.js";
 import { completeCheck, type RepoRef } from "./github.js";
 import { metrics, type ActiveWorkflowMetric, type WorkflowQueueMetric } from "./metrics.js";
 
@@ -347,6 +348,23 @@ export class MysqlWorkflowStore {
     );
   }
 
+  async deferForProviderCooldown(run: WorkflowRun, delayMs: number, message: string): Promise<void> {
+    await this.pool.execute(
+      `
+      UPDATE gemini_pr_bot_workflows
+      SET
+        status = 'queued',
+        attempts = GREATEST(attempts - 1, 0),
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        next_run_at = TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(3)),
+        last_error = ?
+      WHERE id = ?
+      `,
+      [Math.ceil(delayMs) * 1000, truncateError(message), run.id],
+    );
+  }
+
   async failExpiredFinalAttempt(run: ExpiredWorkflowRun, message: string): Promise<void> {
     await this.pool.execute(
       `
@@ -631,6 +649,21 @@ export class WorkflowEngine {
       metrics.recordWorkflowCompleted(run.eventName, elapsedSecondsSince(startedAt));
       this.logger.info({ workflowId: run.id, event: run.eventName }, "workflow completed");
     } catch (error) {
+      if (isAiProviderCooldownError(error)) {
+        await this.store.deferForProviderCooldown(run, error.retryAfterMs, error.message);
+        this.logger.warn(
+          {
+            workflowId: run.id,
+            event: run.eventName,
+            attempt: run.attempts,
+            maxAttempts: run.maxAttempts,
+            retryAfterMs: error.retryAfterMs,
+          },
+          "workflow deferred because all AI providers are cooling down",
+        );
+        return true;
+      }
+
       await this.store.fail(run, error);
       metrics.recordWorkflowFailed(run.eventName, run.attempts >= run.maxAttempts, elapsedSecondsSince(startedAt));
       this.logger.error(

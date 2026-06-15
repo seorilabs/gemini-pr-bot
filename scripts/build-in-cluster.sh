@@ -6,6 +6,10 @@ image="${IMAGE:-registry.vzyx.xyz/seorilabs/gemini-pr-bot}"
 tag="${TAG:-$(git rev-parse --short HEAD)}"
 timeout="${TIMEOUT:-20m}"
 node_name="${BUILD_NODE:-rpi5}"
+build_cpu_request="${BUILD_CPU_REQUEST:-500m}"
+build_cpu_limit="${BUILD_CPU_LIMIT:-2}"
+build_memory_request="${BUILD_MEMORY_REQUEST:-1Gi}"
+build_memory_limit="${BUILD_MEMORY_LIMIT:-4Gi}"
 
 safe_tag=$(printf '%s' "${tag}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-24)
 job_name="build-gemini-pr-bot-${safe_tag}"
@@ -95,11 +99,11 @@ spec:
               readOnly: true
           resources:
             requests:
-              cpu: 500m
-              memory: 512Mi
+              cpu: ${build_cpu_request}
+              memory: ${build_memory_request}
             limits:
-              cpu: "2"
-              memory: 2Gi
+              cpu: "${build_cpu_limit}"
+              memory: ${build_memory_limit}
       volumes:
         - name: build-context
           configMap:
