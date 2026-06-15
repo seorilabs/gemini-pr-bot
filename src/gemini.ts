@@ -160,16 +160,18 @@ export class GeminiClient {
       } catch (error) {
         failedAttempts += 1;
         const message = error instanceof Error ? error.message : String(error);
+        const summary = providerAlertErrorMessage(message);
         metrics.recordAiProviderAttempt(kind, selectedProvider, provider, "failure", elapsedSecondsSince(startedAt));
-        errors.push(`${provider}: ${message}`);
-        const cooldownUntil = this.cooldownProvider(provider);
+        errors.push(`${provider}: ${summary}`);
+        const cooldownMs = providerCooldownMs(message) ?? this.config.aiReviewProviderCooldownMs;
+        const cooldownUntil = this.cooldownProvider(provider, cooldownMs);
         this.logger?.warn(
           {
             kind,
             selectedProvider,
             provider,
             error: message,
-            cooldownMs: this.config.aiReviewProviderCooldownMs,
+            cooldownMs,
           },
           "AI provider failed",
         );
@@ -178,8 +180,8 @@ export class GeminiClient {
             provider,
             selectedProvider,
             kind,
-            errorMessage: truncate(providerAlertErrorMessage(message), 600),
-            cooldownMs: this.config.aiReviewProviderCooldownMs,
+            errorMessage: truncate(summary, 600),
+            cooldownMs,
             cooldownUntil: new Date(cooldownUntil).toISOString(),
             occurredAt: new Date().toISOString(),
           });
@@ -243,8 +245,8 @@ export class GeminiClient {
     return Math.max(0, (this.providerCooldownUntil.get(provider) || 0) - Date.now());
   }
 
-  private cooldownProvider(provider: AiReviewProviderName): number {
-    const cooldownUntil = Date.now() + this.config.aiReviewProviderCooldownMs;
+  private cooldownProvider(provider: AiReviewProviderName, cooldownMs: number): number {
+    const cooldownUntil = Date.now() + cooldownMs;
     this.providerCooldownUntil.set(provider, cooldownUntil);
     return cooldownUntil;
   }
@@ -497,6 +499,45 @@ function providerAlertErrorMessage(message: string): string {
     .trim();
 
   return cleaned || normalized;
+}
+
+function providerCooldownMs(message: string): number | null {
+  const retryDelay = message.match(/retryDelayMs:\s*([0-9.]+)/i);
+  if (retryDelay?.[1]) {
+    const value = Number(retryDelay[1]);
+    if (Number.isFinite(value) && value > 0) {
+      return Math.ceil(value);
+    }
+  }
+
+  const resetAfter = message.match(/reset after\s+([0-9dhms\s.]+)/i);
+  if (!resetAfter?.[1]) {
+    return null;
+  }
+
+  let totalMs = 0;
+  const parts = resetAfter[1].matchAll(/(\d+(?:\.\d+)?)(d|h|m|s|ms)\b/gi);
+  for (const part of parts) {
+    const value = Number(part[1]);
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+
+    const unit = part[2].toLowerCase();
+    if (unit === "d") {
+      totalMs += value * 24 * 60 * 60 * 1000;
+    } else if (unit === "h") {
+      totalMs += value * 60 * 60 * 1000;
+    } else if (unit === "m") {
+      totalMs += value * 60 * 1000;
+    } else if (unit === "s") {
+      totalMs += value * 1000;
+    } else if (unit === "ms") {
+      totalMs += value;
+    }
+  }
+
+  return totalMs > 0 ? Math.ceil(totalMs) : null;
 }
 
 function elapsedSecondsSince(startedAtMs: number): number {
