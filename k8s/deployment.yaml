@@ -95,7 +95,7 @@ spec:
             - name: AI_REVIEW_PROVIDERS
               value: gemini,copilot,cursor
             - name: AI_REVIEW_PROVIDER_WEIGHTS
-              value: gemini:100,copilot:0,cursor:0
+              value: gemini:100,copilot:0,cursor:25
             - name: AI_REVIEW_PROVIDER_FALLBACK_ORDER
               value: gemini,cursor,copilot
             - name: AI_REVIEW_PROVIDER_COOLDOWN_MS

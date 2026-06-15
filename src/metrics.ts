@@ -109,6 +109,46 @@ const METADATA: Record<string, { type: "counter" | "gauge" | "histogram"; help: 
     type: "histogram",
     help: "AI provider call duration in seconds.",
   },
+  gemini_pr_bot_ai_provider_configured: {
+    type: "gauge",
+    help: "Whether an AI provider is listed in AI_REVIEW_PROVIDERS.",
+  },
+  gemini_pr_bot_ai_provider_weight: {
+    type: "gauge",
+    help: "Configured AI provider routing weight.",
+  },
+  gemini_pr_bot_ai_provider_credential_present: {
+    type: "gauge",
+    help: "Whether required credentials appear present for the AI provider.",
+  },
+  gemini_pr_bot_ai_provider_routing_enabled: {
+    type: "gauge",
+    help: "Whether an AI provider can be selected by routing based on config weight.",
+  },
+  gemini_pr_bot_ai_provider_available: {
+    type: "gauge",
+    help: "Whether an AI provider is configured, weighted, credentialed, and not in cooldown.",
+  },
+  gemini_pr_bot_ai_provider_cooldown_remaining_seconds: {
+    type: "gauge",
+    help: "Seconds remaining until the AI provider cooldown expires in this process.",
+  },
+  gemini_pr_bot_ai_provider_cooldown_until_timestamp_seconds: {
+    type: "gauge",
+    help: "Unix timestamp when the AI provider cooldown expires in this process.",
+  },
+  gemini_pr_bot_ai_provider_last_success_timestamp_seconds: {
+    type: "gauge",
+    help: "Unix timestamp of the last successful AI provider response in this process.",
+  },
+  gemini_pr_bot_ai_provider_last_failure_timestamp_seconds: {
+    type: "gauge",
+    help: "Unix timestamp of the last AI provider failure in this process.",
+  },
+  gemini_pr_bot_ai_provider_last_quota_reset_timestamp_seconds: {
+    type: "gauge",
+    help: "Unix timestamp of the last quota reset time reported by an AI provider in this process.",
+  },
   gemini_pr_bot_check_runs_started_total: {
     type: "counter",
     help: "GitHub check runs started by kind.",

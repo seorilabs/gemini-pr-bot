@@ -1,7 +1,8 @@
 import { GoogleGenAI } from "@google/genai";
 import { spawn } from "node:child_process";
-import type { AiReviewProviderName, Config } from "./config.js";
-import { metrics } from "./metrics.js";
+import { existsSync } from "node:fs";
+import { AI_REVIEW_PROVIDER_NAMES, type AiReviewProviderName, type Config } from "./config.js";
+import { metrics, type GaugeSample } from "./metrics.js";
 import { truncate } from "./text.js";
 
 type Logger = {
@@ -38,6 +39,9 @@ export function isAiProviderCooldownError(error: unknown): error is AiProviderCo
 export class GeminiClient {
   private readonly ai?: GoogleGenAI;
   private readonly providerCooldownUntil = new Map<AiReviewProviderName, number>();
+  private readonly providerLastSuccessAt = new Map<AiReviewProviderName, number>();
+  private readonly providerLastFailureAt = new Map<AiReviewProviderName, number>();
+  private readonly providerLastQuotaResetAt = new Map<AiReviewProviderName, number>();
 
   constructor(
     private readonly config: Config,
@@ -146,6 +150,7 @@ export class GeminiClient {
       const startedAt = Date.now();
       try {
         const text = await this.runProvider(provider, kind, prompt);
+        this.providerLastSuccessAt.set(provider, Date.now());
         metrics.recordAiProviderAttempt(kind, selectedProvider, provider, "success", elapsedSecondsSince(startedAt));
         this.logger?.info(
           {
@@ -161,10 +166,14 @@ export class GeminiClient {
         failedAttempts += 1;
         const message = error instanceof Error ? error.message : String(error);
         const summary = providerAlertErrorMessage(message);
+        this.providerLastFailureAt.set(provider, Date.now());
         metrics.recordAiProviderAttempt(kind, selectedProvider, provider, "failure", elapsedSecondsSince(startedAt));
         errors.push(`${provider}: ${summary}`);
         const cooldownMs = providerCooldownMs(message) ?? this.config.aiReviewProviderCooldownMs;
         const cooldownUntil = this.cooldownProvider(provider, cooldownMs);
+        if (isQuotaLikeError(message)) {
+          this.providerLastQuotaResetAt.set(provider, cooldownUntil);
+        }
         this.logger?.warn(
           {
             kind,
@@ -198,6 +207,78 @@ export class GeminiClient {
     }
 
     throw new Error(`All AI ${kind} providers failed: ${errors.join(" | ")}`);
+  }
+
+  metricSamples(): GaugeSample[] {
+    const now = Date.now();
+    const configured = new Set(this.config.aiReviewProviders);
+    const samples: GaugeSample[] = [];
+
+    for (const provider of AI_REVIEW_PROVIDER_NAMES) {
+      const labels = { provider };
+      const weight = this.config.aiReviewProviderWeights[provider] || 0;
+      const isConfigured = configured.has(provider);
+      const hasCredential = this.hasProviderCredential(provider);
+      const cooldownUntil = this.providerCooldownUntil.get(provider) || 0;
+      const cooldownRemainingSeconds = Math.max(0, (cooldownUntil - now) / 1000);
+      const routingEnabled = isConfigured && weight > 0;
+      const available = routingEnabled && hasCredential && cooldownRemainingSeconds <= 0;
+
+      samples.push(
+        {
+          name: "gemini_pr_bot_ai_provider_configured",
+          labels,
+          value: isConfigured ? 1 : 0,
+        },
+        {
+          name: "gemini_pr_bot_ai_provider_weight",
+          labels,
+          value: weight,
+        },
+        {
+          name: "gemini_pr_bot_ai_provider_credential_present",
+          labels,
+          value: hasCredential ? 1 : 0,
+        },
+        {
+          name: "gemini_pr_bot_ai_provider_routing_enabled",
+          labels,
+          value: routingEnabled ? 1 : 0,
+        },
+        {
+          name: "gemini_pr_bot_ai_provider_available",
+          labels,
+          value: available ? 1 : 0,
+        },
+        {
+          name: "gemini_pr_bot_ai_provider_cooldown_remaining_seconds",
+          labels,
+          value: cooldownRemainingSeconds,
+        },
+        {
+          name: "gemini_pr_bot_ai_provider_cooldown_until_timestamp_seconds",
+          labels,
+          value: cooldownUntil > now ? cooldownUntil / 1000 : 0,
+        },
+        {
+          name: "gemini_pr_bot_ai_provider_last_success_timestamp_seconds",
+          labels,
+          value: (this.providerLastSuccessAt.get(provider) || 0) / 1000,
+        },
+        {
+          name: "gemini_pr_bot_ai_provider_last_failure_timestamp_seconds",
+          labels,
+          value: (this.providerLastFailureAt.get(provider) || 0) / 1000,
+        },
+        {
+          name: "gemini_pr_bot_ai_provider_last_quota_reset_timestamp_seconds",
+          labels,
+          value: (this.providerLastQuotaResetAt.get(provider) || 0) / 1000,
+        },
+      );
+    }
+
+    return samples;
   }
 
   private pickReviewProvider(): AiReviewProviderName {
@@ -243,6 +324,25 @@ export class GeminiClient {
 
   private providerCooldownRemainingMs(provider: AiReviewProviderName): number {
     return Math.max(0, (this.providerCooldownUntil.get(provider) || 0) - Date.now());
+  }
+
+  private hasProviderCredential(provider: AiReviewProviderName): boolean {
+    if (provider === "gemini") {
+      if (this.config.geminiProvider === "api") {
+        return Boolean(this.config.geminiApiKey);
+      }
+
+      const home = process.env.HOME || "";
+      return Boolean(home) &&
+        existsSync(`${home}/.gemini/oauth_creds.json`) &&
+        existsSync(`${home}/.gemini/google_accounts.json`);
+    }
+
+    if (provider === "copilot") {
+      return Boolean(process.env.COPILOT_GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_TOKEN);
+    }
+
+    return Boolean(process.env.CURSOR_API_KEY);
   }
 
   private cooldownProvider(provider: AiReviewProviderName, cooldownMs: number): number {

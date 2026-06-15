@@ -139,6 +139,7 @@ Key metric groups:
 - `gemini_pr_bot_workflow_rows`: MySQL workflow rows by status and event.
 - `gemini_pr_bot_workflow_ready_rows`: queued workflows ready to lease now.
 - `gemini_pr_bot_workflow_run_duration_seconds`: workflow processing latency.
+- `gemini_pr_bot_ai_provider_*`: configured provider, routing weight, credential presence, availability, cooldown, and recent success/failure/quota timestamps.
 - `gemini_pr_bot_ai_provider_attempts_total`: provider success, failure, and cooldown counts.
 - `gemini_pr_bot_check_runs_completed_total`: `Seori Review` outcomes by kind and conclusion.
 - `gemini_pr_bot_active_tasks` and `gemini_pr_bot_active_check_runs`: in-process work gauges.
@@ -174,7 +175,7 @@ The production default is:
 
 ```text
 AI_REVIEW_PROVIDERS=gemini,copilot,cursor
-AI_REVIEW_PROVIDER_WEIGHTS=gemini:100,copilot:0,cursor:0
+AI_REVIEW_PROVIDER_WEIGHTS=gemini:100,copilot:0,cursor:25
 AI_REVIEW_PROVIDER_FALLBACK_ORDER=gemini,cursor,copilot
 COPILOT_MODEL=auto
 CURSOR_MODEL=gpt-5.2
@@ -185,6 +186,7 @@ Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
 Providers with weight `0` are disabled for both random selection and fallback attempts.
 If every enabled provider is already in cooldown before a provider command is started, the workflow is requeued until the earliest cooldown expires instead of consuming retry attempts and failing immediately.
+The default keeps Copilot at weight `0` until its quota health is proven, while Cursor has a smaller positive weight so it can absorb traffic when Gemini is cooling down.
 
 Optional approval Telegram notifications use the same NATS message contract as `fundevel/cronjobs`: publish `{ "text": "..." }` to `telegram.<bot>.<channel>`.
 
@@ -197,7 +199,7 @@ APPROVAL_TELEGRAM_BOT=seolee_bot
 APPROVAL_TELEGRAM_CHANNEL=syous
 ```
 
-Quota summaries are based on provider error text and cooldown state. The Gemini/Copilot/Cursor CLI paths do not expose exact remaining quota, so the bot reports the detected quota-like failure, provider routing, weights, fallback order, and cooldown release time.
+Quota summaries and Grafana provider health are based on provider error text, credential presence, routing config, and cooldown state. The Gemini/Copilot/Cursor CLI paths do not expose exact remaining quota, so the bot reports detected quota-like failures, provider routing, weights, fallback order, and cooldown release time instead of exact remaining credits.
 
 Optional stale review closing:
 

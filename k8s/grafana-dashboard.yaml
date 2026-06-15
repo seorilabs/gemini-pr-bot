@@ -1025,6 +1025,91 @@ data:
                 "steps": [
                   {
                     "color": "green"
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 28
+          },
+          "id": 16,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "countRows": false,
+              "fields": "",
+              "reducer": [
+                "sum"
+              ],
+              "show": false
+            },
+            "showHeader": true
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "label_replace(gemini_pr_bot_ai_provider_configured, \"metric\", \"configured\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_weight, \"metric\", \"weight\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_credential_present, \"metric\", \"credential_present\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_routing_enabled, \"metric\", \"routing_enabled\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_available, \"metric\", \"available\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_cooldown_remaining_seconds, \"metric\", \"cooldown_remaining_seconds\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_cooldown_until_timestamp_seconds, \"metric\", \"cooldown_until_timestamp\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_last_success_timestamp_seconds, \"metric\", \"last_success_timestamp\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_last_failure_timestamp_seconds, \"metric\", \"last_failure_timestamp\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_last_quota_reset_timestamp_seconds, \"metric\", \"last_quota_reset_timestamp\", \"__name__\", \".*\")",
+              "format": "table",
+              "instant": true,
+              "legendFormat": "__auto",
+              "refId": "A"
+            }
+          ],
+          "title": "AI Provider Health",
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "__name__": true,
+                  "container": true,
+                  "endpoint": true,
+                  "instance": true,
+                  "job": true,
+                  "namespace": true,
+                  "pod": true,
+                  "service": true
+                },
+                "renameByName": {
+                  "Value": "value",
+                  "metric": "metric",
+                  "provider": "provider"
+                }
+              }
+            }
+          ],
+          "type": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "cellOptions": {
+                  "type": "auto"
+                },
+                "inspect": false
+              },
+              "decimals": 0,
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
                   },
                   {
                     "color": "yellow",
@@ -1063,7 +1148,7 @@ data:
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 28
+            "y": 36
           },
           "id": 15,
           "options": {

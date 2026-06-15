@@ -154,6 +154,7 @@ export class PrBot {
         name: "gemini_pr_bot_active_check_runs",
         value: this.activeChecks.size,
       },
+      ...this.gemini.metricSamples(),
     ];
   }
 
