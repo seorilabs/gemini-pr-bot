@@ -301,13 +301,14 @@ export class PrBot {
       return;
     }
 
-    if (command.mode === "approve") {
+    if (command.mode === "approve" || command.mode === "force_approve") {
       await this.runApprove(
         octokit,
         repo,
         issueNumber,
         payload.sender.login,
         command.request,
+        { skipValidation: command.mode === "force_approve" },
       );
       return;
     }
@@ -359,13 +360,14 @@ export class PrBot {
       return;
     }
 
-    if (command.mode === "approve") {
+    if (command.mode === "approve" || command.mode === "force_approve") {
       await this.runApprove(
         octokit,
         repo,
         prNumber,
         payload.sender.login,
         command.request,
+        { skipValidation: command.mode === "force_approve" },
       );
       return;
     }
@@ -423,13 +425,14 @@ export class PrBot {
       return;
     }
 
-    if (command.mode === "approve") {
+    if (command.mode === "approve" || command.mode === "force_approve") {
       await this.runApprove(
         octokit,
         repo,
         prNumber,
         payload.sender.login,
         command.request,
+        { skipValidation: command.mode === "force_approve" },
       );
       return;
     }
@@ -1407,12 +1410,13 @@ export class PrBot {
     prNumber: number,
     sender: string,
     reason: string,
+    options: { skipValidation?: boolean } = {},
   ): Promise<void> {
     const status = await getPullRequestStatus(octokit, repo, prNumber);
     if (this.isClosedPullRequest(status)) {
       return;
     }
-    if (this.hasMergeConflict(status)) {
+    if (!options.skipValidation && this.hasMergeConflict(status)) {
       await requestChangesPullRequest(
         octokit,
         repo,
@@ -1422,7 +1426,7 @@ export class PrBot {
       );
       return;
     }
-    if (this.hasBlockingStatusChecks(status)) {
+    if (!options.skipValidation && this.hasBlockingStatusChecks(status)) {
       await postPrComment(octokit, repo, prNumber, this.statusCheckBlockerText(status));
       return;
     }
@@ -1432,11 +1436,13 @@ export class PrBot {
       repo,
       prNumber,
       status,
-      this.approvalText(sender, reason, status.headSha),
+      this.approvalText(sender, reason, status.headSha, undefined, {
+        validationSkipped: Boolean(options.skipValidation),
+      }),
       {
-        mode: "manual",
+        mode: options.skipValidation ? "force_manual" : "manual",
         sender,
-        source: "approve_command",
+        source: options.skipValidation ? "force_approve_command" : "approve_command",
         reason,
       },
     );
@@ -1575,12 +1581,20 @@ export class PrBot {
       "- `@seorilabs-seori /review`: 현재 PR을 리뷰합니다.",
       "- `@seori-bot /review`: 현재 PR을 리뷰합니다.",
       "- `@seorilabs-seori /approve [사유]`: GitHub approval review와 agent coordination marker를 남깁니다.",
+      "- `@seorilabs-seori /approve --skip-validation [사유]`: 봇의 병합 충돌/상태 체크 차단을 건너뛰고 즉시 approval review를 남깁니다.",
+      "- `@seorilabs-seori /force-approve [사유]`: `/approve --skip-validation`과 같습니다.",
       "- `@seorilabs-seori 질문`: PR 맥락을 분석하고 comment 또는 approve를 결정합니다. `/review deep`처럼 요청하면 deep repository context를 강제로 사용합니다.",
       "- inline review comment에서 `@seorilabs-seori 질문`: 해당 review comment 맥락으로 답하거나 PR을 approve합니다.",
     ].join("\n");
   }
 
-  private approvalText(sender: string, reason: string, headSha: string, analysis?: string): string {
+  private approvalText(
+    sender: string,
+    reason: string,
+    headSha: string,
+    analysis?: string,
+    options: { validationSkipped?: boolean } = {},
+  ): string {
     return [
       `<!-- ${NO_ACTION_REQUIRED_MARKER} head=${headSha} -->`,
       "## 승인 상태",
@@ -1588,6 +1602,9 @@ export class PrBot {
       `승인 요청자: @${sender}`,
       `적용 HEAD: \`${headSha}\``,
       `사유: ${reason}`,
+      options.validationSkipped
+        ? "검증 스킵: 명시 명령으로 봇의 병합 충돌/상태 체크 차단을 건너뜀"
+        : undefined,
       "",
       "새 커밋이 올라오거나 maintainer가 명시적으로 다시 리뷰를 요청하지 않는 한 추가 에이전트 작업은 필요 없습니다.",
       "",

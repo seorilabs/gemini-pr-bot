@@ -19,6 +19,7 @@ flowchart LR
 - Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
 - Runs explicit review on `@gemini-cli /review`; if there are no actionable findings, it submits an approval review instead of only commenting.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]`.
+- Allows trusted maintainers to bypass bot-side merge conflict and status-check approval blockers with `@gemini-cli /approve --skip-validation [reason]` or `@gemini-cli /force-approve [reason]`.
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
 - Keeps review loops bounded by stating acceptance criteria first, narrowing follow-up checks to new changes plus stability regressions once those criteria are met, and closing PRs that repeatedly fail the same criteria.
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
@@ -28,7 +29,7 @@ flowchart LR
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
 - Can route AI jobs across Gemini CLI, GitHub Copilot CLI, and Cursor Agent with weighted fallback.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
-- Blocks approval while tests, build, lint, typecheck, or status checks are failing.
+- Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
 - Ignores resolved inline review threads.
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
@@ -49,6 +50,10 @@ flowchart LR
 /gemini review
 @gemini-cli /approve [reason]
 /gemini approve [reason]
+@gemini-cli /approve --skip-validation [reason]
+@gemini-cli /force-approve [reason]
+/gemini approve --skip-validation [reason]
+/gemini force-approve [reason]
 @gemini-cli /help
 @gemini-cli <question>
 @seorilabs-seori <question or handoff>
@@ -56,13 +61,15 @@ flowchart LR
 @seorilabs-gemini-pr-bot <question or handoff>
 ```
 
-`/approve` submits a real GitHub approval review for the current PR HEAD. The approval review body includes a hidden coordination marker:
+`/approve` submits a real GitHub approval review for the current PR HEAD after bot-side merge conflict and status-check validation passes. The approval review body includes a hidden coordination marker:
 
 ```html
 <!-- seorilabs-gemini-pr-bot:status=no-action-required head=<head-sha> -->
 ```
 
 Other review agents should treat the latest non-stale approval marker as "no further agent action required". A new commit makes the marker stale when the repository's branch protection dismisses stale approvals.
+
+`/approve --skip-validation` and `/force-approve` skip the bot-side merge conflict and status-check blockers and submit approval immediately for the current PR HEAD. The review body records that validation was skipped. Repository branch protection can still block the merge independently.
 
 ```mermaid
 flowchart TD
@@ -74,7 +81,11 @@ flowchart TD
   Decision -->|Yes| Output["Post findings comment + check run"]
   Decision -->|No| Approval["GitHub APPROVE review with HEAD marker"]
   Output --> Approve["Maintainer or trusted agent runs /approve"]
-  Approve --> Approval
+  Approve --> Validation{"Bot-side validation passes?"}
+  Validation -->|Yes| Approval
+  Validation -->|No| Block["Comment blocker"]
+  Output --> ForceApprove["Maintainer runs /force-approve or /approve --skip-validation"]
+  ForceApprove --> Approval
   Approval --> Agent["Other agents read review state + marker"]
   Agent -->|Approval current| Stop["No further agent action"]
   Agent -->|New commit or stale approval| Review

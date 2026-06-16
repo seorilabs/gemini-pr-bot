@@ -2,7 +2,7 @@ import type { Config } from "./config.js";
 
 export type BotCommand = {
   mention: string;
-  mode: "review" | "chat" | "help" | "approve" | "agent";
+  mode: "review" | "chat" | "help" | "approve" | "force_approve" | "agent";
   request: string;
 };
 
@@ -32,6 +32,17 @@ function parseRequest(mention: string, rawRequest: string): BotCommand {
       mention,
       mode: "help",
       request: rawRequest,
+    };
+  }
+
+  const forceApproveMatch = rawRequest.match(
+    /^\/?(?:(?:force[-_ ]?approve)|(?:approve\s+(?:--force|--skip-validation|--skip-checks|--no-verify)))(?:\s+([\s\S]*))?$/iu,
+  );
+  if (forceApproveMatch) {
+    return {
+      mention,
+      mode: "force_approve",
+      request: forceApproveMatch[1]?.trim() || "검증을 건너뛰고 즉시 승인합니다.",
     };
   }
 
