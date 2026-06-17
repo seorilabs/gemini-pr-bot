@@ -31,6 +31,7 @@ flowchart LR
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
+- When `AUTO_SQUASH_MERGE_ENABLED=true`, squash-merges the approved current HEAD only when the PR base branch is `main`, the PR is not draft, mergeable, and all status checks are green.
 - Ignores resolved inline review threads.
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
 - Persists active check-run IDs so a restarted worker can resume a job instead of leaving stale pending checks.
@@ -70,7 +71,7 @@ flowchart LR
 
 Other review agents should treat the latest non-stale approval marker as "no further agent action required". A new commit makes the marker stale when the repository's branch protection dismisses stale approvals.
 
-`/approve --skip-validation` and `/force-approve` skip the bot-side merge conflict and status-check blockers and submit approval immediately for the current PR HEAD. The review body records that validation was skipped. Repository branch protection can still block the merge independently.
+`/approve --skip-validation` and `/force-approve` skip the bot-side merge conflict and status-check blockers and submit approval immediately for the current PR HEAD. The review body records that validation was skipped. Repository branch protection can still block the merge independently. Validation-skipped approvals never trigger automatic Squash Merge.
 
 ```mermaid
 flowchart TD
@@ -86,8 +87,12 @@ flowchart TD
   Validation -->|Yes| Approval
   Validation -->|No| Block["Comment blocker"]
   Output --> ForceApprove["Maintainer runs /force-approve or /approve --skip-validation"]
-  ForceApprove --> Approval
-  Approval --> Agent["Other agents read review state + marker"]
+  ForceApprove --> ForceApproval["GitHub APPROVE review with skipped validation marker"]
+  Approval --> AutoMerge{"AUTO_SQUASH_MERGE_ENABLED and base main?"}
+  AutoMerge -->|Yes + checks green| Squash["Squash Merge current HEAD"]
+  AutoMerge -->|No| Agent
+  Squash --> Agent
+  ForceApproval --> Agent["Other agents read review state + marker"]
   Agent -->|Approval current| Stop["No further agent action"]
   Agent -->|New commit or stale approval| Review
 ```
@@ -193,11 +198,13 @@ COPILOT_MODEL=auto
 CURSOR_MODEL=gpt-5.2
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot
 PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
+AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
 Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions all use the multi-provider router. This keeps `/agent` approval decisions working when Gemini CLI is temporarily quota-blocked.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
+When `AUTO_SQUASH_MERGE_ENABLED=true`, approval is followed by a GitHub Squash Merge attempt only for PRs targeting `main`; there is no repo allowlist and no branch allowlist beyond exact `main`.
 Providers with weight `0` are disabled for both random selection and fallback attempts.
 If every enabled provider is already in cooldown before a provider command is started, the workflow is requeued until the earliest cooldown expires instead of consuming retry attempts and failing immediately.
 The default keeps Copilot at weight `0` until its quota health is proven, while Cursor has a smaller positive weight so it can absorb traffic when Gemini is cooling down.

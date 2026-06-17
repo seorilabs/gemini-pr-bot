@@ -18,6 +18,7 @@ import {
   REVIEW_AGENT_NAME,
   repoFromPayload,
   shouldHandleRepository,
+  squashMergePullRequest,
   type CheckConclusion,
   type PullRequestContext,
   type PullRequestContextOptions,
@@ -36,6 +37,13 @@ const AGENT_APPROVE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=approve -->";
 const AGENT_COMMENT_MARKER = "<!-- seorilabs-gemini-pr-bot:action=comment -->";
 const AGENT_CLOSE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=close -->";
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
+const AUTO_SQUASH_MERGE_FAILED_MARKER = "seorilabs-gemini-pr-bot:auto-squash-merge=failed";
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 type AgentReplyTarget =
   | { type: "pr_comment" }
@@ -635,6 +643,13 @@ export class PrBot {
       },
     );
     await completeCheck(octokit, repo, request.checkRunId, "success", "PR 승인 완료", request.approvalBody);
+    await this.maybeSquashMergeApprovedPullRequest(
+      octokit,
+      repo,
+      request.prNumber,
+      status.headSha,
+      request.mode,
+    );
   }
 
   private isAutoReviewIgnored(repo: RepoRef): boolean {
@@ -743,6 +758,13 @@ export class PrBot {
           },
         );
         await this.completeTrackedCheck(check, "success", "PR 승인 완료", reviewText);
+        await this.maybeSquashMergeApprovedPullRequest(
+          octokit,
+          repo,
+          prNumber,
+          latest.headSha,
+          "review",
+        );
         return;
       }
 
@@ -878,6 +900,13 @@ export class PrBot {
           },
         );
         await this.completeTrackedCheck(check, "success", "PR 승인 완료", publicText);
+        await this.maybeSquashMergeApprovedPullRequest(
+          octokit,
+          repo,
+          prNumber,
+          latest.headSha,
+          "agent",
+        );
         return;
       }
 
@@ -1446,6 +1475,13 @@ export class PrBot {
         reason,
       },
     );
+    await this.maybeSquashMergeApprovedPullRequest(
+      octokit,
+      repo,
+      prNumber,
+      status.headSha,
+      options.skipValidation ? "force_manual" : "manual",
+    );
   }
 
   private async approveAndNotify(
@@ -1473,6 +1509,89 @@ export class PrBot {
       reason: notification.reason,
       mode: notification.mode,
     });
+  }
+
+  private async maybeSquashMergeApprovedPullRequest(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    approvedHeadSha: string,
+    mode: ApprovalNotificationMode,
+  ): Promise<void> {
+    if (!this.config.autoSquashMergeEnabled || mode === "force_manual") {
+      return;
+    }
+
+    const status = await this.statusForSquashMerge(octokit, repo, prNumber);
+    const skipReason = this.autoSquashMergeSkipReason(status, approvedHeadSha);
+    if (skipReason) {
+      this.logger.info(
+        {
+          repo: repo.fullName,
+          prNumber,
+          headSha: approvedHeadSha,
+          skipReason,
+          baseRef: status.baseRef,
+          mergeable: status.mergeable,
+          mergeableState: status.mergeableState,
+        },
+        "auto squash merge skipped",
+      );
+      return;
+    }
+
+    try {
+      await this.squashMergeWithRetry(octokit, repo, prNumber, approvedHeadSha);
+      this.logger.info(
+        {
+          repo: repo.fullName,
+          prNumber,
+          headSha: approvedHeadSha,
+          mode,
+        },
+        "auto squash merge completed",
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        {
+          error,
+          repo: repo.fullName,
+          prNumber,
+          headSha: approvedHeadSha,
+          mode,
+        },
+        "auto squash merge failed",
+      );
+      await postPrComment(
+        octokit,
+        repo,
+        prNumber,
+        this.autoSquashMergeFailureText(status, approvedHeadSha, message),
+      );
+    }
+  }
+
+  private async squashMergeWithRetry(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    approvedHeadSha: string,
+  ): Promise<void> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await squashMergePullRequest(octokit, repo, prNumber, approvedHeadSha);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 3) {
+          await delay(1_000);
+        }
+      }
+    }
+
+    throw lastError;
   }
 
   private async shouldIgnoreClosedPullRequest(
@@ -1705,6 +1824,56 @@ export class PrBot {
 
   private isClosedPullRequest(status: PullRequestStatus): boolean {
     return status.merged || status.state.toLowerCase() !== "open";
+  }
+
+  private async statusForSquashMerge(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+  ): Promise<PullRequestStatus> {
+    let status = await getPullRequestStatus(octokit, repo, prNumber);
+    for (let attempt = 0; attempt < 3 && this.hasPendingStatusChecks(status); attempt += 1) {
+      await delay(1_000);
+      status = await getPullRequestStatus(octokit, repo, prNumber);
+    }
+    return status;
+  }
+
+  private autoSquashMergeSkipReason(status: PullRequestStatus, approvedHeadSha: string): string | null {
+    if (this.isClosedPullRequest(status)) {
+      return "pull request is already closed or merged";
+    }
+    if (status.headSha !== approvedHeadSha) {
+      return "pull request head changed after approval";
+    }
+    if (status.draft) {
+      return "pull request is draft";
+    }
+    if (status.baseRef !== "main") {
+      return "base branch is not main";
+    }
+    if (this.hasMergeConflict(status)) {
+      return "pull request has merge conflicts";
+    }
+    if (this.hasBlockingStatusChecks(status)) {
+      return "status checks are not green";
+    }
+    return null;
+  }
+
+  private autoSquashMergeFailureText(status: PullRequestStatus, approvedHeadSha: string, message: string): string {
+    return [
+      `<!-- ${AUTO_SQUASH_MERGE_FAILED_MARKER} head=${approvedHeadSha} -->`,
+      "## 자동 Squash Merge 실패",
+      "",
+      "Seori approval은 제출됐지만, GitHub Squash Merge API 호출이 실패했습니다.",
+      "",
+      `- HEAD: \`${approvedHeadSha}\``,
+      `- Base: \`${status.baseRepoFullName}:${status.baseRef}\``,
+      `- GitHub mergeable: \`${status.mergeable ?? "unknown"}\``,
+      `- GitHub mergeable_state: \`${status.mergeableState}\``,
+      `- 오류: \`${message}\``,
+    ].join("\n");
   }
 
   private hasBlockingStatusChecks(status: PullRequestStatus): boolean {

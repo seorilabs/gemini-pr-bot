@@ -43,6 +43,7 @@ export type Config = {
   autoReviewOnOpen: boolean;
   autoReviewOnSynchronize: boolean;
   autoReviewIgnoredRepositories: Set<string>;
+  autoSquashMergeEnabled: boolean;
   approvalTelegramNotifyEnabled: boolean;
   quotaTelegramNotifyEnabled: boolean;
   quotaTelegramSummaryIntervalMs: number;
@@ -254,6 +255,7 @@ export function loadConfig(): Config {
     autoReviewOnOpen: optionalBool("AUTO_REVIEW_ON_OPEN", true),
     autoReviewOnSynchronize: optionalBool("AUTO_REVIEW_ON_SYNCHRONIZE", false),
     autoReviewIgnoredRepositories: optionalRepositorySet("AUTO_REVIEW_IGNORED_REPOSITORIES", []),
+    autoSquashMergeEnabled: optionalBool("AUTO_SQUASH_MERGE_ENABLED", false),
     approvalTelegramNotifyEnabled: optionalBool("APPROVAL_TELEGRAM_NOTIFY_ENABLED", false),
     quotaTelegramNotifyEnabled: optionalBool("QUOTA_TELEGRAM_NOTIFY_ENABLED", false),
     quotaTelegramSummaryIntervalMs: optionalInt("QUOTA_TELEGRAM_SUMMARY_INTERVAL_MS", 60 * 60 * 1000),

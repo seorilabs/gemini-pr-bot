@@ -800,6 +800,21 @@ export async function approvePullRequest(
   });
 }
 
+export async function squashMergePullRequest(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+  headSha: string,
+): Promise<void> {
+  await octokit.rest.pulls.merge({
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: prNumber,
+    sha: headSha,
+    merge_method: "squash",
+  });
+}
+
 export async function requestChangesPullRequest(
   octokit: Octokit,
   repo: RepoRef,

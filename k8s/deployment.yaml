@@ -136,6 +136,8 @@ spec:
               value: "true"
             - name: AUTO_REVIEW_IGNORED_REPOSITORIES
               value: seorilabs/gemini-pr-bot
+            - name: AUTO_SQUASH_MERGE_ENABLED
+              value: "true"
             - name: APPROVAL_TELEGRAM_NOTIFY_ENABLED
               value: "true"
             - name: QUOTA_TELEGRAM_NOTIFY_ENABLED
