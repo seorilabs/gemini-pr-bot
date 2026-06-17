@@ -318,6 +318,7 @@ export async function buildPullRequestContext(
     `Head SHA: ${pr.head.sha}`,
     `GitHub mergeable: ${pr.mergeable ?? "unknown"}`,
     `GitHub mergeable_state: ${pr.mergeable_state || "unknown"}`,
+    "Merge gate note: `mergeable_state: blocked` can be caused by pending required checks/reviews, including the current Seori Review gate. Treat only explicit failing checks listed below as review findings; the bot's own Seori Review check is omitted from Status Checks.",
     "",
     "## Status Checks",
     statusChecks.markdown,
