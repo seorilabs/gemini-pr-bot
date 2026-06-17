@@ -28,7 +28,7 @@ import {
   updateInProgressCheck,
 } from "./github.js";
 import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./telegram.js";
-import { parseBotCommand } from "./text.js";
+import { parseBotCommand, truncate } from "./text.js";
 
 const NO_ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=no-action-required";
 const ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=action-required";
@@ -91,11 +91,27 @@ export type WorkflowCheckRecord = {
   headSha: string;
 };
 
+export type WorkflowTargetRecord = Omit<WorkflowCheckRecord, "checkRunId">;
+
+export type ActiveReviewWorkflow = {
+  workflowId: number;
+  status: string;
+  eventName: string;
+  payload: any;
+  checkRunId: number | null;
+  startedAt: Date | string | null;
+  completedAt: Date | string | null;
+};
+
 export type WorkflowExecution = {
+  workflowId?: number;
+  createdAt?: Date | string;
   checkRunId?: number | null;
   installationId?: number;
   installationToken?: string;
+  recordWorkflowTarget?: (record: WorkflowTargetRecord) => Promise<void>;
   recordCheckRun: (record: WorkflowCheckRecord) => Promise<void>;
+  findActiveReview?: (record: WorkflowTargetRecord) => Promise<ActiveReviewWorkflow | null>;
   enqueueSynthetic?: (eventName: string, dedupeKey: string, payload: any, delayMs?: number) => Promise<boolean>;
 };
 
@@ -669,6 +685,20 @@ export class PrBot {
       return;
     }
 
+    const target: WorkflowTargetRecord = {
+      kind: "review",
+      repoFullName: repo.fullName,
+      prNumber,
+      headSha: context.headSha,
+    };
+    await workflow?.recordWorkflowTarget?.(target);
+
+    const activeReview = await workflow?.findActiveReview?.(target);
+    if (activeReview && this.shouldCoalesceReviewRequest(activeReview, trigger)) {
+      await this.coalesceReviewRequest(octokit, repo, prNumber, context.headSha, trigger, activeReview);
+      return;
+    }
+
     const check = await this.createTrackedCheck(octokit, repo, prNumber, context.headSha, "review", workflow);
 
     try {
@@ -781,6 +811,93 @@ export class PrBot {
       await this.completeTrackedCheck(check, "failure", "리뷰 실패", message);
       throw error;
     }
+  }
+
+  private shouldCoalesceReviewRequest(activeReview: ActiveReviewWorkflow, trigger: ReviewTrigger): boolean {
+    if (activeReview.status !== "queued") {
+      return true;
+    }
+
+    const activeTriggerKey = this.reviewTriggerKeyFromWorkflowPayload(activeReview.eventName, activeReview.payload);
+    if (!activeTriggerKey) {
+      return true;
+    }
+
+    return activeTriggerKey === this.reviewTriggerKey(trigger.source, trigger.request);
+  }
+
+  private async coalesceReviewRequest(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    headSha: string,
+    trigger: ReviewTrigger,
+    activeReview: ActiveReviewWorkflow,
+  ): Promise<void> {
+    this.logger.info(
+      {
+        repo: repo.fullName,
+        prNumber,
+        headSha,
+        source: trigger.source,
+        sender: trigger.sender,
+        activeWorkflowId: activeReview.workflowId,
+        activeStatus: activeReview.status,
+        activeCheckRunId: activeReview.checkRunId,
+      },
+      "review request coalesced into active review workflow",
+    );
+
+    if (activeReview.status === "completed" || !activeReview.checkRunId) {
+      return;
+    }
+
+    await updateInProgressCheck(
+      octokit,
+      repo,
+      activeReview.checkRunId,
+      "추가 리뷰 요청 접수",
+      [
+        "같은 PR HEAD에 대한 추가 리뷰 요청을 기존 진행 중인 리뷰에 합쳤습니다.",
+        "",
+        `PR: #${prNumber}`,
+        `HEAD: \`${headSha}\``,
+        `요청자: @${trigger.sender}`,
+        `요청 출처: \`${trigger.source}\``,
+        trigger.request ? `요청: ${truncate(trigger.request, 500)}` : undefined,
+        `기존 workflow: \`${activeReview.workflowId}\``,
+      ].filter(Boolean).join("\n"),
+    );
+  }
+
+  private reviewTriggerKeyFromWorkflowPayload(eventName: string, payload: any): string | null {
+    if (eventName === "pull_request") {
+      const action = String(payload.action || "");
+      if (["opened", "reopened", "synchronize"].includes(action)) {
+        return this.reviewTriggerKey(`pull_request.${action}`, undefined);
+      }
+      return null;
+    }
+
+    if (eventName === "issue_comment") {
+      const command = parseBotCommand(payload.comment?.body || "", this.config);
+      return command?.mode === "review" ? this.reviewTriggerKey("issue_comment", command.request) : null;
+    }
+
+    if (eventName === "pull_request_review") {
+      const command = parseBotCommand(payload.review?.body || "", this.config);
+      return command?.mode === "review" ? this.reviewTriggerKey("pull_request_review", command.request) : null;
+    }
+
+    return null;
+  }
+
+  private reviewTriggerKey(source: string, request: string | undefined): string {
+    return `${source}:${this.normalizeReviewRequest(request)}`;
+  }
+
+  private normalizeReviewRequest(request: string | undefined): string {
+    return (request || "").replace(/\s+/g, " ").trim();
   }
 
   private async runAgent(

@@ -33,6 +33,7 @@ type WorkflowRow = RowDataPacket & {
   attempts: number;
   max_attempts: number;
   check_run_id: number | null;
+  created_at: Date | string;
 };
 
 type ExpiredWorkflowRow = WorkflowRow & {
@@ -75,6 +76,16 @@ type ActiveWorkflowMetricRow = RowDataPacket & {
   next_run_delay_seconds: number | string | null;
 };
 
+type ActiveReviewWorkflowRow = RowDataPacket & {
+  id: number | string;
+  status: string;
+  event_name: string;
+  payload_json: string;
+  check_run_id: number | string | null;
+  started_at: Date | string | null;
+  completed_at: Date | string | null;
+};
+
 export type WorkflowRun = {
   id: number;
   dedupeKey: string;
@@ -83,6 +94,19 @@ export type WorkflowRun = {
   attempts: number;
   maxAttempts: number;
   checkRunId: number | null;
+  createdAt: Date | string;
+};
+
+export type WorkflowTargetRecord = Omit<WorkflowCheckRecord, "checkRunId">;
+
+export type ActiveReviewWorkflow = {
+  workflowId: number;
+  status: string;
+  eventName: string;
+  payload: any;
+  checkRunId: number | null;
+  startedAt: Date | string | null;
+  completedAt: Date | string | null;
 };
 
 export class MysqlWorkflowStore {
@@ -162,7 +186,8 @@ export class MysqlWorkflowStore {
           payload_json,
           attempts,
           max_attempts,
-          check_run_id
+          check_run_id,
+          created_at
         FROM gemini_pr_bot_workflows
         WHERE
           attempts < max_attempts
@@ -207,6 +232,7 @@ export class MysqlWorkflowStore {
         attempts: row.attempts + 1,
         maxAttempts: row.max_attempts,
         checkRunId: row.check_run_id,
+        createdAt: row.created_at,
       };
     } catch (error) {
       await rollbackQuietly(connection, this.logger);
@@ -235,7 +261,8 @@ export class MysqlWorkflowStore {
           head_sha,
           check_kind,
           lease_owner,
-          lease_expires_at
+          lease_expires_at,
+          created_at
         FROM gemini_pr_bot_workflows
         WHERE
           status = 'running'
@@ -274,6 +301,7 @@ export class MysqlWorkflowStore {
         attempts: Number(row.attempts),
         maxAttempts: Number(row.max_attempts),
         checkRunId: row.check_run_id === null ? null : Number(row.check_run_id),
+        createdAt: row.created_at,
         repoFullName: row.repo_full_name,
         prNumber: row.pr_number === null ? null : Number(row.pr_number),
         headSha: row.head_sha,
@@ -303,6 +331,84 @@ export class MysqlWorkflowStore {
       `,
       [record.checkRunId, record.kind, record.repoFullName, record.prNumber, record.headSha, id],
     );
+  }
+
+  async recordWorkflowTarget(id: number, record: WorkflowTargetRecord): Promise<void> {
+    await this.pool.execute(
+      `
+      UPDATE gemini_pr_bot_workflows
+      SET
+        check_kind = ?,
+        repo_full_name = ?,
+        pr_number = ?,
+        head_sha = ?
+      WHERE id = ?
+      `,
+      [record.kind, record.repoFullName, record.prNumber, record.headSha, id],
+    );
+  }
+
+  async findActiveReviewWorkflow(
+    currentWorkflowId: number,
+    currentCreatedAt: Date | string,
+    record: WorkflowTargetRecord,
+  ): Promise<ActiveReviewWorkflow | null> {
+    const [rows] = await this.pool.execute<ActiveReviewWorkflowRow[]>(
+      `
+      SELECT
+        id,
+        status,
+        event_name,
+        payload_json,
+        check_run_id,
+        started_at,
+        completed_at
+      FROM gemini_pr_bot_workflows
+      WHERE
+        id < ?
+        AND check_kind = ?
+        AND repo_full_name = ?
+        AND pr_number = ?
+        AND head_sha = ?
+        AND (
+          status = 'queued'
+          OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at >= CURRENT_TIMESTAMP(3)))
+          OR (
+            status = 'completed'
+            AND started_at IS NOT NULL
+            AND completed_at IS NOT NULL
+            AND started_at <= ?
+            AND completed_at >= ?
+          )
+        )
+      ORDER BY FIELD(status, 'running', 'queued', 'completed'), id ASC
+      LIMIT 1
+      `,
+      [
+        currentWorkflowId,
+        record.kind,
+        record.repoFullName,
+        record.prNumber,
+        record.headSha,
+        currentCreatedAt,
+        currentCreatedAt,
+      ],
+    );
+
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+
+    return {
+      workflowId: Number(row.id),
+      status: row.status,
+      eventName: row.event_name,
+      payload: JSON.parse(row.payload_json),
+      checkRunId: row.check_run_id === null ? null : Number(row.check_run_id),
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+    };
   }
 
   async complete(id: number): Promise<void> {
@@ -638,10 +744,14 @@ export class WorkflowEngine {
       const installationToken = await this.createInstallationToken(installationId);
       const octokit = await this.app.getInstallationOctokit(installationId);
       await this.bot.processEvent(octokit, run.eventName, run.payload, {
+        workflowId: run.id,
+        createdAt: run.createdAt,
         checkRunId: run.checkRunId,
         installationId,
         installationToken,
+        recordWorkflowTarget: (record) => this.store.recordWorkflowTarget(run.id, record),
         recordCheckRun: (record) => this.store.recordCheckRun(run.id, record),
+        findActiveReview: (record) => this.store.findActiveReviewWorkflow(run.id, run.createdAt, record),
         enqueueSynthetic: (eventName, dedupeKey, payload, delayMs) =>
           this.enqueueSynthetic(eventName, dedupeKey, payload, delayMs),
       });
