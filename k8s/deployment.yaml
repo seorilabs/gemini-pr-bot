@@ -128,6 +128,8 @@ spec:
               value: "OWNER,MEMBER,COLLABORATOR"
             - name: ALLOW_PUBLIC_REPOS
               value: "false"
+            - name: PUBLIC_REPOSITORY_ALLOWLIST
+              value: seorilabs/.github
             - name: AUTO_REVIEW_ON_OPEN
               value: "true"
             - name: AUTO_REVIEW_ON_SYNCHRONIZE

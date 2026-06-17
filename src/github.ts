@@ -105,7 +105,11 @@ export function shouldHandleRepository(payload: any, config: Config): boolean {
     return false;
   }
 
-  if (!config.allowPublicRepos && !repo.isPrivate) {
+  const publicRepoAllowed =
+    config.publicRepositoryAllowlist.has(repo.fullName.toLowerCase()) ||
+    config.publicRepositoryAllowlist.has(repo.repo.toLowerCase());
+
+  if (!config.allowPublicRepos && !repo.isPrivate && !publicRepoAllowed) {
     return false;
   }
 
@@ -301,7 +305,7 @@ export async function buildPullRequestContext(
     "",
     `Repository: ${repo.fullName}`,
     `Repository private: ${repo.isPrivate}`,
-    `Public repository handling: ${config.allowPublicRepos ? "allowed" : "disabled"}`,
+    `Public repository handling: ${config.allowPublicRepos ? "allowed" : "disabled except allowlist"}`,
     `Seorilabs ARC policy: private JS/TS lint, test, typecheck, and build jobs may use self-hosted ARC runners; public PR jobs must not.`,
     `Pull request: #${prNumber}`,
     `Title: ${pr.title}`,

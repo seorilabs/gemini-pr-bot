@@ -38,6 +38,7 @@ flowchart LR
 - Publishes a throttled Telegram quota summary when provider errors look like quota or rate-limit failures.
 - Periodically closes stale PRs when a bot action-required review/comment has had no new commit or human response for more than 24 hours.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
+- Allows selected public repositories with `PUBLIC_REPOSITORY_ALLOWLIST`, currently `seorilabs/.github` for organization-level governance PRs.
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default.
 
 ## Commands
@@ -191,9 +192,11 @@ AI_REVIEW_PROVIDER_FALLBACK_ORDER=gemini,cursor,copilot
 COPILOT_MODEL=auto
 CURSOR_MODEL=gpt-5.2
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot
+PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
 ```
 
 Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions all use the multi-provider router. This keeps `/agent` approval decisions working when Gemini CLI is temporarily quota-blocked.
+`ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
 Providers with weight `0` are disabled for both random selection and fallback attempts.
 If every enabled provider is already in cooldown before a provider command is started, the workflow is requeued until the earliest cooldown expires instead of consuming retry attempts and failing immediately.

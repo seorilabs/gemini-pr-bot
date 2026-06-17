@@ -39,6 +39,7 @@ export type Config = {
   botMentions: string[];
   trustedAssociations: Set<string>;
   allowPublicRepos: boolean;
+  publicRepositoryAllowlist: Set<string>;
   autoReviewOnOpen: boolean;
   autoReviewOnSynchronize: boolean;
   autoReviewIgnoredRepositories: Set<string>;
@@ -249,6 +250,7 @@ export function loadConfig(): Config {
       ),
     ),
     allowPublicRepos: optionalBool("ALLOW_PUBLIC_REPOS", false),
+    publicRepositoryAllowlist: optionalRepositorySet("PUBLIC_REPOSITORY_ALLOWLIST", []),
     autoReviewOnOpen: optionalBool("AUTO_REVIEW_ON_OPEN", true),
     autoReviewOnSynchronize: optionalBool("AUTO_REVIEW_ON_SYNCHRONIZE", false),
     autoReviewIgnoredRepositories: optionalRepositorySet("AUTO_REVIEW_IGNORED_REPOSITORIES", []),
