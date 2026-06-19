@@ -29,15 +29,23 @@ import {
 } from "./github.js";
 import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./telegram.js";
 import { parseBotCommand, truncate } from "./text.js";
+import {
+  BOT_GITHUB_LOGIN,
+  bodyIncludesBotActionMarker,
+  botActionMarker,
+  botAutoSquashMergeFailedMarker,
+  botStatusMarker,
+  isBotActionMarkerLine,
+} from "./identity.js";
 
-const NO_ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=no-action-required";
-const ACTION_REQUIRED_MARKER = "seorilabs-gemini-pr-bot:status=action-required";
-const MERGE_CONFLICT_MARKER = "seorilabs-gemini-pr-bot:status=merge-conflict";
-const AGENT_APPROVE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=approve -->";
-const AGENT_COMMENT_MARKER = "<!-- seorilabs-gemini-pr-bot:action=comment -->";
-const AGENT_CLOSE_MARKER = "<!-- seorilabs-gemini-pr-bot:action=close -->";
+const NO_ACTION_REQUIRED_MARKER = botStatusMarker("no-action-required");
+const ACTION_REQUIRED_MARKER = botStatusMarker("action-required");
+const MERGE_CONFLICT_MARKER = botStatusMarker("merge-conflict");
+const AGENT_APPROVE_MARKER = botActionMarker("approve");
+const AGENT_COMMENT_MARKER = botActionMarker("comment");
+const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
-const AUTO_SQUASH_MERGE_FAILED_MARKER = "seorilabs-gemini-pr-bot:auto-squash-merge=failed";
+const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -171,11 +179,11 @@ export class PrBot {
   metricSamples(): GaugeSample[] {
     return [
       {
-        name: "gemini_pr_bot_active_tasks",
+        name: "seori_pr_bot_active_tasks",
         value: this.activeTasks.size,
       },
       {
-        name: "gemini_pr_bot_active_check_runs",
+        name: "seori_pr_bot_active_check_runs",
         value: this.activeChecks.size,
       },
       ...this.gemini.metricSamples(),
@@ -540,7 +548,7 @@ export class PrBot {
       request,
       {
         source: STALE_REVIEW_SELF_TRIGGER_EVENT,
-        sender: "seorilabs-gemini-pr-bot",
+        sender: BOT_GITHUB_LOGIN,
       },
       { type: "pr_comment" },
       workflow,
@@ -1410,7 +1418,7 @@ export class PrBot {
       "- Do not mention that you are an AI model.",
       "- Keep code quotes short: quote identifiers or a minimal expression only when useful.",
       "- Do not include Mermaid diagrams or other diagrams in review comments.",
-      "- If the PR conversation contains the marker `seorilabs-gemini-pr-bot:status=no-action-required`, treat it as a prior human/agent approval signal. Prefer markers whose recorded HEAD SHA matches the current PR Head SHA. Still review if this request explicitly asks for `/review`, but avoid reopening already-settled issues unless the new diff contradicts the marker.",
+      `- If the PR conversation contains the marker \`${NO_ACTION_REQUIRED_MARKER}\`, treat it as a prior human/agent approval signal. Prefer markers whose recorded HEAD SHA matches the current PR Head SHA. Still review if this request explicitly asks for \`/review\`, but avoid reopening already-settled issues unless the new diff contradicts the marker.`,
       `- If GitHub mergeable is \`false\` or mergeable_state is \`dirty\`/\`conflicting\`, treat the merge conflict as a blocking finding. Do not write \`${NO_ACTIONABLE_FINDINGS_TEXT}\`; include concrete conflict-resolution steps.`,
       "",
       "Severity guide:",
@@ -1478,7 +1486,7 @@ export class PrBot {
       "- It is allowed to choose approve while checks are only pending; the system will hold approval until CI settles.",
       "- Do not flag Seorilabs ARC/self-hosted runner usage solely because it is self-hosted when the PR context shows a private repository and an eligible JS/TS lint, test, typecheck, or build job.",
       "- If evidence is insufficient, choose comment and state exactly what is missing.",
-      "- If prior comments contain `seorilabs-gemini-pr-bot:status=no-action-required`, prefer markers whose recorded HEAD SHA matches the current PR Head SHA.",
+      `- If prior comments contain \`${NO_ACTION_REQUIRED_MARKER}\`, prefer markers whose recorded HEAD SHA matches the current PR Head SHA.`,
       "",
       "Output contract:",
       "- Include exactly one hidden action marker as the first non-empty line:",
@@ -2037,7 +2045,7 @@ export class PrBot {
       !this.isClosedPullRequest(status) &&
       !this.hasMergeConflict(status) &&
       !this.hasBlockingStatusChecks(status) &&
-      text.includes(AGENT_APPROVE_MARKER) &&
+      bodyIncludesBotActionMarker(text, "approve") &&
       this.wantsApproval(text)
     );
   }
@@ -2055,7 +2063,7 @@ export class PrBot {
     return (
       !this.isClosedPullRequest(status) &&
       !this.hasMergeConflict(status) &&
-      text.includes(AGENT_CLOSE_MARKER)
+      bodyIncludesBotActionMarker(text, "close")
     );
   }
 
@@ -2066,11 +2074,7 @@ export class PrBot {
   private publicAgentText(text: string): string {
     return text
       .split("\n")
-      .filter((line) =>
-        line.trim() !== AGENT_APPROVE_MARKER &&
-        line.trim() !== AGENT_COMMENT_MARKER &&
-        line.trim() !== AGENT_CLOSE_MARKER
-      )
+      .filter((line) => !isBotActionMarkerLine(line))
       .join("\n")
       .trim();
   }

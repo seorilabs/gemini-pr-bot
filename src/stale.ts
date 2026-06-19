@@ -9,6 +9,7 @@ import {
   type PullRequestStatus,
   type RepoRef,
 } from "./github.js";
+import { BOT_GITHUB_LOGIN, bodyIncludesBotStatusMarker, botStatusMarker } from "./identity.js";
 
 type Logger = {
   info: (value: unknown, message?: string) => void;
@@ -70,9 +71,7 @@ type StaleReviewSelfTriggerHandler = (
   request: StaleReviewSelfTriggerRequest,
 ) => Promise<boolean | void>;
 
-const ACTION_REQUIRED_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=action-required";
-const MERGE_CONFLICT_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=merge-conflict";
-const STALE_CLOSED_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=stale-closed";
+const STALE_CLOSED_MARKER_TEXT = botStatusMarker("stale-closed");
 
 export class StaleReviewMonitor {
   private timer: NodeJS.Timeout | null = null;
@@ -390,7 +389,7 @@ function signalFromBody(body: string | undefined, at: string | undefined, user: 
     return [];
   }
 
-  if (body.includes(ACTION_REQUIRED_MARKER_TEXT)) {
+  if (bodyIncludesBotStatusMarker(body, "action-required")) {
     return [{
       kind: "action-required",
       at,
@@ -402,7 +401,7 @@ function signalFromBody(body: string | undefined, at: string | undefined, user: 
     }];
   }
 
-  if (body.includes(MERGE_CONFLICT_MARKER_TEXT)) {
+  if (bodyIncludesBotStatusMarker(body, "merge-conflict")) {
     return [{
       kind: "merge-conflict",
       at,
@@ -529,7 +528,7 @@ export function staleSelfTriggerPayload(request: StaleReviewSelfTriggerRequest):
       stale_ms: request.staleMs,
     },
     sender: {
-      login: "seorilabs-gemini-pr-bot",
+      login: BOT_GITHUB_LOGIN,
       type: "Bot",
     },
   };

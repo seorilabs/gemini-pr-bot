@@ -4,9 +4,9 @@ Create this as an organization-owned GitHub App under `seorilabs`.
 
 ## Basic
 
-- GitHub App name: `Seorilabs Seori`
-- Homepage URL: `https://github.com/seorilabs/gemini-pr-bot`
-- Webhook URL: `https://gemini-pr-bot.vzyx.xyz/github/webhook`
+- GitHub App name: `Seorilabs Seori PR Bot`
+- Homepage URL: `https://github.com/seorilabs/seori-pr-bot`
+- Webhook URL: `https://seori-pr-bot.vzyx.xyz/github/webhook`
 - Webhook secret: generate a random value and store the same value in K8s secret key `GITHUB_WEBHOOK_SECRET`
 - Where can this GitHub App be installed?: `Only on this account`
 

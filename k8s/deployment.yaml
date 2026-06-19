@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: gemini-pr-bot
+  name: seori-pr-bot
   namespace: apps
   labels:
-    app.kubernetes.io/name: gemini-pr-bot
+    app.kubernetes.io/name: seori-pr-bot
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: gemini-pr-bot
+      app.kubernetes.io/name: seori-pr-bot
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: gemini-pr-bot
+        app.kubernetes.io/name: seori-pr-bot
     spec:
       terminationGracePeriodSeconds: 260
       nodeSelector:
@@ -45,8 +45,8 @@ spec:
               mountPath: /gemini-cli-secret
               readOnly: true
       containers:
-        - name: gemini-pr-bot
-          image: registry.vzyx.xyz/seorilabs/gemini-pr-bot:latest
+        - name: seori-pr-bot
+          image: registry.vzyx.xyz/seorilabs/seori-pr-bot:latest
           imagePullPolicy: Always
           securityContext:
             runAsUser: 10001
@@ -92,12 +92,18 @@ spec:
               value: gemini-3-flash-preview
             - name: GEMINI_CLI_COMMAND
               value: /app/node_modules/.bin/gemini
+            - name: MINIMAX_MODEL
+              value: MiniMax-M3
+            - name: MINIMAX_API_BASE_URL
+              value: https://api.minimax.io/v1
+            - name: MINIMAX_TIMEOUT_MS
+              value: "180000"
             - name: AI_REVIEW_PROVIDERS
-              value: gemini,copilot,cursor
+              value: minimax,gemini,copilot,cursor
             - name: AI_REVIEW_PROVIDER_WEIGHTS
-              value: gemini:100,copilot:0,cursor:25
+              value: minimax:100,gemini:0,copilot:0,cursor:25
             - name: AI_REVIEW_PROVIDER_FALLBACK_ORDER
-              value: gemini,cursor,copilot
+              value: minimax,cursor,copilot,gemini
             - name: AI_REVIEW_PROVIDER_COOLDOWN_MS
               value: "300000"
             - name: COPILOT_CLI_COMMAND
@@ -123,7 +129,7 @@ spec:
             - name: HOME
               value: /home/app
             - name: BOT_MENTIONS
-              value: "@seorilabs-seori,@seorilabs-gemini-pr-bot,@seori-bot,@seori,@gemini-cli,@gemini"
+              value: "@seorilabs-seori,@seorilabs-seori-pr-bot,@seori-bot,@seori,@gemini-cli,@gemini"
             - name: TRUSTED_ASSOCIATIONS
               value: "OWNER,MEMBER,COLLABORATOR"
             - name: ALLOW_PUBLIC_REPOS
@@ -135,7 +141,7 @@ spec:
             - name: AUTO_REVIEW_ON_SYNCHRONIZE
               value: "true"
             - name: AUTO_REVIEW_IGNORED_REPOSITORIES
-              value: seorilabs/gemini-pr-bot
+              value: seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
             - name: AUTO_SQUASH_MERGE_ENABLED
               value: "true"
             - name: APPROVAL_TELEGRAM_NOTIFY_ENABLED
@@ -153,7 +159,7 @@ spec:
             - name: STALE_REVIEW_MAX_PRS_PER_SCAN
               value: "100"
             - name: STALE_REVIEW_IGNORED_REPOSITORIES
-              value: seorilabs/gemini-pr-bot
+              value: seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
             - name: NATS_SERVER_URL
               value: nats://nats.data.svc.cluster.local:4222
             - name: APPROVAL_TELEGRAM_BOT
@@ -175,29 +181,35 @@ spec:
             - name: GITHUB_APP_ID
               valueFrom:
                 secretKeyRef:
-                  name: gemini-pr-bot-secrets
+                  name: seori-pr-bot-secrets
                   key: GITHUB_APP_ID
             - name: GITHUB_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
-                  name: gemini-pr-bot-secrets
+                  name: seori-pr-bot-secrets
                   key: GITHUB_PRIVATE_KEY
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: gemini-pr-bot-secrets
+                  name: seori-pr-bot-secrets
                   key: GITHUB_WEBHOOK_SECRET
             - name: COPILOT_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: gemini-pr-bot-provider-secrets
+                  name: seori-pr-bot-provider-secrets
                   key: COPILOT_GITHUB_TOKEN
                   optional: true
             - name: CURSOR_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: gemini-pr-bot-provider-secrets
+                  name: seori-pr-bot-provider-secrets
                   key: CURSOR_API_KEY
+                  optional: true
+            - name: MINIMAX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: seori-pr-bot-provider-secrets
+                  key: MINIMAX_API_KEY
                   optional: true
           readinessProbe:
             httpGet:
@@ -230,7 +242,7 @@ spec:
           emptyDir: {}
         - name: gemini-cli-secret
           secret:
-            secretName: gemini-pr-bot-cli-oauth
+            secretName: seori-pr-bot-cli-oauth
             items:
               - key: oauth_creds.json
                 path: oauth_creds.json
@@ -242,13 +254,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: gemini-pr-bot
+  name: seori-pr-bot
   namespace: apps
   labels:
-    app.kubernetes.io/name: gemini-pr-bot
+    app.kubernetes.io/name: seori-pr-bot
 spec:
   selector:
-    app.kubernetes.io/name: gemini-pr-bot
+    app.kubernetes.io/name: seori-pr-bot
   ports:
     - name: http
       port: 80
@@ -257,15 +269,15 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: gemini-pr-bot
+  name: seori-pr-bot
   namespace: apps
   labels:
-    app.kubernetes.io/name: gemini-pr-bot
+    app.kubernetes.io/name: seori-pr-bot
     release: rpi-monitoring
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: gemini-pr-bot
+      app.kubernetes.io/name: seori-pr-bot
   endpoints:
     - port: http
       path: /metrics
@@ -275,7 +287,7 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: gemini-pr-bot
+  name: seori-pr-bot
   namespace: apps
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt
@@ -283,17 +295,17 @@ metadata:
 spec:
   ingressClassName: public
   tls:
-    - secretName: gemini-pr-bot-vzyx-xyz-tls
+    - secretName: seori-pr-bot-vzyx-xyz-tls
       hosts:
-        - gemini-pr-bot.vzyx.xyz
+        - seori-pr-bot.vzyx.xyz
   rules:
-    - host: gemini-pr-bot.vzyx.xyz
+    - host: seori-pr-bot.vzyx.xyz
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: gemini-pr-bot
+                name: seori-pr-bot
                 port:
                   name: http

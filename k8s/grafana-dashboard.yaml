@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: gemini-pr-bot-grafana-dashboard
+  name: seori-pr-bot-grafana-dashboard
   namespace: monitoring
   labels:
     app: kube-prometheus-stack-grafana
@@ -10,7 +10,7 @@ metadata:
     grafana_dashboard: "1"
     release: rpi-monitoring
 data:
-  gemini-pr-bot.json: |-
+  seori-pr-bot.json: |-
     {
       "annotations": {
         "list": [
@@ -101,7 +101,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "max(up{job=\"gemini-pr-bot\",namespace=\"apps\"})",
+              "expr": "max(up{job=\"seori-pr-bot\",namespace=\"apps\"})",
               "instant": true,
               "legendFormat": "target",
               "refId": "A"
@@ -165,7 +165,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum(gemini_pr_bot_workflow_ready_rows) or vector(0)",
+              "expr": "sum(seori_pr_bot_workflow_ready_rows) or vector(0)",
               "instant": true,
               "legendFormat": "ready",
               "refId": "A"
@@ -229,7 +229,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum(gemini_pr_bot_workflow_rows{status=\"running\"}) or vector(0)",
+              "expr": "sum(seori_pr_bot_workflow_rows{status=\"running\"}) or vector(0)",
               "instant": true,
               "legendFormat": "running",
               "refId": "A"
@@ -293,7 +293,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "max(gemini_pr_bot_active_check_runs)",
+              "expr": "max(seori_pr_bot_active_check_runs)",
               "instant": true,
               "legendFormat": "active",
               "refId": "A"
@@ -357,7 +357,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum(increase(gemini_pr_bot_workflows_failed_total[$__range])) or vector(0)",
+              "expr": "sum(increase(seori_pr_bot_workflows_failed_total[$__range])) or vector(0)",
               "instant": true,
               "legendFormat": "failures",
               "refId": "A"
@@ -421,7 +421,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum(increase(gemini_pr_bot_ai_provider_attempts_total{outcome!=\"success\"}[$__range])) or vector(0)",
+              "expr": "sum(increase(seori_pr_bot_ai_provider_attempts_total{outcome!=\"success\"}[$__range])) or vector(0)",
               "instant": true,
               "legendFormat": "provider issues",
               "refId": "A"
@@ -490,7 +490,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by (event) (rate(gemini_pr_bot_workflows_enqueued_total{result=\"inserted\"}[$__rate_interval]))",
+              "expr": "sum by (event) (rate(seori_pr_bot_workflows_enqueued_total{result=\"inserted\"}[$__rate_interval]))",
               "legendFormat": "enqueued {{event}}",
               "refId": "A"
             },
@@ -499,7 +499,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by (event) (rate(gemini_pr_bot_workflows_completed_total[$__rate_interval]))",
+              "expr": "sum by (event) (rate(seori_pr_bot_workflows_completed_total[$__rate_interval]))",
               "legendFormat": "completed {{event}}",
               "refId": "B"
             },
@@ -508,7 +508,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by (event,outcome) (rate(gemini_pr_bot_workflows_failed_total[$__rate_interval]))",
+              "expr": "sum by (event,outcome) (rate(seori_pr_bot_workflows_failed_total[$__rate_interval]))",
               "legendFormat": "failed {{event}} {{outcome}}",
               "refId": "C"
             }
@@ -576,7 +576,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "histogram_quantile(0.95, sum by (le,event,outcome) (rate(gemini_pr_bot_workflow_run_duration_seconds_bucket[$__rate_interval])))",
+              "expr": "histogram_quantile(0.95, sum by (le,event,outcome) (rate(seori_pr_bot_workflow_run_duration_seconds_bucket[$__rate_interval])))",
               "legendFormat": "p95 {{event}} {{outcome}}",
               "refId": "A"
             },
@@ -585,7 +585,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "histogram_quantile(0.50, sum by (le,event,outcome) (rate(gemini_pr_bot_workflow_run_duration_seconds_bucket[$__rate_interval])))",
+              "expr": "histogram_quantile(0.50, sum by (le,event,outcome) (rate(seori_pr_bot_workflow_run_duration_seconds_bucket[$__rate_interval])))",
               "legendFormat": "p50 {{event}} {{outcome}}",
               "refId": "B"
             }
@@ -645,7 +645,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by (status,event) (gemini_pr_bot_workflow_rows)",
+              "expr": "sum by (status,event) (seori_pr_bot_workflow_rows)",
               "format": "table",
               "instant": true,
               "legendFormat": "__auto",
@@ -715,7 +715,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by (provider,outcome) (rate(gemini_pr_bot_ai_provider_attempts_total[$__rate_interval]))",
+              "expr": "sum by (provider,outcome) (rate(seori_pr_bot_ai_provider_attempts_total[$__rate_interval]))",
               "legendFormat": "{{provider}} {{outcome}}",
               "refId": "A"
             }
@@ -783,7 +783,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "histogram_quantile(0.95, sum by (le,provider,outcome) (rate(gemini_pr_bot_ai_provider_duration_seconds_bucket[$__rate_interval])))",
+              "expr": "histogram_quantile(0.95, sum by (le,provider,outcome) (rate(seori_pr_bot_ai_provider_duration_seconds_bucket[$__rate_interval])))",
               "legendFormat": "p95 {{provider}} {{outcome}}",
               "refId": "A"
             }
@@ -851,7 +851,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by (kind,conclusion) (increase(gemini_pr_bot_check_runs_completed_total[$__range]))",
+              "expr": "sum by (kind,conclusion) (increase(seori_pr_bot_check_runs_completed_total[$__range]))",
               "legendFormat": "{{kind}} {{conclusion}}",
               "refId": "A"
             }
@@ -919,7 +919,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by (event,outcome) (rate(gemini_pr_bot_webhook_requests_total[$__rate_interval]))",
+              "expr": "sum by (event,outcome) (rate(seori_pr_bot_webhook_requests_total[$__rate_interval]))",
               "legendFormat": "{{event}} {{outcome}}",
               "refId": "A"
             }
@@ -987,7 +987,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"apps\",pod=~\"gemini-pr-bot-.*\",container=\"gemini-pr-bot\"}[$__rate_interval]))",
+              "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"apps\",pod=~\"seori-pr-bot-.*\",container=\"seori-pr-bot\"}[$__rate_interval]))",
               "legendFormat": "cpu cores",
               "refId": "A"
             },
@@ -996,7 +996,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum(container_memory_working_set_bytes{namespace=\"apps\",pod=~\"gemini-pr-bot-.*\",container=\"gemini-pr-bot\"}) / 1024 / 1024",
+              "expr": "sum(container_memory_working_set_bytes{namespace=\"apps\",pod=~\"seori-pr-bot-.*\",container=\"seori-pr-bot\"}) / 1024 / 1024",
               "legendFormat": "memory MiB",
               "refId": "B"
             }
@@ -1056,7 +1056,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "label_replace(gemini_pr_bot_ai_provider_configured, \"metric\", \"configured\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_weight, \"metric\", \"weight\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_credential_present, \"metric\", \"credential_present\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_routing_enabled, \"metric\", \"routing_enabled\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_available, \"metric\", \"available\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_cooldown_remaining_seconds, \"metric\", \"cooldown_remaining_seconds\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_cooldown_until_timestamp_seconds, \"metric\", \"cooldown_until_timestamp\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_last_success_timestamp_seconds, \"metric\", \"last_success_timestamp\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_last_failure_timestamp_seconds, \"metric\", \"last_failure_timestamp\", \"__name__\", \".*\") or label_replace(gemini_pr_bot_ai_provider_last_quota_reset_timestamp_seconds, \"metric\", \"last_quota_reset_timestamp\", \"__name__\", \".*\")",
+              "expr": "label_replace(seori_pr_bot_ai_provider_configured, \"metric\", \"configured\", \"__name__\", \".*\") or label_replace(seori_pr_bot_ai_provider_weight, \"metric\", \"weight\", \"__name__\", \".*\") or label_replace(seori_pr_bot_ai_provider_credential_present, \"metric\", \"credential_present\", \"__name__\", \".*\") or label_replace(seori_pr_bot_ai_provider_routing_enabled, \"metric\", \"routing_enabled\", \"__name__\", \".*\") or label_replace(seori_pr_bot_ai_provider_available, \"metric\", \"available\", \"__name__\", \".*\") or label_replace(seori_pr_bot_ai_provider_cooldown_remaining_seconds, \"metric\", \"cooldown_remaining_seconds\", \"__name__\", \".*\") or label_replace(seori_pr_bot_ai_provider_cooldown_until_timestamp_seconds, \"metric\", \"cooldown_until_timestamp\", \"__name__\", \".*\") or label_replace(seori_pr_bot_ai_provider_last_success_timestamp_seconds, \"metric\", \"last_success_timestamp\", \"__name__\", \".*\") or label_replace(seori_pr_bot_ai_provider_last_failure_timestamp_seconds, \"metric\", \"last_failure_timestamp\", \"__name__\", \".*\") or label_replace(seori_pr_bot_ai_provider_last_quota_reset_timestamp_seconds, \"metric\", \"last_quota_reset_timestamp\", \"__name__\", \".*\")",
               "format": "table",
               "instant": true,
               "legendFormat": "__auto",
@@ -1169,7 +1169,7 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "gemini_pr_bot_active_pr_age_seconds",
+              "expr": "seori_pr_bot_active_pr_age_seconds",
               "format": "table",
               "instant": true,
               "legendFormat": "__auto",
@@ -1217,7 +1217,7 @@ data:
       "tags": [
         "seorilabs",
         "pr-bot",
-        "gemini-pr-bot"
+        "seori-pr-bot"
       ],
       "templating": {
         "list": [

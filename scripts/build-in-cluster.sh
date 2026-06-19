@@ -2,7 +2,7 @@
 set -euo pipefail
 
 namespace="${NAMESPACE:-apps}"
-image="${IMAGE:-registry.vzyx.xyz/seorilabs/gemini-pr-bot}"
+image="${IMAGE:-registry.vzyx.xyz/seorilabs/seori-pr-bot}"
 tag="${TAG:-$(git rev-parse --short HEAD)}"
 timeout="${TIMEOUT:-20m}"
 node_name="${BUILD_NODE:-rpi5}"
@@ -12,7 +12,7 @@ build_memory_request="${BUILD_MEMORY_REQUEST:-1Gi}"
 build_memory_limit="${BUILD_MEMORY_LIMIT:-4Gi}"
 
 safe_tag=$(printf '%s' "${tag}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-24)
-job_name="build-gemini-pr-bot-${safe_tag}"
+job_name="build-seori-pr-bot-${safe_tag}"
 context_configmap="${job_name}-context"
 tmpdir=$(mktemp -d)
 context_tgz="${tmpdir}/context.tgz"

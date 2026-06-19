@@ -45,123 +45,123 @@ type HistogramSeries = {
 const CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
 
 const METADATA: Record<string, { type: "counter" | "gauge" | "histogram"; help: string }> = {
-  gemini_pr_bot_info: {
+  seori_pr_bot_info: {
     type: "gauge",
-    help: "Static gemini-pr-bot process information.",
+    help: "Static seori-pr-bot process information.",
   },
-  gemini_pr_bot_process_uptime_seconds: {
+  seori_pr_bot_process_uptime_seconds: {
     type: "gauge",
-    help: "Seconds since the gemini-pr-bot process started.",
+    help: "Seconds since the seori-pr-bot process started.",
   },
-  gemini_pr_bot_webhook_requests_total: {
+  seori_pr_bot_webhook_requests_total: {
     type: "counter",
     help: "GitHub webhook HTTP requests handled by outcome.",
   },
-  gemini_pr_bot_workflows_enqueued_total: {
+  seori_pr_bot_workflows_enqueued_total: {
     type: "counter",
     help: "Workflow enqueue attempts by event, source, and result.",
   },
-  gemini_pr_bot_workflows_leased_total: {
+  seori_pr_bot_workflows_leased_total: {
     type: "counter",
     help: "Workflow runs leased by the worker.",
   },
-  gemini_pr_bot_workflows_completed_total: {
+  seori_pr_bot_workflows_completed_total: {
     type: "counter",
     help: "Workflow runs completed successfully.",
   },
-  gemini_pr_bot_workflows_failed_total: {
+  seori_pr_bot_workflows_failed_total: {
     type: "counter",
     help: "Workflow runs that failed, split by retry/final outcome.",
   },
-  gemini_pr_bot_workflow_run_duration_seconds: {
+  seori_pr_bot_workflow_run_duration_seconds: {
     type: "histogram",
     help: "Workflow run processing duration in seconds.",
   },
-  gemini_pr_bot_workflow_rows: {
+  seori_pr_bot_workflow_rows: {
     type: "gauge",
     help: "Workflow rows currently stored in MySQL by status and event.",
   },
-  gemini_pr_bot_workflow_ready_rows: {
+  seori_pr_bot_workflow_ready_rows: {
     type: "gauge",
     help: "Queued workflow rows ready to be leased now.",
   },
-  gemini_pr_bot_workflow_oldest_row_age_seconds: {
+  seori_pr_bot_workflow_oldest_row_age_seconds: {
     type: "gauge",
     help: "Age in seconds of the oldest workflow row by status and event.",
   },
-  gemini_pr_bot_active_pr_info: {
+  seori_pr_bot_active_pr_info: {
     type: "gauge",
     help: "Active queued or running PR workflow information. Labels include repo, PR number, title, URL, status, and event.",
   },
-  gemini_pr_bot_active_pr_age_seconds: {
+  seori_pr_bot_active_pr_age_seconds: {
     type: "gauge",
     help: "Age in seconds for active queued or running PR workflows. Labels identify the PR workflow.",
   },
-  gemini_pr_bot_active_pr_next_run_delay_seconds: {
+  seori_pr_bot_active_pr_next_run_delay_seconds: {
     type: "gauge",
     help: "Seconds until the next run time for active queued PR workflows. Running workflows report zero.",
   },
-  gemini_pr_bot_ai_provider_attempts_total: {
+  seori_pr_bot_ai_provider_attempts_total: {
     type: "counter",
     help: "AI provider attempts by task kind, selected provider, provider, and outcome.",
   },
-  gemini_pr_bot_ai_provider_duration_seconds: {
+  seori_pr_bot_ai_provider_duration_seconds: {
     type: "histogram",
     help: "AI provider call duration in seconds.",
   },
-  gemini_pr_bot_ai_provider_configured: {
+  seori_pr_bot_ai_provider_configured: {
     type: "gauge",
     help: "Whether an AI provider is listed in AI_REVIEW_PROVIDERS.",
   },
-  gemini_pr_bot_ai_provider_weight: {
+  seori_pr_bot_ai_provider_weight: {
     type: "gauge",
     help: "Configured AI provider routing weight.",
   },
-  gemini_pr_bot_ai_provider_credential_present: {
+  seori_pr_bot_ai_provider_credential_present: {
     type: "gauge",
     help: "Whether required credentials appear present for the AI provider.",
   },
-  gemini_pr_bot_ai_provider_routing_enabled: {
+  seori_pr_bot_ai_provider_routing_enabled: {
     type: "gauge",
     help: "Whether an AI provider can be selected by routing based on config weight.",
   },
-  gemini_pr_bot_ai_provider_available: {
+  seori_pr_bot_ai_provider_available: {
     type: "gauge",
     help: "Whether an AI provider is configured, weighted, credentialed, and not in cooldown.",
   },
-  gemini_pr_bot_ai_provider_cooldown_remaining_seconds: {
+  seori_pr_bot_ai_provider_cooldown_remaining_seconds: {
     type: "gauge",
     help: "Seconds remaining until the AI provider cooldown expires in this process.",
   },
-  gemini_pr_bot_ai_provider_cooldown_until_timestamp_seconds: {
+  seori_pr_bot_ai_provider_cooldown_until_timestamp_seconds: {
     type: "gauge",
     help: "Unix timestamp when the AI provider cooldown expires in this process.",
   },
-  gemini_pr_bot_ai_provider_last_success_timestamp_seconds: {
+  seori_pr_bot_ai_provider_last_success_timestamp_seconds: {
     type: "gauge",
     help: "Unix timestamp of the last successful AI provider response in this process.",
   },
-  gemini_pr_bot_ai_provider_last_failure_timestamp_seconds: {
+  seori_pr_bot_ai_provider_last_failure_timestamp_seconds: {
     type: "gauge",
     help: "Unix timestamp of the last AI provider failure in this process.",
   },
-  gemini_pr_bot_ai_provider_last_quota_reset_timestamp_seconds: {
+  seori_pr_bot_ai_provider_last_quota_reset_timestamp_seconds: {
     type: "gauge",
     help: "Unix timestamp of the last quota reset time reported by an AI provider in this process.",
   },
-  gemini_pr_bot_check_runs_started_total: {
+  seori_pr_bot_check_runs_started_total: {
     type: "counter",
     help: "GitHub check runs started by kind.",
   },
-  gemini_pr_bot_check_runs_completed_total: {
+  seori_pr_bot_check_runs_completed_total: {
     type: "counter",
     help: "GitHub check runs completed by kind and conclusion.",
   },
-  gemini_pr_bot_active_tasks: {
+  seori_pr_bot_active_tasks: {
     type: "gauge",
     help: "Background webhook tasks currently running in this process.",
   },
-  gemini_pr_bot_active_check_runs: {
+  seori_pr_bot_active_check_runs: {
     type: "gauge",
     help: "Tracked GitHub check runs currently active in this process.",
   },
@@ -176,11 +176,11 @@ export class MetricsRegistry {
   private readonly startedAtMs = Date.now();
 
   recordWebhookRequest(event: string, outcome: string): void {
-    this.increment("gemini_pr_bot_webhook_requests_total", { event: normalizeLabel(event), outcome });
+    this.increment("seori_pr_bot_webhook_requests_total", { event: normalizeLabel(event), outcome });
   }
 
   recordWorkflowEnqueued(event: string, source: "webhook" | "synthetic", inserted: boolean): void {
-    this.increment("gemini_pr_bot_workflows_enqueued_total", {
+    this.increment("seori_pr_bot_workflows_enqueued_total", {
       event,
       source,
       result: inserted ? "inserted" : "duplicate",
@@ -188,18 +188,18 @@ export class MetricsRegistry {
   }
 
   recordWorkflowLeased(event: string): void {
-    this.increment("gemini_pr_bot_workflows_leased_total", { event });
+    this.increment("seori_pr_bot_workflows_leased_total", { event });
   }
 
   recordWorkflowCompleted(event: string, durationSeconds: number): void {
-    this.increment("gemini_pr_bot_workflows_completed_total", { event });
-    this.observe("gemini_pr_bot_workflow_run_duration_seconds", { event, outcome: "completed" }, durationSeconds, WORKFLOW_DURATION_BUCKETS);
+    this.increment("seori_pr_bot_workflows_completed_total", { event });
+    this.observe("seori_pr_bot_workflow_run_duration_seconds", { event, outcome: "completed" }, durationSeconds, WORKFLOW_DURATION_BUCKETS);
   }
 
   recordWorkflowFailed(event: string, final: boolean, durationSeconds: number): void {
     const outcome = final ? "failed_final" : "failed_retry";
-    this.increment("gemini_pr_bot_workflows_failed_total", { event, outcome });
-    this.observe("gemini_pr_bot_workflow_run_duration_seconds", { event, outcome }, durationSeconds, WORKFLOW_DURATION_BUCKETS);
+    this.increment("seori_pr_bot_workflows_failed_total", { event, outcome });
+    this.observe("seori_pr_bot_workflow_run_duration_seconds", { event, outcome }, durationSeconds, WORKFLOW_DURATION_BUCKETS);
   }
 
   recordAiProviderAttempt(
@@ -215,18 +215,18 @@ export class MetricsRegistry {
       provider,
       outcome,
     };
-    this.increment("gemini_pr_bot_ai_provider_attempts_total", labels);
+    this.increment("seori_pr_bot_ai_provider_attempts_total", labels);
     if (typeof durationSeconds === "number") {
-      this.observe("gemini_pr_bot_ai_provider_duration_seconds", labels, durationSeconds, AI_PROVIDER_DURATION_BUCKETS);
+      this.observe("seori_pr_bot_ai_provider_duration_seconds", labels, durationSeconds, AI_PROVIDER_DURATION_BUCKETS);
     }
   }
 
   recordCheckRunStarted(kind: string): void {
-    this.increment("gemini_pr_bot_check_runs_started_total", { kind });
+    this.increment("seori_pr_bot_check_runs_started_total", { kind });
   }
 
   recordCheckRunCompleted(kind: string, conclusion: string): void {
-    this.increment("gemini_pr_bot_check_runs_completed_total", { kind, conclusion });
+    this.increment("seori_pr_bot_check_runs_completed_total", { kind, conclusion });
   }
 
   render(options: {
@@ -238,13 +238,13 @@ export class MetricsRegistry {
     const samples: string[] = [];
     const used = new Set<string>();
 
-    samples.push(this.metadata("gemini_pr_bot_info"));
-    samples.push(metricLine("gemini_pr_bot_info", normalizeLabels(options.infoLabels || {}), 1));
-    used.add("gemini_pr_bot_info");
+    samples.push(this.metadata("seori_pr_bot_info"));
+    samples.push(metricLine("seori_pr_bot_info", normalizeLabels(options.infoLabels || {}), 1));
+    used.add("seori_pr_bot_info");
 
-    samples.push(this.metadata("gemini_pr_bot_process_uptime_seconds"));
-    samples.push(metricLine("gemini_pr_bot_process_uptime_seconds", {}, (Date.now() - this.startedAtMs) / 1000));
-    used.add("gemini_pr_bot_process_uptime_seconds");
+    samples.push(this.metadata("seori_pr_bot_process_uptime_seconds"));
+    samples.push(metricLine("seori_pr_bot_process_uptime_seconds", {}, (Date.now() - this.startedAtMs) / 1000));
+    used.add("seori_pr_bot_process_uptime_seconds");
 
     for (const [name, group] of this.groupCounters()) {
       samples.push(this.metadata(name));
@@ -353,12 +353,12 @@ export class MetricsRegistry {
     for (const row of rows) {
       samples.push(
         {
-          name: "gemini_pr_bot_workflow_rows",
+          name: "seori_pr_bot_workflow_rows",
           labels: { status: row.status, event: row.eventName },
           value: row.count,
         },
         {
-          name: "gemini_pr_bot_workflow_oldest_row_age_seconds",
+          name: "seori_pr_bot_workflow_oldest_row_age_seconds",
           labels: { status: row.status, event: row.eventName },
           value: row.oldestAgeSeconds,
         },
@@ -366,7 +366,7 @@ export class MetricsRegistry {
 
       if (row.status === "queued") {
         samples.push({
-          name: "gemini_pr_bot_workflow_ready_rows",
+          name: "seori_pr_bot_workflow_ready_rows",
           labels: { event: row.eventName },
           value: row.readyCount,
         });
@@ -392,17 +392,17 @@ export class MetricsRegistry {
       };
       samples.push(
         {
-          name: "gemini_pr_bot_active_pr_info",
+          name: "seori_pr_bot_active_pr_info",
           labels,
           value: 1,
         },
         {
-          name: "gemini_pr_bot_active_pr_age_seconds",
+          name: "seori_pr_bot_active_pr_age_seconds",
           labels,
           value: row.ageSeconds,
         },
         {
-          name: "gemini_pr_bot_active_pr_next_run_delay_seconds",
+          name: "seori_pr_bot_active_pr_next_run_delay_seconds",
           labels,
           value: row.nextRunDelaySeconds,
         },

@@ -6,7 +6,7 @@ set -euo pipefail
 : "${GITHUB_WEBHOOK_SECRET:?Set GITHUB_WEBHOOK_SECRET}"
 
 secret_yaml=$(
-  kubectl -n apps create secret generic gemini-pr-bot-secrets \
+  kubectl -n apps create secret generic seori-pr-bot-secrets \
     --from-literal=GITHUB_APP_ID="${GITHUB_APP_ID}" \
     --from-file=GITHUB_PRIVATE_KEY="${GITHUB_PRIVATE_KEY_FILE}" \
     --from-literal=GITHUB_WEBHOOK_SECRET="${GITHUB_WEBHOOK_SECRET}" \

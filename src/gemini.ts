@@ -2,6 +2,7 @@ import { GoogleGenAI } from "@google/genai";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { AI_REVIEW_PROVIDER_NAMES, type AiReviewProviderName, type Config } from "./config.js";
+import { botActionMarker } from "./identity.js";
 import { metrics, type GaugeSample } from "./metrics.js";
 import { truncate } from "./text.js";
 
@@ -125,9 +126,9 @@ export class GeminiClient {
       "Do not claim to have run tests unless the context proves it.",
       "Do not include Mermaid diagrams or other diagrams in comments.",
       "Keep the answer concise and practical.",
-      "If and only if approval is appropriate, include this exact hidden marker on its own line: <!-- seorilabs-gemini-pr-bot:action=approve -->",
-      "If and only if closing is appropriate, include this exact hidden marker on its own line: <!-- seorilabs-gemini-pr-bot:action=close -->",
-      "Otherwise include this exact hidden marker on its own line: <!-- seorilabs-gemini-pr-bot:action=comment -->",
+      `If and only if approval is appropriate, include this exact hidden marker on its own line: ${botActionMarker("approve")}`,
+      `If and only if closing is appropriate, include this exact hidden marker on its own line: ${botActionMarker("close")}`,
+      `Otherwise include this exact hidden marker on its own line: ${botActionMarker("comment")}`,
     ].join(" ");
   }
 
@@ -226,52 +227,52 @@ export class GeminiClient {
 
       samples.push(
         {
-          name: "gemini_pr_bot_ai_provider_configured",
+          name: "seori_pr_bot_ai_provider_configured",
           labels,
           value: isConfigured ? 1 : 0,
         },
         {
-          name: "gemini_pr_bot_ai_provider_weight",
+          name: "seori_pr_bot_ai_provider_weight",
           labels,
           value: weight,
         },
         {
-          name: "gemini_pr_bot_ai_provider_credential_present",
+          name: "seori_pr_bot_ai_provider_credential_present",
           labels,
           value: hasCredential ? 1 : 0,
         },
         {
-          name: "gemini_pr_bot_ai_provider_routing_enabled",
+          name: "seori_pr_bot_ai_provider_routing_enabled",
           labels,
           value: routingEnabled ? 1 : 0,
         },
         {
-          name: "gemini_pr_bot_ai_provider_available",
+          name: "seori_pr_bot_ai_provider_available",
           labels,
           value: available ? 1 : 0,
         },
         {
-          name: "gemini_pr_bot_ai_provider_cooldown_remaining_seconds",
+          name: "seori_pr_bot_ai_provider_cooldown_remaining_seconds",
           labels,
           value: cooldownRemainingSeconds,
         },
         {
-          name: "gemini_pr_bot_ai_provider_cooldown_until_timestamp_seconds",
+          name: "seori_pr_bot_ai_provider_cooldown_until_timestamp_seconds",
           labels,
           value: cooldownUntil > now ? cooldownUntil / 1000 : 0,
         },
         {
-          name: "gemini_pr_bot_ai_provider_last_success_timestamp_seconds",
+          name: "seori_pr_bot_ai_provider_last_success_timestamp_seconds",
           labels,
           value: (this.providerLastSuccessAt.get(provider) || 0) / 1000,
         },
         {
-          name: "gemini_pr_bot_ai_provider_last_failure_timestamp_seconds",
+          name: "seori_pr_bot_ai_provider_last_failure_timestamp_seconds",
           labels,
           value: (this.providerLastFailureAt.get(provider) || 0) / 1000,
         },
         {
-          name: "gemini_pr_bot_ai_provider_last_quota_reset_timestamp_seconds",
+          name: "seori_pr_bot_ai_provider_last_quota_reset_timestamp_seconds",
           labels,
           value: (this.providerLastQuotaResetAt.get(provider) || 0) / 1000,
         },
@@ -327,6 +328,10 @@ export class GeminiClient {
   }
 
   private hasProviderCredential(provider: AiReviewProviderName): boolean {
+    if (provider === "minimax") {
+      return Boolean(this.config.minimaxApiKey);
+    }
+
     if (provider === "gemini") {
       if (this.config.geminiProvider === "api") {
         return Boolean(this.config.geminiApiKey);
@@ -365,6 +370,10 @@ export class GeminiClient {
   }
 
   private runProvider(provider: AiReviewProviderName, kind: AiTaskKind, prompt: string): Promise<string> {
+    if (provider === "minimax") {
+      return this.runMiniMaxApi(kind, prompt);
+    }
+
     if (provider === "gemini") {
       return this.runGemini(kind, prompt);
     }
@@ -405,6 +414,72 @@ export class GeminiClient {
     }
 
     return "응답을 생성하지 못했습니다.";
+  }
+
+  private async runMiniMaxApi(kind: AiTaskKind, prompt: string): Promise<string> {
+    if (!this.config.minimaxApiKey) {
+      throw new Error("MiniMax API key is not configured");
+    }
+
+    const baseUrl = this.config.minimaxApiBaseUrl.replace(/\/+$/, "");
+    const url = `${baseUrl}/chat/completions`;
+    const { temperature, maxCompletionTokens } = this.minimaxGenerationConfig(kind);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.config.minimaxTimeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.config.minimaxApiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.config.minimaxModel,
+          messages: [{ role: "user", content: truncate(prompt, this.config.maxContextChars) }],
+          temperature,
+          max_completion_tokens: maxCompletionTokens,
+          thinking: { type: "disabled" },
+          stream: false,
+        }),
+        signal: controller.signal,
+      });
+
+      const rawText = await response.text();
+      if (!response.ok) {
+        throw new Error(`MiniMax API request failed (${response.status}): ${truncate(rawText, 600)}`);
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch (error) {
+        throw new Error(`MiniMax API returned non-JSON response: ${truncate(rawText, 600)}`);
+      }
+
+      const baseResp = parsed?.base_resp;
+      if (baseResp && typeof baseResp === "object" && Number(baseResp.status_code) !== 0) {
+        const message = String(baseResp.status_msg || `MiniMax API error code ${baseResp.status_code}`);
+        throw new Error(`MiniMax API rejected request: ${message}`);
+      }
+
+      const content = parsed?.choices?.[0]?.message?.content;
+      const text = typeof content === "string" ? content.trim() : "";
+      if (!text) {
+        return this.emptyResponseText(kind);
+      }
+      return text;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private minimaxGenerationConfig(kind: AiTaskKind): { temperature: number; maxCompletionTokens: number } {
+    if (kind === "answer") {
+      return { temperature: 0.3, maxCompletionTokens: 3072 };
+    }
+
+    return { temperature: 0.2, maxCompletionTokens: 4096 };
   }
 
   private runGeminiCli(prompt: string): Promise<string> {
@@ -592,6 +667,9 @@ function providerAlertErrorMessage(message: string): string {
 
   const cleaned = normalized
     .replace(/^Gemini CLI exited with code \d+:\s*/i, "")
+    .replace(/^MiniMax API request failed \(\d+\):\s*/i, "")
+    .replace(/^MiniMax API rejected request:\s*/i, "")
+    .replace(/^MiniMax API returned non-JSON response:\s*/i, "")
     .replace(/Warning: True color \(24-bit\) support not detected\. Using a terminal with true color enabled will result in a better visual experience\.\s*/gi, "")
     .replace(/Ripgrep is not available\. Falling back to GrepTool\.\s*/gi, "")
     .replace(/Full report available at:\s+\S+\s*/gi, "")

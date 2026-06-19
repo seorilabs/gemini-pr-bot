@@ -1,6 +1,7 @@
 import type { Config } from "./config.js";
 import { buildDeepRepoContext } from "./repo-context.js";
 import { githubCommentBody, truncate } from "./text.js";
+import { bodyIncludesBotStatusMarker } from "./identity.js";
 
 type Octokit = any;
 
@@ -8,8 +9,6 @@ export const REVIEW_AGENT_NAME = "Seori";
 export const REVIEW_CHECK_NAME = "Seori Review";
 
 const LEGACY_REVIEW_CHECK_NAME = "Gemini PR Bot";
-const NO_ACTION_REQUIRED_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=no-action-required";
-const MERGE_CONFLICT_MARKER_TEXT = "seorilabs-gemini-pr-bot:status=merge-conflict";
 const FAILING_CHECK_CONCLUSIONS = new Set(["action_required", "cancelled", "failure", "timed_out"]);
 const MAX_CHANGED_FILE_CONTENT_CHARS = 20_000;
 const MAX_CHANGED_FILE_CONTENT_CONTEXT_CHARS = 50_000;
@@ -731,13 +730,13 @@ function buildConversationState(headSha: string, issueComments: any[], reviewCom
     ...reviews.map((review: any) => review.body || ""),
   ];
   const currentNoActionMarkers = bodies.filter((body) =>
-    body.includes(NO_ACTION_REQUIRED_MARKER_TEXT) && body.includes(`head=${headSha}`),
+    bodyIncludesBotStatusMarker(body, "no-action-required") && body.includes(`head=${headSha}`),
   ).length;
   const staleNoActionMarkers = bodies.filter((body) =>
-    body.includes(NO_ACTION_REQUIRED_MARKER_TEXT) && !body.includes(`head=${headSha}`),
+    bodyIncludesBotStatusMarker(body, "no-action-required") && !body.includes(`head=${headSha}`),
   ).length;
   const currentMergeConflictMarkers = bodies.filter((body) =>
-    body.includes(MERGE_CONFLICT_MARKER_TEXT) && body.includes(`head=${headSha}`),
+    bodyIncludesBotStatusMarker(body, "merge-conflict") && body.includes(`head=${headSha}`),
   ).length;
 
   return [

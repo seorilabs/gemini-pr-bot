@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image="${IMAGE:-registry.vzyx.xyz/seorilabs/gemini-pr-bot}"
+image="${IMAGE:-registry.vzyx.xyz/seorilabs/seori-pr-bot}"
 tag="${TAG:-$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d-%H%M)}"
 platform="${PLATFORM:-linux/arm64}"
 registry_secret_namespace="${REGISTRY_SECRET_NAMESPACE:-apps}"

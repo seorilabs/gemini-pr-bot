@@ -1,13 +1,13 @@
-# Seori Review Bot
+# Seori PR Bot
 
 Seorilabs organization-wide GitHub App webhook daemon for multi-provider PR review and PR conversation replies.
 
 ```mermaid
 flowchart LR
   GitHub["GitHub App Webhook"] --> Ingress["K8s Ingress"]
-  Ingress --> Bot["gemini-pr-bot"]
+  Ingress --> Bot["seori-pr-bot"]
   Bot --> GitHubAPI["GitHub App Installation API"]
-  Bot --> Providers["Gemini / Cursor / Copilot"]
+  Bot --> Providers["MiniMax / Gemini / Cursor / Copilot"]
   Bot --> Comment["PR comments / inline replies / check runs"]
   Bot --> NATS["NATS telegram subject"]
   NATS --> Telegram["Telegram"]
@@ -27,7 +27,7 @@ flowchart LR
 - Creates a `Seori Review` check run for review and agent jobs.
 - Marks `Seori Review` as `success` only when the bot approves the current HEAD; actionable review findings complete as `action_required`.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
-- Can route AI jobs across Gemini CLI, GitHub Copilot CLI, and Cursor Agent with weighted fallback.
+- Can route AI jobs across MiniMax API (default), Gemini CLI, GitHub Copilot CLI, and Cursor Agent with weighted fallback.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
@@ -48,7 +48,7 @@ flowchart LR
 @gemini-cli /review
 @seorilabs-seori /review
 @seori-bot /review
-@seorilabs-gemini-pr-bot /review
+@seorilabs-seori-pr-bot /review
 /gemini review
 @gemini-cli /approve [reason]
 /gemini approve [reason]
@@ -60,13 +60,13 @@ flowchart LR
 @gemini-cli <question>
 @seorilabs-seori <question or handoff>
 @seori-bot <question or handoff>
-@seorilabs-gemini-pr-bot <question or handoff>
+@seorilabs-seori-pr-bot <question or handoff>
 ```
 
 `/approve` submits a real GitHub approval review for the current PR HEAD after bot-side merge conflict and status-check validation passes. The approval review body includes a hidden coordination marker:
 
 ```html
-<!-- seorilabs-gemini-pr-bot:status=no-action-required head=<head-sha> -->
+<!-- seorilabs-seori-pr-bot:status=no-action-required head=<head-sha> -->
 ```
 
 Other review agents should treat the latest non-stale approval marker as "no further agent action required". A new commit makes the marker stale when the repository's branch protection dismisses stale approvals.
@@ -125,7 +125,7 @@ Use `off` to disable the clone path or `always` for every PR context build. A ma
 
 ## Workflow Persistence
 
-In production, set `WORKFLOW_STORE=mysql`. The daemon creates and uses the `base.gemini_pr_bot_workflows` table.
+In production, set `WORKFLOW_STORE=mysql`. The daemon creates and uses the existing `base.gemini_pr_bot_workflows` table.
 
 ```mermaid
 flowchart TD
@@ -149,19 +149,19 @@ When a review finds no actionable code issue but external CI is still pending, `
 
 ## Metrics
 
-The daemon exposes Prometheus metrics at `/metrics`. Production Kubernetes includes a `ServiceMonitor` for the `apps/gemini-pr-bot` service, selected by the `rpi-monitoring` Prometheus stack.
+The daemon exposes Prometheus metrics at `/metrics`. Production Kubernetes includes a `ServiceMonitor` for the `apps/seori-pr-bot` service, selected by the `rpi-monitoring` Prometheus stack.
 
 By default, `/metrics` rejects requests that arrive through a forwarded ingress header. Set `METRICS_ALLOW_FORWARDED=true` only if metrics must be reachable through the public ingress.
 
 Key metric groups:
 
-- `gemini_pr_bot_workflow_rows`: MySQL workflow rows by status and event.
-- `gemini_pr_bot_workflow_ready_rows`: queued workflows ready to lease now.
-- `gemini_pr_bot_workflow_run_duration_seconds`: workflow processing latency.
-- `gemini_pr_bot_ai_provider_*`: configured provider, routing weight, credential presence, availability, cooldown, and recent success/failure/quota timestamps.
-- `gemini_pr_bot_ai_provider_attempts_total`: provider success, failure, and cooldown counts.
-- `gemini_pr_bot_check_runs_completed_total`: `Seori Review` outcomes by kind and conclusion.
-- `gemini_pr_bot_active_tasks` and `gemini_pr_bot_active_check_runs`: in-process work gauges.
+- `seori_pr_bot_workflow_rows`: MySQL workflow rows by status and event.
+- `seori_pr_bot_workflow_ready_rows`: queued workflows ready to lease now.
+- `seori_pr_bot_workflow_run_duration_seconds`: workflow processing latency.
+- `seori_pr_bot_ai_provider_*`: configured provider, routing weight, credential presence, availability, cooldown, and recent success/failure/quota timestamps.
+- `seori_pr_bot_ai_provider_attempts_total`: provider success, failure, and cooldown counts.
+- `seori_pr_bot_check_runs_completed_total`: `Seori Review` outcomes by kind and conclusion.
+- `seori_pr_bot_active_tasks` and `seori_pr_bot_active_check_runs`: in-process work gauges.
 
 ## Required Secrets
 
@@ -171,21 +171,20 @@ Then create the K8s secrets.
 
 ```bash
 export GITHUB_APP_ID="..."
-export GITHUB_PRIVATE_KEY_FILE="/path/to/seorilabs-gemini-pr-bot.private-key.pem"
+export GITHUB_PRIVATE_KEY_FILE="/path/to/seorilabs-seori-pr-bot.private-key.pem"
 export GITHUB_WEBHOOK_SECRET="..."
+export MINIMAX_API_KEY="..."
 
 ./scripts/create-k8s-secret.sh
 ./scripts/create-gemini-cli-oauth-secret.sh
+./scripts/create-provider-secrets.sh
 ./scripts/copy-mysql-app-secret.sh
 ```
 
 Optional multi-provider review routing:
 
 ```bash
-kubectl -n apps create secret generic gemini-pr-bot-provider-secrets \
-  --from-literal=COPILOT_GITHUB_TOKEN="$COPILOT_GITHUB_TOKEN" \
-  --from-literal=CURSOR_API_KEY="$CURSOR_API_KEY" \
-  --dry-run=client -o yaml | kubectl apply -f -
+./scripts/create-provider-secrets.sh   # writes seori-pr-bot-provider-secrets
 ```
 
 Use a dedicated automation account for these credentials. Personal tokens are acceptable for a short smoke test, but not for steady production use.
@@ -193,15 +192,19 @@ Use a dedicated automation account for these credentials. Personal tokens are ac
 The production default is:
 
 ```text
-AI_REVIEW_PROVIDERS=gemini,copilot,cursor
-AI_REVIEW_PROVIDER_WEIGHTS=gemini:100,copilot:0,cursor:25
-AI_REVIEW_PROVIDER_FALLBACK_ORDER=gemini,cursor,copilot
+AI_REVIEW_PROVIDERS=minimax,gemini,copilot,cursor
+AI_REVIEW_PROVIDER_WEIGHTS=minimax:100,gemini:0,copilot:0,cursor:25
+AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax,cursor,copilot,gemini
+MINIMAX_MODEL=MiniMax-M3
+MINIMAX_API_BASE_URL=https://api.minimax.io/v1
 COPILOT_MODEL=auto
 CURSOR_MODEL=gpt-5.2
-AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot
+AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
 PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
+
+The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMAX_API_BASE_URL}/chat/completions` and disables M3 thinking so the response contains only the review text. Set `AI_REVIEW_PROVIDERS=minimax` alone to run as a single-provider deployment, or keep the legacy Gemini/Copilot/Cursor providers in the list at weight `0` as a fallback when needed.
 
 Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions all use the multi-provider router. This keeps `/agent` approval decisions working when Gemini CLI is temporarily quota-blocked.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
@@ -231,13 +234,13 @@ STALE_REVIEW_CLOSE_ENABLED=true
 STALE_REVIEW_THRESHOLD_MS=86400000
 STALE_REVIEW_SCAN_INTERVAL_MS=1800000
 STALE_REVIEW_MAX_PRS_PER_SCAN=100
-STALE_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot
+STALE_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
 ```
 
 The stale scanner only considers hidden bot markers for the current PR HEAD. If a non-bot response appears after an action-required marker but does not mention the bot, the scanner queues one synthetic agent follow-up instead of closing immediately. If that follow-up still leaves action required, the bot writes:
 
 ```html
-<!-- seorilabs-gemini-pr-bot:status=action-required kind=stale-self-trigger blocked_kind=<review|status-check|merge-conflict> head=<head-sha> response_at=<timestamp> -->
+<!-- seorilabs-seori-pr-bot:status=action-required kind=stale-self-trigger blocked_kind=<review|status-check|merge-conflict> head=<head-sha> response_at=<timestamp> -->
 ```
 
 After a `stale-self-trigger` marker is present for the current HEAD, later unmentioned comments do not reset the stale close window. A new commit or an explicit bot mention starts a fresh review path.
@@ -249,8 +252,8 @@ npm ci
 npm run check
 ./scripts/build-and-push.sh
 kubectl apply -k k8s
-kubectl -n apps rollout restart deployment/gemini-pr-bot
-kubectl -n apps rollout status deployment/gemini-pr-bot
+kubectl -n apps rollout restart deployment/seori-pr-bot
+kubectl -n apps rollout status deployment/seori-pr-bot
 ```
 
 If the local machine does not have Docker, build and push from the cluster with Kaniko:
@@ -258,14 +261,14 @@ If the local machine does not have Docker, build and push from the cluster with 
 ```bash
 ./scripts/build-in-cluster.sh
 kubectl apply -k k8s
-kubectl -n apps rollout restart deployment/gemini-pr-bot
-kubectl -n apps rollout status deployment/gemini-pr-bot
+kubectl -n apps rollout restart deployment/seori-pr-bot
+kubectl -n apps rollout status deployment/seori-pr-bot
 ```
 
 Webhook endpoint:
 
 ```text
-https://gemini-pr-bot.vzyx.xyz/github/webhook
+https://seori-pr-bot.vzyx.xyz/github/webhook
 ```
 
 ## Local Development

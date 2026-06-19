@@ -3,7 +3,7 @@ set -euo pipefail
 
 gemini_home="${GEMINI_HOME_DIR:-${HOME}/.gemini}"
 namespace="${NAMESPACE:-apps}"
-secret_name="${SECRET_NAME:-gemini-pr-bot-cli-oauth}"
+secret_name="${SECRET_NAME:-seori-pr-bot-cli-oauth}"
 tmpdir=$(mktemp -d)
 
 retry() {

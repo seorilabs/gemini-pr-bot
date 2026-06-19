@@ -1,4 +1,4 @@
-IMAGE ?= registry.vzyx.xyz/seorilabs/gemini-pr-bot
+IMAGE ?= registry.vzyx.xyz/seorilabs/seori-pr-bot
 TAG ?= $(shell git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d-%H%M)
 PLATFORM ?= linux/arm64
 
