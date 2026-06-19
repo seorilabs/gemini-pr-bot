@@ -99,11 +99,11 @@ spec:
             - name: MINIMAX_TIMEOUT_MS
               value: "180000"
             - name: AI_REVIEW_PROVIDERS
-              value: minimax,gemini,copilot,cursor
+              value: minimax,copilot
             - name: AI_REVIEW_PROVIDER_WEIGHTS
-              value: minimax:100,gemini:0,copilot:0,cursor:25
+              value: minimax:100,copilot:25
             - name: AI_REVIEW_PROVIDER_FALLBACK_ORDER
-              value: minimax,cursor,copilot,gemini
+              value: minimax,copilot
             - name: AI_REVIEW_PROVIDER_COOLDOWN_MS
               value: "300000"
             - name: COPILOT_CLI_COMMAND
@@ -112,12 +112,6 @@ spec:
               value: "180000"
             - name: COPILOT_MODEL
               value: auto
-            - name: CURSOR_CLI_COMMAND
-              value: /usr/local/bin/agent
-            - name: CURSOR_CLI_TIMEOUT_MS
-              value: "180000"
-            - name: CURSOR_MODEL
-              value: gpt-5.2
             - name: DEEP_REPO_CONTEXT_MODE
               value: auto
             - name: DEEP_REPO_CONTEXT_TIMEOUT_MS
@@ -198,12 +192,6 @@ spec:
                 secretKeyRef:
                   name: seori-pr-bot-provider-secrets
                   key: COPILOT_GITHUB_TOKEN
-                  optional: true
-            - name: CURSOR_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: seori-pr-bot-provider-secrets
-                  key: CURSOR_API_KEY
                   optional: true
             - name: MINIMAX_API_KEY
               valueFrom:

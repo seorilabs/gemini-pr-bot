@@ -7,7 +7,7 @@ flowchart LR
   GitHub["GitHub App Webhook"] --> Ingress["K8s Ingress"]
   Ingress --> Bot["seori-pr-bot"]
   Bot --> GitHubAPI["GitHub App Installation API"]
-  Bot --> Providers["MiniMax / Gemini / Cursor / Copilot"]
+  Bot --> Providers["MiniMax / Copilot"]
   Bot --> Comment["PR comments / inline replies / check runs"]
   Bot --> NATS["NATS telegram subject"]
   NATS --> Telegram["Telegram"]
@@ -27,7 +27,7 @@ flowchart LR
 - Creates a `Seori Review` check run for review and agent jobs.
 - Marks `Seori Review` as `success` only when the bot approves the current HEAD; actionable review findings complete as `action_required`.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
-- Can route AI jobs across MiniMax API (default), Gemini CLI, GitHub Copilot CLI, and Cursor Agent with weighted fallback.
+- Can route AI jobs across MiniMax API (default) and GitHub Copilot CLI (fallback, returns 2026-07-01) with weighted fallback.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
@@ -192,19 +192,18 @@ Use a dedicated automation account for these credentials. Personal tokens are ac
 The production default is:
 
 ```text
-AI_REVIEW_PROVIDERS=minimax,gemini,copilot,cursor
-AI_REVIEW_PROVIDER_WEIGHTS=minimax:100,gemini:0,copilot:0,cursor:25
-AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax,cursor,copilot,gemini
+AI_REVIEW_PROVIDERS=minimax,copilot
+AI_REVIEW_PROVIDER_WEIGHTS=minimax:100,copilot:25
+AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax,copilot
 MINIMAX_MODEL=MiniMax-M3
 MINIMAX_API_BASE_URL=https://api.minimax.io/v1
 COPILOT_MODEL=auto
-CURSOR_MODEL=gpt-5.2
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
 PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
-The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMAX_API_BASE_URL}/chat/completions` and disables M3 thinking so the response contains only the review text. Set `AI_REVIEW_PROVIDERS=minimax` alone to run as a single-provider deployment, or keep the legacy Gemini/Copilot/Cursor providers in the list at weight `0` as a fallback when needed.
+The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMAX_API_BASE_URL}/chat/completions` and disables M3 thinking so the response contains only the review text. GitHub Copilot CLI is the optional fallback (quota returns 2026-07-01). The legacy Gemini CLI and Cursor Agent integrations remain in source and can be re-enabled by listing them in `AI_REVIEW_PROVIDERS` with a positive weight, but they are not loaded by default.
 
 Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions all use the multi-provider router. This keeps `/agent` approval decisions working when Gemini CLI is temporarily quota-blocked.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.

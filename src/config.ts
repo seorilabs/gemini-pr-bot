@@ -206,9 +206,10 @@ export function loadConfig(): Config {
     throw new Error("Missing required environment variable: GEMINI_API_KEY");
   }
 
-  const aiReviewProviders = optionalProviderList("AI_REVIEW_PROVIDERS", ["minimax"]);
+  const aiReviewProviders = optionalProviderList("AI_REVIEW_PROVIDERS", ["minimax", "copilot"]);
   const aiReviewProviderWeights = optionalProviderWeights("AI_REVIEW_PROVIDER_WEIGHTS", {
     minimax: 100,
+    copilot: 25,
   });
   if (aiReviewProviders.every((provider) => aiReviewProviderWeights[provider] <= 0)) {
     throw new Error("AI_REVIEW_PROVIDER_WEIGHTS must give at least one enabled provider a positive weight");
@@ -238,7 +239,7 @@ export function loadConfig(): Config {
     minimaxTimeoutMs: optionalInt("MINIMAX_TIMEOUT_MS", 180_000),
     aiReviewProviders,
     aiReviewProviderWeights,
-    aiReviewProviderFallbackOrder: optionalProviderList("AI_REVIEW_PROVIDER_FALLBACK_ORDER", ["minimax"]),
+    aiReviewProviderFallbackOrder: optionalProviderList("AI_REVIEW_PROVIDER_FALLBACK_ORDER", ["minimax", "copilot"]),
     aiReviewProviderCooldownMs: optionalInt("AI_REVIEW_PROVIDER_COOLDOWN_MS", 5 * 60 * 1000),
     copilotCliCommand: process.env.COPILOT_CLI_COMMAND?.trim() || "/app/node_modules/.bin/copilot",
     copilotCliTimeoutMs: optionalInt("COPILOT_CLI_TIMEOUT_MS", 180_000),
