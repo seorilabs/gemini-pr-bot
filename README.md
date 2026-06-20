@@ -16,6 +16,12 @@ flowchart LR
 ## Behavior
 
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
+- Reviews like a human: one batched review ("Start review") with **inline draft comments anchored to the problem lines**, plus a summary body that organizes findings by severity (Critical/High/Medium/Low) and category (`STRUCTURED_REVIEW_ENABLED`, requires `WORKFLOW_STORE=mysql`).
+- Tracks convergence across review turns in MySQL: the summary counts **🆕 new findings, ♻️ regressions introduced by review-response changes, ✅ previously-resolved defects, ⏳ carried, and 📤 issue-offloaded** items, so you can see at a glance whether the PR is converging.
+- Treats only **Critical/High as merge blockers** (`REQUEST_CHANGES`); Medium/Low are surfaced but do not block (`APPROVE`). Set `BLOCK_ON_MEDIUM=true` to also block on Medium.
+- Offloads **refactor / future-improvement Medium-Low** findings to linked GitHub issues (`FOLLOWUP_ISSUE_ENABLED`, label `FOLLOWUP_ISSUE_LABEL`) to keep review turns short, deduplicating by finding fingerprint.
+- **Resolves** an inline review thread once the finding is fixed (file actually changed and no longer reported) or moved to a follow-up issue, and closes the follow-up issue when resolved.
+- Falls back to the legacy single free-form review comment when structured output cannot be parsed or `WORKFLOW_STORE` is not MySQL.
 - Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
 - Runs explicit review on `@gemini-cli /review`; if there are no actionable findings, it submits an approval review instead of only commenting.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]`.

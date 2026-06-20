@@ -120,6 +120,14 @@ spec:
               value: "40"
             - name: DEEP_REPO_CONTEXT_MAX_BYTES
               value: "80000"
+            - name: STRUCTURED_REVIEW_ENABLED
+              value: "true"
+            - name: FOLLOWUP_ISSUE_ENABLED
+              value: "true"
+            - name: FOLLOWUP_ISSUE_LABEL
+              value: seori-followup
+            - name: BLOCK_ON_MEDIUM
+              value: "false"
             - name: HOME
               value: /home/app
             - name: BOT_MENTIONS
