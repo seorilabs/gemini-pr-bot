@@ -13,7 +13,7 @@ Create this as an organization-owned GitHub App under `seorilabs`.
 ## Repository Permissions
 
 - Checks: `Read and write`
-- Contents: `Read-only`
+- Contents: `Read and write`
 - Issues: `Read and write`
 - Metadata: `Read-only`
 - Pull requests: `Read and write`
