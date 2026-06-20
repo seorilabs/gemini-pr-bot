@@ -874,3 +874,194 @@ export async function postReviewCommentReply(
     body: githubCommentBody(body),
   });
 }
+
+export type InlineReviewComment = {
+  path: string;
+  line: number;
+  body: string;
+};
+
+export type ReviewSubmitEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+
+// Submits one batched ("Start review" + submit) pull request review with inline draft
+// comments anchored to changed lines, mirroring a human reviewer.
+export async function submitReviewWithInlineComments(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+  headSha: string,
+  event: ReviewSubmitEvent,
+  body: string,
+  comments: InlineReviewComment[],
+): Promise<void> {
+  await octokit.rest.pulls.createReview({
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: prNumber,
+    commit_id: headSha,
+    event,
+    body: githubCommentBody(body),
+    comments: comments.map((comment) => ({
+      path: comment.path,
+      line: comment.line,
+      side: "RIGHT",
+      body: comment.body,
+    })),
+  });
+}
+
+export type ReviewThreadInfo = {
+  threadId: string;
+  isResolved: boolean;
+  commentDatabaseIds: number[];
+  bodies: string[];
+};
+
+export async function listReviewThreads(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+): Promise<ReviewThreadInfo[]> {
+  const query = `
+    query($owner: String!, $repo: String!, $prNumber: Int!, $after: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $prNumber) {
+          reviewThreads(first: 100, after: $after) {
+            nodes {
+              id
+              isResolved
+              comments(first: 20) {
+                nodes {
+                  databaseId
+                  body
+                }
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const threads: ReviewThreadInfo[] = [];
+  let after: string | null = null;
+  do {
+    const result: any = await octokit.graphql(query, {
+      owner: repo.owner,
+      repo: repo.repo,
+      prNumber,
+      after,
+    });
+    const reviewThreads = result.repository?.pullRequest?.reviewThreads;
+    for (const thread of reviewThreads?.nodes || []) {
+      const comments = thread.comments?.nodes || [];
+      threads.push({
+        threadId: String(thread.id),
+        isResolved: Boolean(thread.isResolved),
+        commentDatabaseIds: comments
+          .map((comment: any) => Number(comment.databaseId))
+          .filter((id: number) => Number.isFinite(id)),
+        bodies: comments.map((comment: any) => String(comment.body || "")),
+      });
+    }
+    after = reviewThreads?.pageInfo?.hasNextPage ? reviewThreads.pageInfo.endCursor : null;
+  } while (after);
+
+  return threads;
+}
+
+export async function resolveReviewThread(octokit: Octokit, threadNodeId: string): Promise<void> {
+  const mutation = `
+    mutation($threadId: ID!) {
+      resolveReviewThread(input: { threadId: $threadId }) {
+        thread { id isResolved }
+      }
+    }
+  `;
+  await octokit.graphql(mutation, { threadId: threadNodeId });
+}
+
+// Set of changed file paths between two commits, used to tell review-response
+// regressions apart from genuinely new findings and to confirm resolutions.
+export async function changedFilesBetween(
+  octokit: Octokit,
+  repo: RepoRef,
+  baseSha: string,
+  headSha: string,
+): Promise<Set<string>> {
+  if (!baseSha || baseSha === headSha) {
+    return new Set();
+  }
+  try {
+    const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
+      owner: repo.owner,
+      repo: repo.repo,
+      basehead: `${baseSha}...${headSha}`,
+    });
+    return new Set((data.files || []).map((file: any) => String(file.filename)));
+  } catch {
+    return new Set();
+  }
+}
+
+export async function ensureLabelExists(octokit: Octokit, repo: RepoRef, label: string): Promise<void> {
+  try {
+    await octokit.rest.issues.getLabel({ owner: repo.owner, repo: repo.repo, name: label });
+  } catch {
+    try {
+      await octokit.rest.issues.createLabel({
+        owner: repo.owner,
+        repo: repo.repo,
+        name: label,
+        color: "ededed",
+        description: "Seori PR Bot follow-up (refactor / future improvement)",
+      });
+    } catch {
+      // Label creation can race or be unauthorized; issue creation still works without it.
+    }
+  }
+}
+
+export async function createFollowupIssue(
+  octokit: Octokit,
+  repo: RepoRef,
+  params: { title: string; body: string; labels: string[] },
+): Promise<{ number: number; url: string }> {
+  const { data } = await octokit.rest.issues.create({
+    owner: repo.owner,
+    repo: repo.repo,
+    title: params.title,
+    body: githubCommentBody(params.body),
+    labels: params.labels,
+  });
+  return { number: data.number, url: data.html_url };
+}
+
+export async function commentAndCloseIssue(
+  octokit: Octokit,
+  repo: RepoRef,
+  issueNumber: number,
+  comment: string,
+): Promise<void> {
+  try {
+    await octokit.rest.issues.createComment({
+      owner: repo.owner,
+      repo: repo.repo,
+      issue_number: issueNumber,
+      body: githubCommentBody(comment),
+    });
+    await octokit.rest.issues.update({
+      owner: repo.owner,
+      repo: repo.repo,
+      issue_number: issueNumber,
+      state: "closed",
+      state_reason: "completed",
+    });
+  } catch {
+    // Best-effort: a manually-closed or deleted issue should not fail the review.
+  }
+}

@@ -69,6 +69,10 @@ export type Config = {
   deepRepoContextTimeoutMs: number;
   deepRepoContextMaxFiles: number;
   deepRepoContextMaxBytes: number;
+  structuredReviewEnabled: boolean;
+  followupIssueEnabled: boolean;
+  followupIssueLabel: string;
+  blockOnMedium: boolean;
 };
 
 function requiredEnv(name: string): string {
@@ -292,5 +296,9 @@ export function loadConfig(): Config {
     deepRepoContextTimeoutMs: optionalInt("DEEP_REPO_CONTEXT_TIMEOUT_MS", 60_000),
     deepRepoContextMaxFiles: optionalInt("DEEP_REPO_CONTEXT_MAX_FILES", 40),
     deepRepoContextMaxBytes: optionalInt("DEEP_REPO_CONTEXT_MAX_BYTES", 80_000),
+    structuredReviewEnabled: optionalBool("STRUCTURED_REVIEW_ENABLED", true),
+    followupIssueEnabled: optionalBool("FOLLOWUP_ISSUE_ENABLED", true),
+    followupIssueLabel: process.env.FOLLOWUP_ISSUE_LABEL?.trim() || "seori-followup",
+    blockOnMedium: optionalBool("BLOCK_ON_MEDIUM", false),
   };
 }

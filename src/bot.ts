@@ -5,28 +5,49 @@ import { metrics, type GaugeSample } from "./metrics.js";
 import {
   approvePullRequest,
   buildPullRequestContext,
+  changedFilesBetween,
   closePullRequest,
+  commentAndCloseIssue,
   completeCheck,
+  createFollowupIssue,
   createInProgressCheck,
+  ensureLabelExists,
   getPullRequestStatus,
   isReviewThreadResolved,
   isPullRequestIssue,
   isTrustedAssociation,
+  listReviewThreads,
   postPrComment,
   postReviewCommentReply,
   requestChangesPullRequest,
+  resolveReviewThread,
   REVIEW_AGENT_NAME,
   repoFromPayload,
   shouldHandleRepository,
   squashMergePullRequest,
+  submitReviewWithInlineComments,
   type CheckConclusion,
+  type InlineReviewComment,
   type PullRequestContext,
   type PullRequestContextOptions,
   type PullRequestStatus,
   type RepoRef,
+  type ReviewSubmitEvent,
   type ReviewTrigger,
   updateInProgressCheck,
 } from "./github.js";
+import type { ReviewFindingStore } from "./workflow.js";
+import {
+  classifyConvergence,
+  isBlocking,
+  isOffloadable,
+  parseAnchorableLines,
+  parseStructuredReview,
+  SEVERITY_LABEL,
+  toFindings,
+  type ClassifiedFinding,
+  type StoredFinding,
+} from "./review.js";
 import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./telegram.js";
 import { parseBotCommand, truncate } from "./text.js";
 import {
@@ -68,6 +89,12 @@ type AgentRunOptions = {
 type GeneratedText = {
   text: string;
   headSha: string;
+};
+
+type OffloadedFinding = {
+  finding: ClassifiedFinding;
+  issueNumber: number;
+  url: string;
 };
 
 type Logger = {
@@ -121,6 +148,7 @@ export type WorkflowExecution = {
   recordCheckRun: (record: WorkflowCheckRecord) => Promise<void>;
   findActiveReview?: (record: WorkflowTargetRecord) => Promise<ActiveReviewWorkflow | null>;
   enqueueSynthetic?: (eventName: string, dedupeKey: string, payload: any, delayMs?: number) => Promise<boolean>;
+  reviewFindingStore?: ReviewFindingStore;
 };
 
 type CiRecheckRequest = {
@@ -743,6 +771,25 @@ export class PrBot {
           conflictText,
         );
         return;
+      }
+
+      if (this.config.structuredReviewEnabled && workflow?.reviewFindingStore) {
+        const handled = await this.runStructuredReview(
+          octokit,
+          repo,
+          prNumber,
+          context,
+          trigger,
+          check,
+          workflow,
+        );
+        if (handled) {
+          return;
+        }
+        this.logger.warn(
+          { repo: repo.fullName, prNumber, headSha: context.headSha },
+          "structured review unavailable; falling back to free-form review",
+        );
       }
 
       const reviewText = await this.createReviewTextFromContext(context, trigger);
@@ -1454,6 +1501,451 @@ export class PrBot {
     ].join("\n");
 
     return this.gemini.review(prompt);
+  }
+
+  // Human-like review: one batched review with inline draft comments anchored to the
+  // problem lines, a Start-Review summary that tracks convergence across turns, and
+  // refactor/future-improvement Medium/Low offloaded to linked GitHub issues.
+  // Returns true when it fully handled the turn, false to fall back to free-form review.
+  private async runStructuredReview(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    context: PullRequestContext,
+    trigger: ReviewTrigger,
+    check: ActiveCheckRun | null,
+    workflow: WorkflowExecution,
+  ): Promise<boolean> {
+    const store = workflow.reviewFindingStore!;
+    const prior = await store.listOpenReviewFindings(repo.fullName, prNumber);
+    const priorByFingerprint = new Map(prior.map((finding) => [finding.fingerprint, finding]));
+    const baseSha = prior.find((finding) => finding.lastSeenHead && finding.lastSeenHead !== context.headSha)?.lastSeenHead ?? "";
+    const changedFiles = await changedFilesBetween(octokit, repo, baseSha, context.headSha);
+
+    const raw = await this.gemini.reviewStructured(this.structuredReviewPrompt(context, trigger, prior));
+    const parsed = parseStructuredReview(raw);
+    if (!parsed) {
+      return false;
+    }
+
+    const findings = toFindings(parsed.findings);
+    const { classified, resolved } = classifyConvergence(findings, prior, changedFiles);
+
+    const anchors = await this.buildAnchorMap(octokit, repo, prNumber);
+
+    // Verify the head is still current before any side effects (issue creation,
+    // review submission). On a stale/closed head the helper completes the check.
+    if (await this.cancelTrackedCheckIfShuttingDown(check, "리뷰 취소", "리뷰 결과를 게시하기 전에 봇이 중지되었습니다.")) {
+      return true;
+    }
+    const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+    if (!latest) {
+      return true;
+    }
+
+    const offloaded: OffloadedFinding[] = [];
+    const inlineComments: InlineReviewComment[] = [];
+    let labelEnsured = false;
+
+    for (const finding of classified) {
+      if (this.config.followupIssueEnabled && isOffloadable(finding)) {
+        const existingIssue = priorByFingerprint.get(finding.fingerprint)?.issueNumber ?? null;
+        if (existingIssue) {
+          offloaded.push({
+            finding,
+            issueNumber: existingIssue,
+            url: `https://github.com/${repo.fullName}/issues/${existingIssue}`,
+          });
+        } else {
+          if (!labelEnsured) {
+            await ensureLabelExists(octokit, repo, this.config.followupIssueLabel);
+            labelEnsured = true;
+          }
+          const created = await createFollowupIssue(octokit, repo, {
+            title: this.followupIssueTitle(finding),
+            body: this.followupIssueBody(repo, prNumber, finding),
+            labels: [this.config.followupIssueLabel],
+          });
+          offloaded.push({ finding, issueNumber: created.number, url: created.url });
+        }
+        continue;
+      }
+
+      if (finding.file && finding.line && anchors.get(finding.file)?.has(finding.line)) {
+        inlineComments.push({ path: finding.file, line: finding.line, body: this.inlineCommentBody(finding) });
+      }
+    }
+
+    const blockingCount = classified.filter((finding) => isBlocking(finding, this.config.blockOnMedium)).length;
+    const summary = this.buildStructuredSummary({
+      headSha: context.headSha,
+      classified,
+      resolved,
+      offloaded,
+      blockingCount,
+      acceptanceCriteria: parsed.acceptanceCriteria,
+      anchors,
+    });
+
+    const event: ReviewSubmitEvent = blockingCount > 0 ? "REQUEST_CHANGES" : "COMMENT";
+    const reviewBody = blockingCount > 0 ? this.actionRequiredText("review", context.headSha, summary) : summary;
+    const shouldPostReview = blockingCount > 0 || inlineComments.length > 0 || classified.length > 0 || resolved.length > 0;
+    if (shouldPostReview) {
+      await this.safeSubmitReview(octokit, repo, prNumber, context.headSha, event, reviewBody, inlineComments);
+    }
+
+    await this.persistStructuredFindings(octokit, repo, prNumber, context.headSha, store, {
+      classified,
+      resolved,
+      offloaded,
+      priorByFingerprint,
+      hasInline: inlineComments.length > 0,
+    });
+
+    if (blockingCount > 0) {
+      await this.completeTrackedCheck(check, "action_required", "반드시 수정 필요", reviewBody);
+      return true;
+    }
+
+    const noBlockingReason = "리뷰 결과 반드시 수정할 항목(Critical/High)이 없습니다.";
+
+    if (this.hasFailingStatusChecks(latest)) {
+      const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
+      await postPrComment(octokit, repo, prNumber, blockerText);
+      await this.completeTrackedCheck(check, "action_required", "상태 체크 확인 필요", blockerText);
+      return true;
+    }
+
+    if (this.shouldDeferApprovalForCi(trigger, latest)) {
+      await this.deferApprovalUntilCiSettles(
+        octokit,
+        repo,
+        prNumber,
+        latest,
+        check,
+        workflow,
+        {
+          mode: "review",
+          sender: trigger.sender,
+          source: trigger.source,
+          reason: noBlockingReason,
+          body: summary,
+        },
+        this.hasPendingStatusChecks(latest) ? this.config.ciRecheckIntervalMs : this.config.ciInitialWaitMs,
+      );
+      return true;
+    }
+
+    await this.approveAndNotify(
+      octokit,
+      repo,
+      prNumber,
+      latest,
+      this.approvalText(trigger.sender, noBlockingReason, latest.headSha, summary),
+      {
+        mode: "review",
+        sender: trigger.sender,
+        source: trigger.source,
+        reason: noBlockingReason,
+      },
+    );
+    await this.completeTrackedCheck(check, "success", "PR 승인 완료", summary);
+    await this.maybeSquashMergeApprovedPullRequest(octokit, repo, prNumber, latest.headSha, "review");
+    return true;
+  }
+
+  private structuredReviewPrompt(
+    context: PullRequestContext,
+    trigger: ReviewTrigger,
+    prior: StoredFinding[],
+  ): string {
+    const priorList = prior.length
+      ? prior
+          .map((finding) => `- [${finding.severity}] ${finding.file ? `${finding.file}: ` : ""}${finding.title}`)
+          .join("\n")
+      : "(없음)";
+    return [
+      "Review this pull request and return findings as a single JSON object per the schema.",
+      "",
+      "Previously open Seori findings — for each, judge against the CURRENT diff. If it is now fixed, simply omit it. If it still applies, include it again with the same title wording.",
+      priorList,
+      "",
+      `Trigger: ${trigger.source}`,
+      `Requested by: ${trigger.sender}`,
+      trigger.request ? `User request: ${trigger.request}` : "",
+      "",
+      context.markdown,
+    ].join("\n");
+  }
+
+  private async buildAnchorMap(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+  ): Promise<Map<string, Set<number>>> {
+    const anchors = new Map<string, Set<number>>();
+    try {
+      const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
+        owner: repo.owner,
+        repo: repo.repo,
+        pull_number: prNumber,
+        per_page: 100,
+      });
+      for (const file of files) {
+        anchors.set(String(file.filename), parseAnchorableLines(file.patch));
+      }
+    } catch (error) {
+      this.logger.warn({ error, repo: repo.fullName, prNumber }, "failed to build inline anchor map");
+    }
+    return anchors;
+  }
+
+  private async safeSubmitReview(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    headSha: string,
+    event: ReviewSubmitEvent,
+    body: string,
+    comments: InlineReviewComment[],
+  ): Promise<void> {
+    try {
+      await submitReviewWithInlineComments(octokit, repo, prNumber, headSha, event, body, comments);
+      return;
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, prNumber, inlineComments: comments.length },
+        "inline review submit failed; retrying without inline comments",
+      );
+    }
+    try {
+      await submitReviewWithInlineComments(octokit, repo, prNumber, headSha, event, body, []);
+      return;
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, prNumber },
+        "review submit failed; falling back to a plain PR comment",
+      );
+      await postPrComment(octokit, repo, prNumber, body);
+    }
+  }
+
+  private async persistStructuredFindings(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    headSha: string,
+    store: ReviewFindingStore,
+    data: {
+      classified: ClassifiedFinding[];
+      resolved: StoredFinding[];
+      offloaded: OffloadedFinding[];
+      priorByFingerprint: Map<string, StoredFinding>;
+      hasInline: boolean;
+    },
+  ): Promise<void> {
+    const offloadByFingerprint = new Map(data.offloaded.map((entry) => [entry.finding.fingerprint, entry]));
+
+    const threadByFingerprint = new Map<string, { threadId: string; commentId: number | null }>();
+    if (data.hasInline) {
+      try {
+        const threads = await listReviewThreads(octokit, repo, prNumber);
+        for (const thread of threads) {
+          for (const body of thread.bodies) {
+            const match = body.match(/seori-finding:([0-9a-f]{40})/);
+            if (match && !threadByFingerprint.has(match[1])) {
+              threadByFingerprint.set(match[1], {
+                threadId: thread.threadId,
+                commentId: thread.commentDatabaseIds[0] ?? null,
+              });
+            }
+          }
+        }
+      } catch (error) {
+        this.logger.warn({ error, repo: repo.fullName, prNumber }, "failed to map review threads to findings");
+      }
+    }
+
+    for (const finding of data.classified) {
+      const thread = threadByFingerprint.get(finding.fingerprint);
+      const offload = offloadByFingerprint.get(finding.fingerprint);
+      await store.upsertReviewFinding(repo.fullName, prNumber, {
+        fingerprint: finding.fingerprint,
+        severity: finding.severity,
+        category: finding.category,
+        file: finding.file,
+        title: finding.title,
+        headSha,
+        reviewCommentId: thread?.commentId ?? null,
+        threadNodeId: thread?.threadId ?? null,
+        issueNumber: offload?.issueNumber ?? null,
+      });
+
+      // A finding that moved to a follow-up issue no longer needs an open inline thread.
+      if (offload) {
+        const priorThread = data.priorByFingerprint.get(finding.fingerprint)?.threadNodeId;
+        if (priorThread) {
+          await this.tryResolveThread(octokit, priorThread);
+        }
+      }
+    }
+
+    for (const finding of data.resolved) {
+      if (finding.threadNodeId) {
+        await this.tryResolveThread(octokit, finding.threadNodeId);
+      }
+      if (finding.issueNumber) {
+        await commentAndCloseIssue(
+          octokit,
+          repo,
+          finding.issueNumber,
+          "Seori: PR에서 해당 지적이 반영되어 follow-up 이슈를 닫습니다.",
+        );
+      }
+      await store.markReviewFindingResolved(repo.fullName, prNumber, finding.fingerprint);
+    }
+  }
+
+  private async tryResolveThread(octokit: Octokit, threadNodeId: string): Promise<void> {
+    try {
+      await resolveReviewThread(octokit, threadNodeId);
+    } catch (error) {
+      this.logger.warn({ error, threadNodeId }, "failed to resolve review thread");
+    }
+  }
+
+  private findingMarker(fingerprint: string): string {
+    return `<!-- seori-finding:${fingerprint} -->`;
+  }
+
+  private inlineCommentBody(finding: ClassifiedFinding): string {
+    const convergenceTag =
+      finding.convergence === "regression"
+        ? " ♻️ 리뷰 대응으로 생긴 새 결함"
+        : finding.convergence === "carried"
+          ? " ⏳ 지속"
+          : "";
+    return [
+      `**[${SEVERITY_LABEL[finding.severity]} · ${finding.category}]${convergenceTag} ${finding.title}**`,
+      "",
+      finding.impact || "(영향 설명 없음)",
+      finding.fix ? `\n수정 방향: ${finding.fix}` : "",
+      "",
+      this.findingMarker(finding.fingerprint),
+    ].filter((line) => line !== "").join("\n");
+  }
+
+  private followupIssueTitle(finding: ClassifiedFinding): string {
+    return truncate(`[Seori][${SEVERITY_LABEL[finding.severity]}] ${finding.title}`, 200);
+  }
+
+  private followupIssueBody(repo: RepoRef, prNumber: number, finding: ClassifiedFinding): string {
+    return [
+      `원본 PR: ${repo.fullName}#${prNumber}`,
+      `심각도: ${SEVERITY_LABEL[finding.severity]} (${finding.category})`,
+      finding.file ? `위치: \`${finding.file}${finding.line ? `:${finding.line}` : ""}\`` : undefined,
+      "",
+      "### 내용",
+      finding.impact || "(설명 없음)",
+      "",
+      "### 제안",
+      finding.fix || "(제안 없음)",
+      "",
+      "Seori PR Bot이 리뷰 턴을 줄이기 위해 향후개선/리팩토링 성격 항목으로 분리해 등록했습니다. 머지를 차단하지 않습니다.",
+      this.findingMarker(finding.fingerprint),
+    ].filter((line): line is string => line !== undefined).join("\n");
+  }
+
+  private buildStructuredSummary(data: {
+    headSha: string;
+    classified: ClassifiedFinding[];
+    resolved: StoredFinding[];
+    offloaded: OffloadedFinding[];
+    blockingCount: number;
+    acceptanceCriteria: string[];
+    anchors: Map<string, Set<number>>;
+  }): string {
+    const offloadedFingerprints = new Set(data.offloaded.map((entry) => entry.finding.fingerprint));
+    const newCount = data.classified.filter((f) => f.convergence === "new" && !offloadedFingerprints.has(f.fingerprint)).length;
+    const regressionCount = data.classified.filter((f) => f.convergence === "regression").length;
+    const carriedCount = data.classified.filter((f) => f.convergence === "carried").length;
+
+    const blocking = data.classified.filter((f) => isBlocking(f, this.config.blockOnMedium));
+    const nonBlockingInline = data.classified.filter(
+      (f) => !isBlocking(f, this.config.blockOnMedium) && !offloadedFingerprints.has(f.fingerprint),
+    );
+
+    const anchorNote = (f: ClassifiedFinding): string =>
+      f.file && f.line && data.anchors.get(f.file)?.has(f.line) ? "인라인 코멘트 참고" : "요약 참고";
+
+    const lines: string[] = [
+      "## Seori 리뷰",
+      "",
+      `HEAD: \`${data.headSha}\``,
+      "",
+      "### 수렴 현황",
+      "| 구분 | 건수 |",
+      "|---|---|",
+      `| 🆕 새 발견 | ${newCount} |`,
+      `| ♻️ 리뷰 대응으로 생긴 새 결함 | ${regressionCount} |`,
+      `| ✅ 이전 결함 해결 | ${data.resolved.length} |`,
+      `| ⏳ 지속 | ${carriedCount} |`,
+      `| 📤 이슈 이관(Medium/Low) | ${data.offloaded.length} |`,
+      "",
+      `남은 차단 항목(${this.config.blockOnMedium ? "Critical/High/Medium" : "Critical/High"}): **${data.blockingCount}**`,
+      data.blockingCount === 0 ? "→ 반드시 수정할 항목이 없어 수렴했습니다." : "→ 위 항목을 해결하면 수렴합니다.",
+    ];
+
+    if (data.acceptanceCriteria.length > 0) {
+      lines.push("", "### 인수조건");
+      for (const criterion of data.acceptanceCriteria) {
+        lines.push(`- ${criterion}`);
+      }
+    }
+
+    if (blocking.length > 0) {
+      lines.push("", `### 반드시 수정 (${this.config.blockOnMedium ? "Critical/High/Medium" : "Critical/High"})`);
+      for (const finding of blocking) {
+        lines.push(`- [${SEVERITY_LABEL[finding.severity]}] ${this.findingLocation(finding)} ${finding.title} — ${anchorNote(finding)}`);
+      }
+    }
+
+    if (nonBlockingInline.length > 0) {
+      lines.push("", "### 비차단 지적 (Medium/Low)");
+      for (const finding of nonBlockingInline) {
+        lines.push(`- [${SEVERITY_LABEL[finding.severity]}] ${this.findingLocation(finding)} ${finding.title} — ${anchorNote(finding)}`);
+      }
+    }
+
+    if (data.offloaded.length > 0) {
+      lines.push("", "### 이슈로 이관 (향후개선/리팩토링)");
+      for (const entry of data.offloaded) {
+        lines.push(`- [${SEVERITY_LABEL[entry.finding.severity]} · ${entry.finding.category}] ${entry.finding.title} → #${entry.issueNumber}`);
+      }
+    }
+
+    if (data.resolved.length > 0) {
+      lines.push("", "### 이전 결함 해결");
+      for (const finding of data.resolved) {
+        lines.push(`- ✅ ${finding.file ? `\`${finding.file}\` ` : ""}${finding.title}`);
+      }
+    }
+
+    lines.push("", "### 후속 조치");
+    lines.push(
+      data.blockingCount === 0
+        ? "- 새 커밋이 올라오지 않는 한 추가 에이전트 작업은 필요 없습니다."
+        : "- 반드시 수정 항목을 반영한 뒤 다시 리뷰를 요청하거나 새 커밋을 푸시하세요.",
+    );
+
+    return lines.join("\n");
+  }
+
+  private findingLocation(finding: ClassifiedFinding): string {
+    if (!finding.file) {
+      return "";
+    }
+    return `\`${finding.file}${finding.line ? `:${finding.line}` : ""}\``;
   }
 
   private async createAgentTextFromContext(

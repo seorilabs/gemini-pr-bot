@@ -11,6 +11,7 @@ import type { Config } from "./config.js";
 import type { PrBot, WorkflowCheckRecord } from "./bot.js";
 import { isAiProviderCooldownError } from "./gemini.js";
 import { completeCheck, type RepoRef } from "./github.js";
+import type { StoredFinding } from "./review.js";
 import { metrics, type ActiveWorkflowMetric, type WorkflowQueueMetric } from "./metrics.js";
 
 type Logger = {
@@ -43,6 +44,38 @@ type ExpiredWorkflowRow = WorkflowRow & {
   check_kind: string | null;
   lease_owner: string | null;
   lease_expires_at: Date | string | null;
+};
+
+type ReviewFindingRow = RowDataPacket & {
+  fingerprint: string;
+  severity: string;
+  category: string;
+  file: string | null;
+  title: string;
+  status: string;
+  review_comment_id: number | null;
+  thread_node_id: string | null;
+  issue_number: number | null;
+  first_seen_head: string;
+  last_seen_head: string;
+};
+
+export type ReviewFindingUpsert = {
+  fingerprint: string;
+  severity: string;
+  category: string;
+  file: string | null;
+  title: string;
+  headSha: string;
+  reviewCommentId?: number | null;
+  threadNodeId?: string | null;
+  issueNumber?: number | null;
+};
+
+export type ReviewFindingStore = {
+  listOpenReviewFindings: (repoFullName: string, prNumber: number) => Promise<StoredFinding[]>;
+  upsertReviewFinding: (repoFullName: string, prNumber: number, finding: ReviewFindingUpsert) => Promise<void>;
+  markReviewFindingResolved: (repoFullName: string, prNumber: number, fingerprint: string) => Promise<void>;
 };
 
 export type ExpiredWorkflowRun = WorkflowRun & {
@@ -158,6 +191,101 @@ export class MysqlWorkflowStore {
         KEY idx_gemini_pr_bot_workflows_pr (repo_full_name, pr_number, head_sha)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS gemini_pr_bot_review_findings (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        repo_full_name VARCHAR(255) NOT NULL,
+        pr_number INT NOT NULL,
+        fingerprint CHAR(40) NOT NULL,
+        severity VARCHAR(16) NOT NULL,
+        category VARCHAR(40) NOT NULL,
+        file VARCHAR(512) NULL,
+        title TEXT NOT NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'open',
+        review_comment_id BIGINT UNSIGNED NULL,
+        thread_node_id VARCHAR(120) NULL,
+        issue_number INT NULL,
+        first_seen_head VARCHAR(64) NOT NULL,
+        last_seen_head VARCHAR(64) NOT NULL,
+        created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_review_finding (repo_full_name, pr_number, fingerprint),
+        KEY idx_review_finding_pr (repo_full_name, pr_number, status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+  }
+
+  async listOpenReviewFindings(repoFullName: string, prNumber: number): Promise<StoredFinding[]> {
+    const [rows] = await this.pool.execute<ReviewFindingRow[]>(
+      `
+      SELECT fingerprint, severity, category, file, title, status,
+             review_comment_id, thread_node_id, issue_number, first_seen_head, last_seen_head
+      FROM gemini_pr_bot_review_findings
+      WHERE repo_full_name = ? AND pr_number = ? AND status = 'open'
+      `,
+      [repoFullName, prNumber],
+    );
+    return rows.map((row) => ({
+      fingerprint: row.fingerprint,
+      severity: row.severity,
+      category: row.category,
+      file: row.file,
+      title: row.title,
+      status: row.status === "resolved" ? "resolved" : "open",
+      reviewCommentId: row.review_comment_id === null ? null : Number(row.review_comment_id),
+      threadNodeId: row.thread_node_id,
+      issueNumber: row.issue_number === null ? null : Number(row.issue_number),
+      firstSeenHead: row.first_seen_head,
+      lastSeenHead: row.last_seen_head,
+    }));
+  }
+
+  async upsertReviewFinding(repoFullName: string, prNumber: number, finding: ReviewFindingUpsert): Promise<void> {
+    await this.pool.execute(
+      `
+      INSERT INTO gemini_pr_bot_review_findings
+        (repo_full_name, pr_number, fingerprint, severity, category, file, title, status,
+         review_comment_id, thread_node_id, issue_number, first_seen_head, last_seen_head)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        severity = VALUES(severity),
+        category = VALUES(category),
+        file = VALUES(file),
+        title = VALUES(title),
+        status = 'open',
+        review_comment_id = COALESCE(VALUES(review_comment_id), review_comment_id),
+        thread_node_id = COALESCE(VALUES(thread_node_id), thread_node_id),
+        issue_number = COALESCE(VALUES(issue_number), issue_number),
+        last_seen_head = VALUES(last_seen_head)
+      `,
+      [
+        repoFullName,
+        prNumber,
+        finding.fingerprint,
+        finding.severity,
+        finding.category,
+        finding.file,
+        finding.title,
+        finding.reviewCommentId ?? null,
+        finding.threadNodeId ?? null,
+        finding.issueNumber ?? null,
+        finding.headSha,
+        finding.headSha,
+      ],
+    );
+  }
+
+  async markReviewFindingResolved(repoFullName: string, prNumber: number, fingerprint: string): Promise<void> {
+    await this.pool.execute(
+      `
+      UPDATE gemini_pr_bot_review_findings
+      SET status = 'resolved'
+      WHERE repo_full_name = ? AND pr_number = ? AND fingerprint = ?
+      `,
+      [repoFullName, prNumber, fingerprint],
+    );
   }
 
   async enqueue(eventName: string, dedupeKey: string, payload: any, delayMs = 0): Promise<boolean> {
@@ -754,6 +882,14 @@ export class WorkflowEngine {
         findActiveReview: (record) => this.store.findActiveReviewWorkflow(run.id, run.createdAt, record),
         enqueueSynthetic: (eventName, dedupeKey, payload, delayMs) =>
           this.enqueueSynthetic(eventName, dedupeKey, payload, delayMs),
+        reviewFindingStore: {
+          listOpenReviewFindings: (repoFullName, prNumber) =>
+            this.store.listOpenReviewFindings(repoFullName, prNumber),
+          upsertReviewFinding: (repoFullName, prNumber, finding) =>
+            this.store.upsertReviewFinding(repoFullName, prNumber, finding),
+          markReviewFindingResolved: (repoFullName, prNumber, fingerprint) =>
+            this.store.markReviewFindingResolved(repoFullName, prNumber, fingerprint),
+        },
       });
       await this.store.complete(run.id);
       metrics.recordWorkflowCompleted(run.eventName, elapsedSecondsSince(startedAt));
