@@ -116,7 +116,11 @@ export function parseStructuredReview(text: string): StructuredReview | null {
   try {
     parsed = JSON.parse(candidate);
   } catch {
-    return null;
+    try {
+      parsed = JSON.parse(sanitizeJsonCandidate(candidate));
+    } catch {
+      return null;
+    }
   }
 
   if (!parsed || typeof parsed !== "object") {
@@ -134,6 +138,57 @@ export function parseStructuredReview(text: string): StructuredReview | null {
     acceptanceCriteria: acceptanceRaw.map((item: unknown) => String(item || "").trim()).filter(Boolean),
     findings: findingsRaw.filter((item: unknown) => item && typeof item === "object") as RawFinding[],
   };
+}
+
+// Best-effort repair for almost-JSON that some providers emit: strip // and
+// /* */ comments and trailing commas. String contents (e.g. "https://...") are
+// left untouched by tracking string/escape state instead of using regexes.
+function sanitizeJsonCandidate(candidate: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < candidate.length; i += 1) {
+    const ch = candidate[i];
+    const next = candidate[i + 1];
+
+    if (inString) {
+      out += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      while (i < candidate.length && candidate[i] !== "\n") {
+        i += 1;
+      }
+      out += "\n";
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < candidate.length && !(candidate[i] === "*" && candidate[i + 1] === "/")) {
+        i += 1;
+      }
+      i += 1; // skip the closing '/'
+      continue;
+    }
+    out += ch;
+  }
+
+  // Remove trailing commas before } or ] (outside strings the simple regex is safe
+  // here because comments are already gone).
+  return out.replace(/,(\s*[}\]])/g, "$1");
 }
 
 function extractJsonObject(text: string): string | null {

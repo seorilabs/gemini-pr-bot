@@ -1522,8 +1522,18 @@ export class PrBot {
     const baseSha = prior.find((finding) => finding.lastSeenHead && finding.lastSeenHead !== context.headSha)?.lastSeenHead ?? "";
     const changedFiles = await changedFilesBetween(octokit, repo, baseSha, context.headSha);
 
-    const raw = await this.gemini.reviewStructured(this.structuredReviewPrompt(context, trigger, prior));
-    const parsed = parseStructuredReview(raw);
+    const structuredPrompt = this.structuredReviewPrompt(context, trigger, prior);
+    let parsed = parseStructuredReview(await this.gemini.reviewStructured(structuredPrompt));
+    if (!parsed) {
+      // Providers occasionally wrap the JSON in prose despite the schema/JSON-mode
+      // request. Retry once before degrading to the free-form review (which loses
+      // convergence tracking and inline anchoring).
+      this.logger.warn(
+        { repo: repo.fullName, prNumber, headSha: context.headSha },
+        "structured review JSON parse failed; retrying once",
+      );
+      parsed = parseStructuredReview(await this.gemini.reviewStructured(structuredPrompt));
+    }
     if (!parsed) {
       return false;
     }

@@ -13,6 +13,12 @@ type Logger = {
 
 export type AiTaskKind = "review" | "answer" | "agent";
 
+// Per-call provider options. `jsonOutput` asks API providers to constrain the
+// response to a single JSON object (used by the structured review path).
+export type AiRunOptions = {
+  jsonOutput?: boolean;
+};
+
 export type AiProviderQuotaEvent = {
   provider: AiReviewProviderName;
   selectedProvider: AiReviewProviderName;
@@ -59,7 +65,7 @@ export class GeminiClient {
   }
 
   async reviewStructured(prompt: string): Promise<string> {
-    return this.runWithProviderFallback("review", this.structuredReviewPrompt(prompt));
+    return this.runWithProviderFallback("review", this.structuredReviewPrompt(prompt), { jsonOutput: true });
   }
 
   private structuredReviewPrompt(prompt: string): string {
@@ -72,19 +78,21 @@ export class GeminiClient {
       "Do not use tools. Answer only from the supplied prompt.",
       "",
       "Output a SINGLE JSON object and nothing else. No prose, no markdown, no code fence.",
-      "Schema:",
+      "The output MUST be valid JSON parseable by JSON.parse: double-quoted keys/strings, no // or /* */ comments, no trailing commas, no unquoted values.",
+      "Begin the reply with { and end with }.",
+      "Schema (field meaning in parentheses, do NOT echo these notes into the output):",
       "{",
-      '  "acceptance_criteria": [string],   // 1-4 conditions this PR must satisfy to merge, in Korean',
+      '  "acceptance_criteria": [string]  (1-4 conditions this PR must satisfy to merge, in Korean),',
       '  "findings": [',
       "    {",
-      '      "slug": string,                // short english kebab-case id for the finding',
-      '      "file": string|null,           // changed file path, exactly as shown in context',
-      '      "line": number|null,           // a NEW-file line number that appears in the diff hunk, else null',
+      '      "slug": string  (short english kebab-case id for the finding),',
+      '      "file": string|null  (changed file path, exactly as shown in context),',
+      '      "line": number|null  (a NEW-file line number that appears in the diff hunk, else null),',
       '      "severity": "critical"|"high"|"medium"|"low",',
-      '      "category": string,            // e.g. correctness, security, crash, test, refactor, future-improvement',
-      '      "title": string,               // one concise Korean sentence naming the defect',
-      '      "impact": string,              // why it matters, grounded in the diff (Korean)',
-      '      "fix": string                  // concrete fix direction (Korean)',
+      '      "category": string  (e.g. correctness, security, crash, test, refactor, future-improvement),',
+      '      "title": string  (one concise Korean sentence naming the defect),',
+      '      "impact": string  (why it matters, grounded in the diff, Korean),',
+      '      "fix": string  (concrete fix direction, Korean)',
       "    }",
       "  ]",
       "}",
@@ -180,7 +188,11 @@ export class GeminiClient {
     ].join(" ");
   }
 
-  private async runWithProviderFallback(kind: AiTaskKind, prompt: string): Promise<string> {
+  private async runWithProviderFallback(
+    kind: AiTaskKind,
+    prompt: string,
+    options: AiRunOptions = {},
+  ): Promise<string> {
     const selectedProvider = this.pickReviewProvider();
     const providers = this.reviewProviderAttemptOrder(selectedProvider);
     const errors: string[] = [];
@@ -198,7 +210,7 @@ export class GeminiClient {
 
       const startedAt = Date.now();
       try {
-        const text = await this.runProvider(provider, kind, prompt);
+        const text = await this.runProvider(provider, kind, prompt, options);
         this.providerLastSuccessAt.set(provider, Date.now());
         metrics.recordAiProviderAttempt(kind, selectedProvider, provider, "success", elapsedSecondsSince(startedAt));
         this.logger?.info(
@@ -417,13 +429,18 @@ export class GeminiClient {
     }
   }
 
-  private runProvider(provider: AiReviewProviderName, kind: AiTaskKind, prompt: string): Promise<string> {
+  private runProvider(
+    provider: AiReviewProviderName,
+    kind: AiTaskKind,
+    prompt: string,
+    options: AiRunOptions = {},
+  ): Promise<string> {
     if (provider === "minimax") {
-      return this.runMiniMaxApi(kind, prompt);
+      return this.runMiniMaxApi(kind, prompt, options);
     }
 
     if (provider === "gemini") {
-      return this.runGemini(kind, prompt);
+      return this.runGemini(kind, prompt, options);
     }
 
     if (provider === "copilot") {
@@ -433,12 +450,12 @@ export class GeminiClient {
     return this.runCursorCli(prompt);
   }
 
-  private async runGemini(kind: AiTaskKind, prompt: string): Promise<string> {
+  private async runGemini(kind: AiTaskKind, prompt: string, options: AiRunOptions = {}): Promise<string> {
     if (this.config.geminiProvider === "cli") {
       return this.runGeminiCli(prompt);
     }
 
-    const generationConfig = this.geminiGenerationConfig(kind);
+    const generationConfig = this.geminiGenerationConfig(kind, options);
     const response = await this.ai!.models.generateContent({
       model: this.config.geminiModel || "gemini-2.5-flash",
       contents: truncate(prompt, this.config.maxContextChars),
@@ -448,12 +465,16 @@ export class GeminiClient {
     return response.text?.trim() || this.emptyResponseText(kind);
   }
 
-  private geminiGenerationConfig(kind: AiTaskKind): { temperature: number; maxOutputTokens: number } {
+  private geminiGenerationConfig(
+    kind: AiTaskKind,
+    options: AiRunOptions = {},
+  ): { temperature: number; maxOutputTokens: number; responseMimeType?: string } {
+    const jsonConfig = options.jsonOutput ? { responseMimeType: "application/json" } : {};
     if (kind === "answer") {
-      return { temperature: 0.3, maxOutputTokens: 3072 };
+      return { temperature: 0.3, maxOutputTokens: 3072, ...jsonConfig };
     }
 
-    return { temperature: 0.2, maxOutputTokens: 4096 };
+    return { temperature: 0.2, maxOutputTokens: 4096, ...jsonConfig };
   }
 
   private emptyResponseText(kind: AiTaskKind): string {
@@ -464,7 +485,7 @@ export class GeminiClient {
     return "응답을 생성하지 못했습니다.";
   }
 
-  private async runMiniMaxApi(kind: AiTaskKind, prompt: string): Promise<string> {
+  private async runMiniMaxApi(kind: AiTaskKind, prompt: string, options: AiRunOptions = {}): Promise<string> {
     if (!this.config.minimaxApiKey) {
       throw new Error("MiniMax API key is not configured");
     }
@@ -488,6 +509,9 @@ export class GeminiClient {
           temperature,
           max_completion_tokens: maxCompletionTokens,
           thinking: { type: "disabled" },
+          // Constrain structured-review output to a parseable JSON object so it
+          // does not regress into prose that fails JSON.parse.
+          ...(options.jsonOutput ? { response_format: { type: "json_object" } } : {}),
           stream: false,
         }),
         signal: controller.signal,
