@@ -44,6 +44,7 @@ import {
   parseAnchorableLines,
   parseStructuredReview,
   SEVERITY_LABEL,
+  SEVERITY_ORDER,
   toFindings,
   type ClassifiedFinding,
   type StoredFinding,
@@ -1617,7 +1618,20 @@ export class PrBot {
       return true;
     }
 
-    const noBlockingReason = "리뷰 결과 반드시 수정할 항목(Critical/High)이 없습니다.";
+    const remainingNonBlocking = classified.filter(
+      (f) => !isBlocking(f, this.config.blockOnMedium) && !offloaded.some((e) => e.finding.fingerprint === f.fingerprint),
+    );
+    const noBlockingReason =
+      remainingNonBlocking.length > 0 || offloaded.length > 0
+        ? `차단 결함(Critical/High) 없음 · 비차단 ${remainingNonBlocking.length}건/이관 ${offloaded.length}건은 후속 처리 권장`
+        : "차단 결함(Critical/High) 없이 깨끗하게 수렴";
+    const approvalSummary = this.buildApprovalSummary({
+      headSha: context.headSha,
+      classified,
+      resolved,
+      offloaded,
+      acceptanceCriteria: parsed.acceptanceCriteria,
+    });
 
     if (this.hasFailingStatusChecks(latest)) {
       const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
@@ -1639,7 +1653,7 @@ export class PrBot {
           sender: trigger.sender,
           source: trigger.source,
           reason: noBlockingReason,
-          body: summary,
+          body: approvalSummary,
         },
         this.hasPendingStatusChecks(latest) ? this.config.ciRecheckIntervalMs : this.config.ciInitialWaitMs,
       );
@@ -1651,7 +1665,7 @@ export class PrBot {
       repo,
       prNumber,
       latest,
-      this.approvalText(trigger.sender, noBlockingReason, latest.headSha, summary),
+      this.approvalText(trigger.sender, noBlockingReason, latest.headSha, approvalSummary),
       {
         mode: "review",
         sender: trigger.sender,
@@ -1659,7 +1673,7 @@ export class PrBot {
         reason: noBlockingReason,
       },
     );
-    await this.completeTrackedCheck(check, "success", "PR 승인 완료", summary);
+    await this.completeTrackedCheck(check, "success", "PR 승인 완료", approvalSummary);
     await this.maybeSquashMergeApprovedPullRequest(octokit, repo, prNumber, latest.headSha, "review");
     return true;
   }
@@ -1946,6 +1960,78 @@ export class PrBot {
       data.blockingCount === 0
         ? "- 새 커밋이 올라오지 않는 한 추가 에이전트 작업은 필요 없습니다."
         : "- 반드시 수정 항목을 반영한 뒤 다시 리뷰를 요청하거나 새 커밋을 푸시하세요.",
+    );
+
+    return lines.join("\n");
+  }
+
+  // Approval-framed body: unlike buildStructuredSummary (a fault-finding review),
+  // this answers "is it safe to merge, and what residual risk remains" — so it
+  // states why approval is justified and lists the non-blocking issues that stay.
+  private buildApprovalSummary(data: {
+    headSha: string;
+    classified: ClassifiedFinding[];
+    resolved: StoredFinding[];
+    offloaded: OffloadedFinding[];
+    acceptanceCriteria: string[];
+  }): string {
+    const offloadedFingerprints = new Set(data.offloaded.map((entry) => entry.finding.fingerprint));
+    const remaining = data.classified
+      .filter(
+        (finding) =>
+          !isBlocking(finding, this.config.blockOnMedium) && !offloadedFingerprints.has(finding.fingerprint),
+      )
+      .sort((a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity));
+    const blockLabel = this.config.blockOnMedium ? "Critical/High/Medium" : "Critical/High";
+
+    const lines: string[] = [
+      "## 승인 판단",
+      "",
+      `HEAD: \`${data.headSha}\``,
+      "",
+      `리뷰 범위에서 머지를 막을 결함(${blockLabel})이 없어 **머지 가능**으로 판단합니다.`,
+      '승인은 "차단할 결함이 없음"을 의미하며, 모든 동작을 실행·검증했다는 뜻은 아닙니다.',
+      "",
+      "### 판단 요약",
+      `- 이번 라운드 해결: ${data.resolved.length}건`,
+      `- 남은 비차단 이슈: ${remaining.length}건 (머지를 막지 않음)`,
+      `- 후속 이슈로 이관: ${data.offloaded.length}건`,
+    ];
+
+    if (data.acceptanceCriteria.length > 0) {
+      lines.push("", "### 머지 전 확인 권장 (인수조건)");
+      for (const criterion of data.acceptanceCriteria) {
+        lines.push(`- [ ] ${criterion}`);
+      }
+      lines.push("", "_위 인수조건에는 봇이 직접 실행·검증하지 못한 항목이 포함될 수 있습니다. 머지 전 확인하세요._");
+    }
+
+    if (remaining.length > 0) {
+      lines.push("", "### 남은 이슈 (비차단)");
+      for (const finding of remaining) {
+        lines.push(`- [${SEVERITY_LABEL[finding.severity]}] ${this.findingLocation(finding)} ${finding.title}`);
+      }
+    }
+
+    if (data.offloaded.length > 0) {
+      lines.push("", "### 후속 이슈로 이관 (향후개선/리팩토링)");
+      for (const entry of data.offloaded) {
+        lines.push(`- [${SEVERITY_LABEL[entry.finding.severity]} · ${entry.finding.category}] ${entry.finding.title} → #${entry.issueNumber}`);
+      }
+    }
+
+    if (data.resolved.length > 0) {
+      lines.push("", "### 이번 라운드 해결됨");
+      for (const finding of data.resolved) {
+        lines.push(`- ✅ ${finding.file ? `\`${finding.file}\` ` : ""}${finding.title}`);
+      }
+    }
+
+    lines.push("", "### 권장 후속");
+    lines.push(
+      remaining.length > 0 || data.offloaded.length > 0
+        ? "- 남은 비차단 이슈는 별도 커밋/PR에서 처리하세요. 머지를 막지 않습니다."
+        : "- 추가 조치 없이 머지 가능합니다.",
     );
 
     return lines.join("\n");
