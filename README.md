@@ -38,6 +38,7 @@ flowchart LR
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
 - When `AUTO_SQUASH_MERGE_ENABLED=true`, squash-merges the approved current HEAD only when the PR base branch is `main`, the PR is not draft, mergeable, and all status checks are green.
+- When `DEPENDENCY_FASTPATH_ENABLED=true`, dependabot/renovate dependency PRs skip the AI review and reuse the same approval path: `Seori Review` turns green once other CI checks pass (failing CI blocks, pending CI waits via the CI-recheck loop). Detection uses `DEPENDENCY_FASTPATH_AUTHORS` (PR author) or `DEPENDENCY_FASTPATH_LABELS` (PR label). Without this, bot-authored PRs are skipped entirely and never get the required `Seori Review` check, which blocks merge.
 - Ignores resolved inline review threads.
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
 - Persists active check-run IDs so a restarted worker can resume a job instead of leaving stale pending checks.

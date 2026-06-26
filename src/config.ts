@@ -73,6 +73,9 @@ export type Config = {
   followupIssueEnabled: boolean;
   followupIssueLabel: string;
   blockOnMedium: boolean;
+  dependencyFastPathEnabled: boolean;
+  dependencyFastPathAuthors: Set<string>;
+  dependencyFastPathLabels: Set<string>;
 };
 
 function requiredEnv(name: string): string {
@@ -300,5 +303,17 @@ export function loadConfig(): Config {
     followupIssueEnabled: optionalBool("FOLLOWUP_ISSUE_ENABLED", true),
     followupIssueLabel: process.env.FOLLOWUP_ISSUE_LABEL?.trim() || "seori-followup",
     blockOnMedium: optionalBool("BLOCK_ON_MEDIUM", false),
+    dependencyFastPathEnabled: optionalBool("DEPENDENCY_FASTPATH_ENABLED", false),
+    dependencyFastPathAuthors: new Set(
+      optionalList("DEPENDENCY_FASTPATH_AUTHORS", [
+        "dependabot[bot]",
+        "dependabot-preview[bot]",
+        "renovate[bot]",
+        "renovate",
+      ]).map((item) => item.toLowerCase()),
+    ),
+    dependencyFastPathLabels: new Set(
+      optionalList("DEPENDENCY_FASTPATH_LABELS", ["dependencies"]).map((item) => item.toLowerCase()),
+    ),
   };
 }

@@ -146,6 +146,12 @@ spec:
               value: seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
             - name: AUTO_SQUASH_MERGE_ENABLED
               value: "true"
+            - name: DEPENDENCY_FASTPATH_ENABLED
+              value: "true"
+            - name: DEPENDENCY_FASTPATH_AUTHORS
+              value: "dependabot[bot],dependabot-preview[bot],renovate[bot],renovate"
+            - name: DEPENDENCY_FASTPATH_LABELS
+              value: "dependencies"
             - name: APPROVAL_TELEGRAM_NOTIFY_ENABLED
               value: "true"
             - name: QUOTA_TELEGRAM_NOTIFY_ENABLED

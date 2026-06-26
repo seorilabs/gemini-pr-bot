@@ -513,12 +513,40 @@ export class PrBot {
   }
 
   private async handlePullRequest(octokit: Octokit, payload: any, workflow?: WorkflowExecution): Promise<void> {
-    if (!shouldHandleRepository(payload, this.config) || payload.sender.type === "Bot") {
+    if (!shouldHandleRepository(payload, this.config)) {
       return;
     }
 
     const repo = repoFromPayload(payload);
     const action = payload.action;
+
+    if (payload.sender.type === "Bot") {
+      if (
+        this.config.dependencyFastPathEnabled &&
+        ["opened", "reopened", "synchronize"].includes(action) &&
+        !this.isAutoReviewIgnored(repo) &&
+        this.isDependencyBumpPullRequest(payload.pull_request)
+      ) {
+        this.logger.info(
+          { repo: repo.fullName, prNumber: payload.pull_request?.number, action, author: payload.pull_request?.user?.login },
+          "dependency bump fast-path: skipping AI review, approving on CI pass",
+        );
+        await this.runReview(
+          octokit,
+          repo,
+          payload.pull_request.number,
+          { source: `pull_request.${action}`, sender: payload.sender.login },
+          workflow,
+          {
+            fastPathApproval: {
+              reason: "의존성 업데이트 PR이라 Gemini 리뷰 없이 CI(컴파일/테스트) 통과를 기준으로 자동 승인합니다.",
+            },
+          },
+        );
+      }
+      return;
+    }
+
     if (this.isAutoReviewIgnored(repo) && ["opened", "reopened", "synchronize"].includes(action)) {
       this.logger.info({ repo: repo.fullName, action }, "automatic pull request review ignored for repository");
       return;
@@ -710,12 +738,40 @@ export class PrBot {
     return ignored.has(repo.fullName.toLowerCase()) || ignored.has(repo.repo.toLowerCase());
   }
 
+  private isDependencyBumpPullRequest(pullRequest: any): boolean {
+    if (!pullRequest) {
+      return false;
+    }
+
+    const author = String(pullRequest.user?.login || "").toLowerCase();
+    if (author && this.config.dependencyFastPathAuthors.has(author)) {
+      return true;
+    }
+
+    const labels: string[] = Array.isArray(pullRequest.labels)
+      ? pullRequest.labels.map((label: any) => String(label?.name || "").toLowerCase())
+      : [];
+    return labels.some((label) => this.config.dependencyFastPathLabels.has(label));
+  }
+
+  private dependencyFastPathReviewText(reason: string): string {
+    return [
+      reason,
+      "",
+      "이 PR은 의존성 업데이트(dependabot/renovate)로 분류되어 Seori의 AI 코드 리뷰를 생략했습니다.",
+      "GitHub 상태 체크(컴파일/테스트 등)가 모두 통과하면 자동 승인하고, 실패하거나 대기 중이면 승인을 보류합니다.",
+      "",
+      NO_ACTIONABLE_FINDINGS_TEXT,
+    ].join("\n");
+  }
+
   private async runReview(
     octokit: Octokit,
     repo: RepoRef,
     prNumber: number,
     trigger: ReviewTrigger,
     workflow?: WorkflowExecution,
+    options: { fastPathApproval?: { reason: string } } = {},
   ): Promise<void> {
     const context = await buildPullRequestContext(octokit, repo, prNumber, this.config, this.contextOptions(workflow, trigger.request));
     if (this.shuttingDown || (this.isClosedPullRequest(context) && !workflow?.checkRunId)) {
@@ -774,26 +830,31 @@ export class PrBot {
         return;
       }
 
-      if (this.config.structuredReviewEnabled && workflow?.reviewFindingStore) {
-        const handled = await this.runStructuredReview(
-          octokit,
-          repo,
-          prNumber,
-          context,
-          trigger,
-          check,
-          workflow,
-        );
-        if (handled) {
-          return;
+      let reviewText: string;
+      if (options.fastPathApproval) {
+        reviewText = this.dependencyFastPathReviewText(options.fastPathApproval.reason);
+      } else {
+        if (this.config.structuredReviewEnabled && workflow?.reviewFindingStore) {
+          const handled = await this.runStructuredReview(
+            octokit,
+            repo,
+            prNumber,
+            context,
+            trigger,
+            check,
+            workflow,
+          );
+          if (handled) {
+            return;
+          }
+          this.logger.warn(
+            { repo: repo.fullName, prNumber, headSha: context.headSha },
+            "structured review unavailable; falling back to free-form review",
+          );
         }
-        this.logger.warn(
-          { repo: repo.fullName, prNumber, headSha: context.headSha },
-          "structured review unavailable; falling back to free-form review",
-        );
-      }
 
-      const reviewText = await this.createReviewTextFromContext(context, trigger);
+        reviewText = await this.createReviewTextFromContext(context, trigger);
+      }
       if (await this.cancelTrackedCheckIfShuttingDown(check, "리뷰 취소", "리뷰 결과를 게시하기 전에 봇이 중지되었습니다.")) {
         return;
       }
@@ -801,6 +862,8 @@ export class PrBot {
       if (!latest) {
         return;
       }
+
+      const approvalReason = options.fastPathApproval?.reason ?? "리뷰 결과 조치할 항목이 없습니다.";
 
       if (this.wantsApproval(reviewText) && this.hasFailingStatusChecks(latest)) {
         const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
@@ -821,7 +884,7 @@ export class PrBot {
             mode: "review",
             sender: trigger.sender,
             source: trigger.source,
-            reason: "리뷰 결과 조치할 항목이 없습니다.",
+            reason: approvalReason,
             body: reviewText,
           },
           this.hasPendingStatusChecks(latest) ? this.config.ciRecheckIntervalMs : this.config.ciInitialWaitMs,
@@ -835,12 +898,12 @@ export class PrBot {
           repo,
           prNumber,
           latest,
-          this.approvalText(trigger.sender, "리뷰 결과 조치할 항목이 없습니다.", latest.headSha, reviewText),
+          this.approvalText(trigger.sender, approvalReason, latest.headSha, reviewText),
           {
             mode: "review",
             sender: trigger.sender,
             source: trigger.source,
-            reason: "리뷰 결과 조치할 항목이 없습니다.",
+            reason: approvalReason,
           },
         );
         await this.completeTrackedCheck(check, "success", "PR 승인 완료", reviewText);
