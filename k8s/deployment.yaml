@@ -127,7 +127,7 @@ spec:
             - name: FOLLOWUP_ISSUE_LABEL
               value: seori-followup
             - name: BLOCK_ON_MEDIUM
-              value: "true"
+              value: "false"
             - name: HOME
               value: /home/app
             - name: BOT_MENTIONS
