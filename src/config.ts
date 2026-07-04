@@ -29,6 +29,11 @@ export type Config = {
   aiReviewProviderWeights: AiReviewProviderWeights;
   aiReviewProviderFallbackOrder: AiReviewProviderName[];
   aiReviewProviderCooldownMs: number;
+  // Second-opinion escalation: when a review keeps oscillating (a finding persists
+  // across rounds while its file is unchanged — MiniMax re-litigating unchanged
+  // code), route the next review to a different model to break the loop.
+  aiReviewTiebreakerEnabled: boolean;
+  aiReviewTiebreakerProvider: AiReviewProviderName;
   copilotCliCommand: string;
   copilotCliTimeoutMs: number;
   copilotModel?: string;
@@ -248,6 +253,12 @@ export function loadConfig(): Config {
     aiReviewProviderWeights,
     aiReviewProviderFallbackOrder: optionalProviderList("AI_REVIEW_PROVIDER_FALLBACK_ORDER", ["minimax", "copilot"]),
     aiReviewProviderCooldownMs: optionalInt("AI_REVIEW_PROVIDER_COOLDOWN_MS", 5 * 60 * 1000),
+    aiReviewTiebreakerEnabled: optionalBool("AI_REVIEW_TIEBREAKER_ENABLED", true),
+    aiReviewTiebreakerProvider: optionalChoice<AiReviewProviderName>(
+      "AI_REVIEW_TIEBREAKER_PROVIDER",
+      "copilot",
+      AI_REVIEW_PROVIDER_NAMES,
+    ),
     copilotCliCommand: process.env.COPILOT_CLI_COMMAND?.trim() || "/app/node_modules/.bin/copilot",
     copilotCliTimeoutMs: optionalInt("COPILOT_CLI_TIMEOUT_MS", 180_000),
     copilotModel: process.env.COPILOT_MODEL?.trim(),

@@ -64,8 +64,17 @@ export class GeminiClient {
     return this.runWithProviderFallback("review", this.reviewPrompt(prompt));
   }
 
-  async reviewStructured(prompt: string): Promise<string> {
-    return this.runWithProviderFallback("review", this.structuredReviewPrompt(prompt), { jsonOutput: true });
+  async reviewStructured(prompt: string, preferredProvider?: AiReviewProviderName): Promise<string> {
+    return this.runWithProviderFallback("review", this.structuredReviewPrompt(prompt), { jsonOutput: true }, preferredProvider);
+  }
+
+  // Whether a provider can be forced right now: routing-enabled (configured with a
+  // positive weight), credentialed, and not in cooldown. Used by the caller to
+  // decide if second-opinion escalation is actually possible before triggering it.
+  canUseProvider(provider: AiReviewProviderName): boolean {
+    const routingEnabled =
+      this.config.aiReviewProviders.includes(provider) && this.config.aiReviewProviderWeights[provider] > 0;
+    return routingEnabled && this.hasProviderCredential(provider) && this.providerCooldownRemainingMs(provider) === 0;
   }
 
   private structuredReviewPrompt(prompt: string): string {
@@ -83,6 +92,12 @@ export class GeminiClient {
       "- EXCEPTION — test coverage IS observable in the diff: the file list shows exactly what changed. When the PR adds or modifies product logic but adds/updates NO corresponding test for it, that absence is a fact you can point at. Reporting a missing-test gap for changed logic is allowed and expected (see Test coverage gate below). This exception is ONLY for tests, not for any other 'missing X' claim.",
       "- Do not ask the author to confirm/verify something. A finding is a defect you can point at, not a question.",
       "- Do not assert how a build tool, framework, or language behaves at runtime (Gradle/Groovy/Capacitor signing, etc.) unless the diff itself demonstrates the failure. If your claim depends on inferred tool behavior, drop it.",
+      "",
+      "Cross-symbol grounding (the single biggest source of false positives — read carefully):",
+      "- Before asserting that a called function/helper/method does NOT do something (subtract a baseline, clamp, filter/exclude items, guard against reentry, dedupe, persist, validate), you MUST have that callee's BODY visible in the provided context. If you can only see the call site and not the callee's implementation, treat the callee as correct and DO NOT raise a finding that depends on its internal behavior — that is an 'inferred behavior' claim and is disallowed.",
+      "- A large file is shown as diff hunks (and possibly a symbol outline) — NOT its full body. Do NOT assume a guard, early-return, filter, or precondition is absent just because it is not in the hunk you see. Filters and guards frequently live in a sibling function of the same file. If a symbol outline lists another function that plausibly holds the guard, assume the guard exists rather than reporting its absence.",
+      "- If your proposed fix would only be correct WHEN the callee does not already perform the step (e.g. 'also subtract baseline here'), and you cannot see the callee's body to confirm it does not, do not propose it — the fix may cause a real regression (double-subtraction, double-claim). When in doubt about an unseen callee, stay silent.",
+      "- If a prior-round author/maintainer comment cites a specific file:line that refutes a finding, and you cannot point to concrete diff evidence overriding that citation, DROP the finding. Do not restate a contested finding with identical wording without addressing the cited counter-evidence.",
       "",
       "Scope (do not burn the review on release/build scaffolding):",
       "- App release signing, keystore wiring, Gradle signingConfig fallbacks, allowBackup, usesCleartextTraffic, NSAppTransportSecurity, androidx.test versions, and generated/boilerplate native test files (e.g. Capacitor ExampleInstrumentedTest) are NOT product-runtime defects. These configs are expected to exist and be handled in CI/release flow.",
@@ -155,6 +170,8 @@ export class GeminiClient {
       "Do not invent issues not directly supported by the supplied diff or PR context.",
       "Do not report style preferences, speculative risks, or nits as findings.",
       "The diff is partial: never flag code/tests/config/migration as 'missing', 'not visible', or 'not confirmed', and never ask the author to verify something — only report defects the diff literally shows.",
+      "Do not claim a called helper/method fails to do something (subtract a baseline, filter, guard, dedupe) unless its body is visible in context; if you only see the call site, treat the callee as correct and stay silent. Do not assume a guard/filter is absent just because it is outside the diff hunk you see — it may live in a sibling function of the same file.",
+      "If a prior author/maintainer comment cites a file:line that refutes a finding, drop that finding instead of repeating it verbatim.",
       "Do not assert build-tool/framework/language runtime behavior (Gradle/Groovy/Capacitor signing, etc.) unless the diff itself demonstrates the failure.",
       "Treat release signing, keystore/Gradle config, allowBackup, cleartext/ATS, test-dependency versions, and generated boilerplate tests as out-of-scope scaffolding — mention at most in passing, never as a blocking issue.",
       "Do not approve or say there are no actionable findings when the supplied PR context reports merge conflicts.",
@@ -218,8 +235,10 @@ export class GeminiClient {
     kind: AiTaskKind,
     prompt: string,
     options: AiRunOptions = {},
+    preferredProvider?: AiReviewProviderName,
   ): Promise<string> {
-    const selectedProvider = this.pickReviewProvider();
+    const selectedProvider =
+      preferredProvider && this.canUseProvider(preferredProvider) ? preferredProvider : this.pickReviewProvider();
     const providers = this.reviewProviderAttemptOrder(selectedProvider);
     const errors: string[] = [];
     const cooldownDelaysMs: number[] = [];

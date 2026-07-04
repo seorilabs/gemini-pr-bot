@@ -1,4 +1,4 @@
-import type { Config } from "./config.js";
+import type { AiReviewProviderName, Config } from "./config.js";
 import { CI_RECHECK_EVENT, STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
 import { GeminiClient, isAiProviderCooldownError } from "./gemini.js";
 import { metrics, type GaugeSample } from "./metrics.js";
@@ -40,6 +40,7 @@ import type { ReviewFindingStore } from "./workflow.js";
 import {
   classifyConvergence,
   isBlocking,
+  isBlockingAfterConvergence,
   isOffloadable,
   parseAnchorableLines,
   parseStructuredReview,
@@ -1586,8 +1587,19 @@ export class PrBot {
     const baseSha = prior.find((finding) => finding.lastSeenHead && finding.lastSeenHead !== context.headSha)?.lastSeenHead ?? "";
     const changedFiles = await changedFilesBetween(octokit, repo, baseSha, context.headSha);
 
-    const structuredPrompt = this.structuredReviewPrompt(context, trigger, prior);
-    let parsed = parseStructuredReview(await this.gemini.reviewStructured(structuredPrompt));
+    // Second-opinion escalation: if the review is oscillating (a prior finding
+    // persists while its file did not change — the model re-litigating unchanged
+    // code), route this round to a different model to break the loop.
+    const tiebreaker = this.tiebreakerProviderFor(prior, changedFiles);
+    if (tiebreaker) {
+      this.logger.info(
+        { repo: repo.fullName, prNumber, headSha: context.headSha, provider: tiebreaker },
+        "review oscillation detected; escalating to second-opinion provider",
+      );
+    }
+
+    const structuredPrompt = this.structuredReviewPrompt(context, trigger, prior, changedFiles);
+    let parsed = parseStructuredReview(await this.gemini.reviewStructured(structuredPrompt, tiebreaker));
     if (!parsed) {
       // Providers occasionally wrap the JSON in prose despite the schema/JSON-mode
       // request. Retry once before degrading to the free-form review (which loses
@@ -1596,7 +1608,7 @@ export class PrBot {
         { repo: repo.fullName, prNumber, headSha: context.headSha },
         "structured review JSON parse failed; retrying once",
       );
-      parsed = parseStructuredReview(await this.gemini.reviewStructured(structuredPrompt));
+      parsed = parseStructuredReview(await this.gemini.reviewStructured(structuredPrompt, tiebreaker));
     }
     if (!parsed) {
       return false;
@@ -1650,7 +1662,7 @@ export class PrBot {
       }
     }
 
-    const blockingCount = classified.filter((finding) => isBlocking(finding, this.config.blockOnMedium)).length;
+    const blockingCount = classified.filter((finding) => isBlockingAfterConvergence(finding, this.config.blockOnMedium)).length;
     const summary = this.buildStructuredSummary({
       headSha: context.headSha,
       classified,
@@ -1659,6 +1671,7 @@ export class PrBot {
       blockingCount,
       acceptanceCriteria: parsed.acceptanceCriteria,
       anchors,
+      tiebreakerProvider: tiebreaker,
     });
 
     const event: ReviewSubmitEvent = blockingCount > 0 ? "REQUEST_CHANGES" : "COMMENT";
@@ -1682,7 +1695,7 @@ export class PrBot {
     }
 
     const remainingNonBlocking = classified.filter(
-      (f) => !isBlocking(f, this.config.blockOnMedium) && !offloaded.some((e) => e.finding.fingerprint === f.fingerprint),
+      (f) => !isBlockingAfterConvergence(f, this.config.blockOnMedium) && !offloaded.some((e) => e.finding.fingerprint === f.fingerprint),
     );
     const noBlockingReason =
       remainingNonBlocking.length > 0 || offloaded.length > 0
@@ -1741,20 +1754,59 @@ export class PrBot {
     return true;
   }
 
+  // Returns the provider to hand this review to when oscillation is detected, or
+  // undefined for normal routing. Oscillation = a prior OPEN finding whose file
+  // was NOT changed since it was raised (the model keeps barking at unchanged
+  // code). Fires from the 2nd round onward. Skipped when the tiebreaker provider
+  // is unavailable (cooldown/no credential) so we never block the review.
+  private tiebreakerProviderFor(
+    prior: StoredFinding[],
+    changedFiles: Set<string>,
+  ): AiReviewProviderName | undefined {
+    if (!this.config.aiReviewTiebreakerEnabled) {
+      return undefined;
+    }
+    const oscillating = prior.some(
+      (finding) => finding.status === "open" && finding.file && !changedFiles.has(finding.file),
+    );
+    if (!oscillating) {
+      return undefined;
+    }
+    const provider = this.config.aiReviewTiebreakerProvider;
+    return this.gemini.canUseProvider(provider) ? provider : undefined;
+  }
+
   private structuredReviewPrompt(
     context: PullRequestContext,
     trigger: ReviewTrigger,
     prior: StoredFinding[],
+    changedFiles: Set<string>,
   ): string {
     const priorList = prior.length
       ? prior
-          .map((finding) => `- [${finding.severity}] ${finding.file ? `${finding.file}: ` : ""}${finding.title}`)
+          .map((finding) => {
+            const fileUnchanged = Boolean(finding.file) && !changedFiles.has(finding.file!);
+            const carried =
+              Boolean(finding.firstSeenHead) &&
+              Boolean(finding.lastSeenHead) &&
+              finding.firstSeenHead !== finding.lastSeenHead;
+            const tags = [
+              fileUnchanged ? "file UNCHANGED since it was raised" : null,
+              carried ? "already repeated across rounds" : null,
+            ].filter(Boolean);
+            const suffix = tags.length ? ` [${tags.join("; ")}]` : "";
+            return `- [${finding.severity}] ${finding.file ? `${finding.file}: ` : ""}${finding.title}${suffix}`;
+          })
           .join("\n")
       : "(없음)";
     return [
       "Review this pull request and return findings as a single JSON object per the schema.",
       "",
-      "Previously open Seori findings — for each, judge against the CURRENT diff. If it is now fixed, simply omit it. If it still applies, include it again with the same title wording.",
+      "Previously open Seori findings — for each, judge against the CURRENT diff and the PR conversation. If it is now fixed, simply omit it. If it still genuinely applies, include it again with the same title wording.",
+      "Re-evaluation rules (to converge instead of oscillating):",
+      "- If a finding is tagged 'file UNCHANGED since it was raised', its code did not change — do NOT re-raise it unless you can quote fresh diff evidence proving it is still a real defect. If a maintainer/author comment in the conversation rebuts it with a specific file:line, DROP it; do not restate it verbatim.",
+      "- Never manufacture a reworded or relocated variant of a finding that was already addressed or rebutted.",
+      "- A finding tagged 'already repeated across rounds' that you cannot newly ground in the current diff should be omitted, not repeated.",
       priorList,
       "",
       `Trigger: ${trigger.source}`,
@@ -1951,15 +2003,21 @@ export class PrBot {
     blockingCount: number;
     acceptanceCriteria: string[];
     anchors: Map<string, Set<number>>;
+    tiebreakerProvider?: AiReviewProviderName;
   }): string {
     const offloadedFingerprints = new Set(data.offloaded.map((entry) => entry.finding.fingerprint));
     const newCount = data.classified.filter((f) => f.convergence === "new" && !offloadedFingerprints.has(f.fingerprint)).length;
     const regressionCount = data.classified.filter((f) => f.convergence === "regression").length;
     const carriedCount = data.classified.filter((f) => f.convergence === "carried").length;
 
-    const blocking = data.classified.filter((f) => isBlocking(f, this.config.blockOnMedium));
+    const blocking = data.classified.filter((f) => isBlockingAfterConvergence(f, this.config.blockOnMedium));
+    const stalled = data.classified.filter((f) => f.stalled && isBlocking(f, this.config.blockOnMedium));
+    const stalledFingerprints = new Set(stalled.map((f) => f.fingerprint));
     const nonBlockingInline = data.classified.filter(
-      (f) => !isBlocking(f, this.config.blockOnMedium) && !offloadedFingerprints.has(f.fingerprint),
+      (f) =>
+        !isBlockingAfterConvergence(f, this.config.blockOnMedium) &&
+        !offloadedFingerprints.has(f.fingerprint) &&
+        !stalledFingerprints.has(f.fingerprint),
     );
 
     const anchorNote = (f: ClassifiedFinding): string =>
@@ -1983,6 +2041,13 @@ export class PrBot {
       data.blockingCount === 0 ? "→ 반드시 수정할 항목이 없어 수렴했습니다." : "→ 위 항목을 해결하면 수렴합니다.",
     ];
 
+    if (data.tiebreakerProvider) {
+      lines.push(
+        "",
+        `> ♻️ 리뷰가 여러 라운드 수렴하지 못해 이번 판단은 2차 의견 모델(**${data.tiebreakerProvider}**)로 재검토했습니다.`,
+      );
+    }
+
     if (data.acceptanceCriteria.length > 0) {
       lines.push("", "### 인수조건");
       for (const criterion of data.acceptanceCriteria) {
@@ -2001,6 +2066,17 @@ export class PrBot {
       lines.push("", "### 비차단 지적 (Medium/Low)");
       for (const finding of nonBlockingInline) {
         lines.push(`- [${SEVERITY_LABEL[finding.severity]}] ${this.findingLocation(finding)} ${finding.title} — ${anchorNote(finding)}`);
+      }
+    }
+
+    if (stalled.length > 0) {
+      lines.push(
+        "",
+        "### 수렴 조정 (반복 지적 → 비차단 전환)",
+        "여러 라운드 반복됐지만 해당 파일이 이후 변경되지 않아 병합을 무한 차단하지 않도록 비차단 처리했습니다. 오탐일 수 있으니 근거를 재확인하고, 실제 결함이면 코드를 수정하세요.",
+      );
+      for (const finding of stalled) {
+        lines.push(`- [${SEVERITY_LABEL[finding.severity]}] ${this.findingLocation(finding)} ${finding.title}`);
       }
     }
 

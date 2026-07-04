@@ -192,11 +192,14 @@ async function selectContextFiles(input: DeepRepoContextInput, checkoutDir: stri
     selected.add(file);
   }
 
+  const godotAutoloads = await readGodotAutoloads(checkoutDir);
   for (const file of [...selected]) {
     if (file.startsWith(".github/workflows/")) {
       await addWorkflowContextFiles(selected, checkoutDir, file);
     }
-    if (isSourcePath(file)) {
+    if (isGodotScriptPath(file)) {
+      await addGodotReferenceFiles(selected, checkoutDir, file, godotAutoloads);
+    } else if (isSourcePath(file)) {
       await addRelativeImportFiles(selected, checkoutDir, file);
     }
   }
@@ -269,6 +272,77 @@ async function addRelativeImportFiles(
       selected.add(resolved);
     }
   }
+}
+
+// GDScript pulls related files differently from JS/TS: `preload`/`load` with a
+// res:// path, and autoload singletons referenced by their global class name (a
+// heavy source of review false positives when the callee body is a different,
+// unchanged file — e.g. DailyMissionSystem.progress()).
+async function addGodotReferenceFiles(
+  selected: Set<string>,
+  checkoutDir: string,
+  sourcePath: string,
+  autoloads: Map<string, string>,
+): Promise<void> {
+  const content = await readTextFile(path.join(checkoutDir, sourcePath), 200_000);
+  if (!content) {
+    return;
+  }
+
+  for (const match of content.matchAll(/\b(?:preload|load)\s*\(\s*["']res:\/\/([^"']+)["']/g)) {
+    const resolved = normalizeRepoPath(match[1] || "");
+    if (resolved && (await isReadableContextFile(checkoutDir, resolved))) {
+      selected.add(resolved);
+    }
+  }
+
+  for (const [name, autoloadPath] of autoloads) {
+    if (autoloadPath === sourcePath) {
+      continue;
+    }
+    if (referencesGodotIdentifier(content, name) && (await isReadableContextFile(checkoutDir, autoloadPath))) {
+      selected.add(autoloadPath);
+    }
+  }
+}
+
+// Parse the [autoload] section of project.godot into a name -> res-relative path
+// map. Entries look like: DailyMissionSystem="*res://scripts/systems/daily_mission_system.gd".
+async function readGodotAutoloads(checkoutDir: string): Promise<Map<string, string>> {
+  const autoloads = new Map<string, string>();
+  const content = await readTextFile(path.join(checkoutDir, "project.godot"), 200_000);
+  if (!content) {
+    return autoloads;
+  }
+
+  let inAutoloadSection = false;
+  for (const rawLine of content.split("\n")) {
+    const line = rawLine.trim();
+    if (line.startsWith("[") && line.endsWith("]")) {
+      inAutoloadSection = line === "[autoload]";
+      continue;
+    }
+    if (!inAutoloadSection) {
+      continue;
+    }
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"\*?res:\/\/([^"]+)"/);
+    if (match?.[1] && match[2]) {
+      const resolved = normalizeRepoPath(match[2]);
+      if (resolved.endsWith(".gd")) {
+        autoloads.set(match[1], resolved);
+      }
+    }
+  }
+
+  return autoloads;
+}
+
+function referencesGodotIdentifier(content: string, name: string): boolean {
+  return new RegExp(`\\b${escapeRegExp(name)}\\b`).test(content);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function resolveImportPath(checkoutDir: string, specifierPath: string): Promise<string | null> {
@@ -367,7 +441,11 @@ function isConfigPath(filename: string): boolean {
 }
 
 function isSourcePath(filename: string): boolean {
-  return [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"].includes(pathExtension(filename));
+  return [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".gd"].includes(pathExtension(filename));
+}
+
+function isGodotScriptPath(filename: string): boolean {
+  return pathExtension(filename) === ".gd";
 }
 
 function isLikelyTextPath(filename: string): boolean {
@@ -404,6 +482,13 @@ function codeFenceLanguage(filename: string): string {
       return "javascript";
     case ".css":
       return "css";
+    case ".cs":
+      return "csharp";
+    case ".gd":
+      return "gdscript";
+    case ".gdshader":
+    case ".shader":
+      return "glsl";
     case ".html":
       return "html";
     case ".json":
@@ -412,6 +497,8 @@ function codeFenceLanguage(filename: string): string {
       return "jsx";
     case ".md":
       return "markdown";
+    case ".py":
+      return "python";
     case ".sh":
       return "bash";
     case ".ts":
@@ -425,6 +512,11 @@ function codeFenceLanguage(filename: string): string {
     case ".yaml":
     case ".yml":
       return "yaml";
+    case ".cfg":
+    case ".godot":
+    case ".tres":
+    case ".tscn":
+      return "ini";
     default:
       return "";
   }

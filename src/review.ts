@@ -50,6 +50,10 @@ export type ConvergenceKind = "new" | "regression" | "carried";
 
 export type ClassifiedFinding = Finding & {
   convergence: ConvergenceKind;
+  // A blocking finding that keeps recurring across rounds while its target file
+  // has NOT changed since — the oscillation signal. Downgraded to non-blocking so
+  // the review can converge instead of blocking the merge indefinitely.
+  stalled: boolean;
 };
 
 // Mirrors a row of gemini_pr_bot_review_findings.
@@ -245,11 +249,20 @@ export function classifyConvergence(
   const currentByFingerprint = new Map(current.map((finding) => [finding.fingerprint, finding]));
 
   const classified: ClassifiedFinding[] = current.map((finding) => {
-    if (priorByFingerprint.has(finding.fingerprint)) {
-      return { ...finding, convergence: "carried" };
+    const priorMatch = priorByFingerprint.get(finding.fingerprint);
+    if (priorMatch) {
+      // Oscillation guard: the finding keeps recurring, its file did NOT change
+      // this round, and it was already carried across at least two prior heads
+      // (firstSeenHead !== lastSeenHead). Treat as stalled so it stops blocking.
+      const fileUnchanged = !(finding.file && changedFiles.has(finding.file));
+      const carriedMultipleRounds =
+        Boolean(priorMatch.firstSeenHead) &&
+        Boolean(priorMatch.lastSeenHead) &&
+        priorMatch.firstSeenHead !== priorMatch.lastSeenHead;
+      return { ...finding, convergence: "carried", stalled: fileUnchanged && carriedMultipleRounds };
     }
     const isRegression = Boolean(finding.file && changedFiles.has(finding.file));
-    return { ...finding, convergence: isRegression ? "regression" : "new" };
+    return { ...finding, convergence: isRegression ? "regression" : "new", stalled: false };
   });
 
   // A prior open finding is considered resolved only when it disappeared AND its
@@ -276,6 +289,12 @@ export function isBlocking(finding: Finding, blockOnMedium: boolean): boolean {
     return true;
   }
   return blockOnMedium && finding.severity === "medium";
+}
+
+// Blocking after applying the convergence circuit-breaker: a stalled finding
+// (recurring across rounds on an unchanged file) no longer blocks the merge.
+export function isBlockingAfterConvergence(finding: ClassifiedFinding, blockOnMedium: boolean): boolean {
+  return !finding.stalled && isBlocking(finding, blockOnMedium);
 }
 
 // Right-side (new file) line numbers that exist in the unified diff and can anchor

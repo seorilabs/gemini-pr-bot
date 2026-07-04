@@ -433,23 +433,39 @@ async function buildChangedFileContentSection(
     }
 
     const size = Number(data.size || 0);
+    const encoded = typeof data.content === "string" ? data.content : "";
+    const content = encoded ? Buffer.from(encoded.replace(/\n/g, ""), "base64").toString("utf8") : "";
+    const header = `status=${file.status} additions=${file.additions} deletions=${file.deletions} current_head_size=${size}`;
+
     if (size > MAX_CHANGED_FILE_CONTENT_CHARS) {
+      // Too large to inline in full. For source files, emit a symbol outline plus
+      // windows around the changed hunks so the reviewer can see that guards/filters
+      // living in sibling functions exist, instead of falsely reporting their absence.
+      const digest =
+        content && !looksBinary(content) ? buildLargeFileDigest(content, file.patch) : null;
+      if (digest) {
+        return [
+          `### ${filename}`,
+          `${header} (full body omitted >${MAX_CHANGED_FILE_CONTENT_CHARS} chars; showing symbol outline + changed-region windows)`,
+          `\`\`\`\`${codeFenceLanguage(filename)}`,
+          digest,
+          "````",
+        ].join("\n");
+      }
       return [
         `### ${filename}`,
-        `status=${file.status} current_head_size=${size}`,
+        header,
         `current HEAD content omitted because it exceeds ${MAX_CHANGED_FILE_CONTENT_CHARS} characters`,
       ].join("\n");
     }
 
-    const encoded = typeof data.content === "string" ? data.content : "";
-    const content = Buffer.from(encoded.replace(/\n/g, ""), "base64").toString("utf8");
     if (!content || looksBinary(content)) {
       return null;
     }
 
     return [
       `### ${filename}`,
-      `status=${file.status} additions=${file.additions} deletions=${file.deletions} current_head_size=${size}`,
+      header,
       `\`\`\`\`${codeFenceLanguage(filename)}`,
       content.trimEnd(),
       "````",
@@ -461,6 +477,126 @@ async function buildChangedFileContentSection(
       `current HEAD content unavailable: ${truncate(errorMessage(error), 300)}`,
     ].join("\n");
   }
+}
+
+// High-signal declaration lines (functions, classes, signals, enums) across the
+// languages we review. Used to give the reviewer a map of a large file's symbols
+// so it does not claim a guard/filter is "missing" when it merely lives in a
+// sibling function outside the diff hunk.
+const DECLARATION_PATTERN =
+  /^\s*(?:@\w+\s+)?(?:static\s+)?func\s+\w+|^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+\w+|^\s*(?:export\s+)?(?:public\s+|private\s+|protected\s+|abstract\s+|static\s+)*class\s+\w+|^\s*class_name\s+\w+|^\s*signal\s+\w+|^\s*enum\s+\w+|^\s*def\s+\w+|^\s*(?:export\s+)?(?:interface|type)\s+\w+/;
+
+const LARGE_FILE_DIGEST_BUDGET = 12_000;
+const LARGE_FILE_WINDOW_RADIUS = 18;
+
+// For an oversized changed file, produce a compact digest: a symbol outline plus
+// the changed-region windows (with line numbers) so cross-symbol reasoning stays
+// grounded without inlining the whole body.
+function buildLargeFileDigest(content: string, patch: string | null | undefined): string | null {
+  const lines = content.split("\n");
+  if (lines.length === 0) {
+    return null;
+  }
+
+  const outline: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (DECLARATION_PATTERN.test(lines[i]!)) {
+      outline.push(`L${i + 1}: ${lines[i]!.trim()}`);
+    }
+  }
+
+  const windows = renderChangedWindows(lines, changedNewLines(patch));
+
+  const sections: string[] = [];
+  let budget = LARGE_FILE_DIGEST_BUDGET;
+  if (outline.length > 0) {
+    const outlineText = clampLines(outline, budget - 200);
+    sections.push(`# symbol outline (line: declaration)\n${outlineText}`);
+    budget -= outlineText.length;
+  }
+  if (windows && budget > 200) {
+    const windowText = windows.length > budget ? `${windows.slice(0, budget)}\n...changed-region windows truncated...` : windows;
+    sections.push(`# changed-region windows (line: source)\n${windowText}`);
+  }
+
+  return sections.length > 0 ? sections.join("\n\n") : null;
+}
+
+function clampLines(items: string[], budget: number): string {
+  const out: string[] = [];
+  let used = 0;
+  for (const item of items) {
+    if (used + item.length + 1 > budget) {
+      out.push(`...${items.length - out.length} more declarations omitted...`);
+      break;
+    }
+    out.push(item);
+    used += item.length + 1;
+  }
+  return out.join("\n");
+}
+
+// New-file line numbers that were added in the patch (used to center windows).
+function changedNewLines(patch: string | null | undefined): number[] {
+  const changed: number[] = [];
+  if (!patch) {
+    return changed;
+  }
+
+  let newLine = 0;
+  let inHunk = false;
+  for (const row of patch.split("\n")) {
+    const header = row.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (header) {
+      newLine = Number(header[1]);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) {
+      continue;
+    }
+    if (row.startsWith("+")) {
+      changed.push(newLine);
+      newLine += 1;
+    } else if (row.startsWith(" ")) {
+      newLine += 1;
+    } else if (row.startsWith("-") || row.startsWith("\\")) {
+      // removed / "no newline" lines do not advance the new-file counter
+    } else {
+      inHunk = false;
+    }
+  }
+
+  return changed;
+}
+
+function renderChangedWindows(lines: string[], changed: number[]): string | null {
+  if (changed.length === 0) {
+    return null;
+  }
+
+  const ranges: Array<[number, number]> = [];
+  for (const lineNumber of changed) {
+    const start = Math.max(1, lineNumber - LARGE_FILE_WINDOW_RADIUS);
+    const end = Math.min(lines.length, lineNumber + LARGE_FILE_WINDOW_RADIUS);
+    const last = ranges[ranges.length - 1];
+    if (last && start <= last[1] + 1) {
+      last[1] = Math.max(last[1], end);
+    } else {
+      ranges.push([start, end]);
+    }
+  }
+
+  const blocks: string[] = [];
+  for (const [start, end] of ranges) {
+    const rows: string[] = [];
+    for (let line = start; line <= end; line += 1) {
+      rows.push(`L${line}: ${lines[line - 1] ?? ""}`);
+    }
+    blocks.push(rows.join("\n"));
+  }
+
+  return blocks.join("\n  ...\n");
 }
 
 function isLikelyBinaryPath(path: string): boolean {
@@ -499,6 +635,13 @@ function codeFenceLanguage(path: string): string {
       return "javascript";
     case ".css":
       return "css";
+    case ".cs":
+      return "csharp";
+    case ".gd":
+      return "gdscript";
+    case ".gdshader":
+    case ".shader":
+      return "glsl";
     case ".html":
       return "html";
     case ".json":
@@ -509,6 +652,8 @@ function codeFenceLanguage(path: string): string {
       return "jsx";
     case ".md":
       return "markdown";
+    case ".py":
+      return "python";
     case ".sh":
       return "bash";
     case ".ts":
@@ -522,6 +667,11 @@ function codeFenceLanguage(path: string): string {
     case ".yaml":
     case ".yml":
       return "yaml";
+    case ".cfg":
+    case ".godot":
+    case ".tres":
+    case ".tscn":
+      return "ini";
     default:
       return "";
   }

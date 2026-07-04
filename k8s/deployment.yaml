@@ -101,11 +101,15 @@ spec:
             - name: AI_REVIEW_PROVIDERS
               value: minimax,copilot
             - name: AI_REVIEW_PROVIDER_WEIGHTS
-              value: minimax:100,copilot:0
+              value: minimax:100,copilot:10
             - name: AI_REVIEW_PROVIDER_FALLBACK_ORDER
               value: minimax,copilot
             - name: AI_REVIEW_PROVIDER_COOLDOWN_MS
               value: "300000"
+            - name: AI_REVIEW_TIEBREAKER_ENABLED
+              value: "true"
+            - name: AI_REVIEW_TIEBREAKER_PROVIDER
+              value: copilot
             - name: COPILOT_CLI_COMMAND
               value: /app/node_modules/.bin/copilot
             - name: COPILOT_CLI_TIMEOUT_MS
