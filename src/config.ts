@@ -298,7 +298,7 @@ export function loadConfig(): Config {
     staleReviewMaxPrsPerScan: optionalInt("STALE_REVIEW_MAX_PRS_PER_SCAN", 100),
     staleReviewIgnoredRepositories: optionalRepositorySet("STALE_REVIEW_IGNORED_REPOSITORIES", []),
     natsServerUrl: process.env.NATS_SERVER_URL?.trim() || "nats://localhost:4222",
-    approvalTelegramBot: process.env.APPROVAL_TELEGRAM_BOT?.trim() || "seolee_bot",
+    approvalTelegramBot: process.env.APPROVAL_TELEGRAM_BOT?.trim() || "seori_review_bot",
     approvalTelegramChannel: process.env.APPROVAL_TELEGRAM_CHANNEL?.trim() || "syous",
     deliveryTtlMs: optionalInt("DELIVERY_TTL_MS", 60 * 60 * 1000),
     shutdownGraceMs: optionalInt("SHUTDOWN_GRACE_MS", 25_000),

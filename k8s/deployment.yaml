@@ -175,7 +175,7 @@ spec:
             - name: NATS_SERVER_URL
               value: nats://nats.data.svc.cluster.local:4222
             - name: APPROVAL_TELEGRAM_BOT
-              value: seolee_bot
+              value: seori_review_bot
             - name: APPROVAL_TELEGRAM_CHANNEL
               value: syous
             - name: LOG_LEVEL
