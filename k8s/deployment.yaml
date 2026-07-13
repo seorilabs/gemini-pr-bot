@@ -99,15 +99,15 @@ spec:
             - name: MINIMAX_TIMEOUT_MS
               value: "180000"
             - name: AI_REVIEW_PROVIDERS
-              value: minimax,copilot
+              value: minimax
             - name: AI_REVIEW_PROVIDER_WEIGHTS
-              value: minimax:100,copilot:10
+              value: minimax:100
             - name: AI_REVIEW_PROVIDER_FALLBACK_ORDER
-              value: minimax,copilot
+              value: minimax
             - name: AI_REVIEW_PROVIDER_COOLDOWN_MS
               value: "300000"
             - name: AI_REVIEW_TIEBREAKER_ENABLED
-              value: "true"
+              value: "false"
             - name: AI_REVIEW_TIEBREAKER_PROVIDER
               value: copilot
             - name: COPILOT_CLI_COMMAND
