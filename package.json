@@ -6,7 +6,8 @@
   "description": "GitHub App webhook daemon for Seorilabs PR reviews and PR comment replies.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test src/review-gate.test.ts src/review-grounding.test.ts src/repo-context.test.ts src/github-context.test.ts",
+    "check": "npm run test && tsc --noEmit -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"
   },

@@ -1,5 +1,5 @@
 import type { Config } from "./config.js";
-import { buildDeepRepoContext } from "./repo-context.js";
+import { buildDeepRepoContext, classifyChange, type ChangeClass } from "./repo-context.js";
 import { githubCommentBody, truncate } from "./text.js";
 import { bodyIncludesBotStatusMarker } from "./identity.js";
 
@@ -12,6 +12,8 @@ const LEGACY_REVIEW_CHECK_NAME = "Gemini PR Bot";
 const FAILING_CHECK_CONCLUSIONS = new Set(["action_required", "cancelled", "failure", "timed_out"]);
 const MAX_CHANGED_FILE_CONTENT_CHARS = 20_000;
 const MAX_CHANGED_FILE_CONTENT_CONTEXT_CHARS = 50_000;
+const MAX_REVIEW_GATE_PATCH_CHARS = 60_000;
+const MAX_REVIEW_GATE_CHANGED_CONTENT_CHARS = 15_000;
 const BINARY_FILE_EXTENSIONS = new Set([
   ".7z",
   ".avif",
@@ -75,11 +77,20 @@ export type PullRequestStatus = {
 
 export type PullRequestContext = PullRequestStatus & {
   markdown: string;
+  reviewGateMarkdown: string;
+  acceptanceSourceText: string;
+  testInventoryComplete: boolean;
+  currentHeadFileContents: Readonly<Record<string, string>>;
+  visibleChangedPatches: Readonly<Record<string, string>>;
+  changeClass: ChangeClass;
+  minimumAcceptanceCriteria: number;
+  explicitAcceptanceCriteria: readonly string[];
 };
 
 export type PullRequestContextOptions = {
   installationToken?: string;
   deepContextRequested?: boolean;
+  reviewGatePromptReserveChars?: number;
 };
 
 export type StatusCheckSummary = {
@@ -240,6 +251,7 @@ export async function buildPullRequestContext(
   ]);
 
   const fileSections: string[] = [];
+  const completeFilePatchSections: Array<{ filename: string; patch: string; section: string }> = [];
   let patchChars = 0;
   for (const file of files) {
     const patch = file.patch || "(binary file or patch unavailable)";
@@ -261,11 +273,12 @@ export async function buildPullRequestContext(
     }
 
     fileSections.push(section);
+    completeFilePatchSections.push({ filename: String(file.filename), patch, section });
     patchChars += section.length;
   }
 
   const changedFileContents = await buildChangedFileContents(octokit, repo, pr.head.sha, files);
-  const deepRepoContext = await buildDeepRepoContext({
+  const deepRepoContextResult = await buildDeepRepoContext({
     repo,
     prNumber,
     headSha: pr.head.sha,
@@ -274,6 +287,7 @@ export async function buildPullRequestContext(
     installationToken: options.installationToken,
     requested: options.deepContextRequested,
   });
+  const deepRepoContext = deepRepoContextResult.markdown;
 
   const recentIssueComments = issueComments
     .slice(-50)
@@ -298,6 +312,23 @@ export async function buildPullRequestContext(
     .join("\n");
 
   const conversationState = buildConversationState(pr.head.sha, issueComments, reviewComments, reviews);
+  const trustedAcceptanceSources = buildTrustedAcceptanceSourceText(
+    pr,
+    issueComments,
+    reviewComments,
+    reviews,
+    config,
+  );
+  const acceptanceSourceText = trustedAcceptanceSources.text;
+  const changeClass = classifyChange(files.map((file: any) => String(file.filename || "")));
+  const gateChangedFilePatches = truncate(
+    fileSections.join("\n\n") || "(none)",
+    Math.min(config.maxPatchChars, MAX_REVIEW_GATE_PATCH_CHARS),
+  );
+  const gateChangedFileContents = truncate(
+    changedFileContents || "(none)",
+    MAX_REVIEW_GATE_CHANGED_CONTENT_CHARS,
+  );
 
   const markdown = [
     "# Pull Request Context",
@@ -314,6 +345,8 @@ export async function buildPullRequestContext(
     `Draft: ${Boolean(pr.draft)}`,
     `Base: ${pr.base.repo?.full_name || repo.fullName}:${pr.base.ref}`,
     `Head: ${pr.head.repo?.full_name || repo.fullName}:${pr.head.ref}`,
+    `Change class: ${changeClass}`,
+    `Minimum explicit acceptance criteria: ${trustedAcceptanceSources.minimumCriteria}`,
     `Head SHA: ${pr.head.sha}`,
     `GitHub mergeable: ${pr.mergeable ?? "unknown"}`,
     `GitHub mergeable_state: ${pr.mergeable_state || "unknown"}`,
@@ -353,6 +386,59 @@ export async function buildPullRequestContext(
     fileSections.join("\n\n") || "(none)",
   ].join("\n");
 
+  // The conservative merge gate intentionally excludes prior bot reviews and
+  // bot-generated comments. Feeding Seori's own findings back into the next
+  // round anchored weaker models on earlier false positives and made them recur.
+  // Only explicit PR/maintainer acceptance sources plus current HEAD evidence
+  // are available in this reduced context.
+  const reviewGateMarkdown = [
+    "# Pull Request Merge Gate Context",
+    "",
+    `Repository: ${repo.fullName}`,
+    `Pull request: #${prNumber}`,
+    `Title: ${pr.title}`,
+    `Head SHA: ${pr.head.sha}`,
+    `Base: ${pr.base.repo?.full_name || repo.fullName}:${pr.base.ref}`,
+    `Head: ${pr.head.repo?.full_name || repo.fullName}:${pr.head.ref}`,
+    `Change class: ${changeClass}`,
+    `Minimum explicit acceptance criteria: ${trustedAcceptanceSources.minimumCriteria}`,
+    "",
+    "## Status Checks",
+    statusChecks.markdown,
+    "",
+    "## Trusted Acceptance Sources",
+    "Acceptance criteria and source_quote values may be derived ONLY from this section.",
+    acceptanceSourceText,
+    "",
+    "## Changed Files",
+    gateChangedFilePatches,
+    "",
+    "## Deep Repository Context",
+    "This is selected current-HEAD evidence, not necessarily the whole repository.",
+    deepRepoContext || "(none)",
+    "",
+    "## Current Changed File Contents",
+    "These are supplementary post-change HEAD contents; this section may be partial.",
+    gateChangedFileContents,
+  ].join("\n");
+  const reviewGateContextBudget = Math.max(
+    0,
+    config.maxContextChars - Math.max(0, options.reviewGatePromptReserveChars || 16_000),
+  );
+  const truncatedReviewGateMarkdown = truncate(reviewGateMarkdown, reviewGateContextBudget);
+  const deepContextFullyVisible =
+    !deepRepoContext || truncatedReviewGateMarkdown.includes(deepRepoContext);
+  const visibleCurrentHeadFileContents = Object.fromEntries(
+    Object.entries(deepRepoContextResult.fileContents).filter(([file, content]) =>
+      isDeepContextFileFullyVisible(truncatedReviewGateMarkdown, file, content),
+    ),
+  );
+  const visibleChangedPatches = Object.fromEntries(
+    completeFilePatchSections
+      .filter(({ section }) => truncatedReviewGateMarkdown.includes(section))
+      .map(({ filename, patch }) => [filename, patch]),
+  );
+
   return {
     state: String(pr.state || "unknown"),
     merged: Boolean(pr.merged),
@@ -367,7 +453,136 @@ export async function buildPullRequestContext(
     headRepoFullName: pr.head.repo?.full_name || repo.fullName,
     statusChecks,
     markdown: truncate(markdown, config.maxContextChars),
+    reviewGateMarkdown: truncatedReviewGateMarkdown,
+    acceptanceSourceText: truncate(acceptanceSourceText, config.maxContextChars),
+    testInventoryComplete: deepRepoContextResult.testInventoryComplete && deepContextFullyVisible,
+    currentHeadFileContents: visibleCurrentHeadFileContents,
+    visibleChangedPatches,
+    changeClass,
+    minimumAcceptanceCriteria: trustedAcceptanceSources.minimumCriteria,
+    explicitAcceptanceCriteria: trustedAcceptanceSources.criteria,
   };
+}
+
+function buildTrustedAcceptanceSourceText(
+  pr: any,
+  issueComments: any[],
+  reviewComments: any[],
+  reviews: any[],
+  config: Config,
+): { text: string; minimumCriteria: number; criteria: string[] } {
+  const trustedAssociations = config.trustedAssociations;
+  const isTrustedHuman = (entry: any): boolean => {
+    const login = String(entry.user?.login || "");
+    const type = String(entry.user?.type || "").toLowerCase();
+    const association = String(entry.author_association || "").toUpperCase();
+    return (
+      Boolean(login) &&
+      type !== "bot" &&
+      !login.toLowerCase().endsWith("[bot]") &&
+      trustedAssociations.has(association)
+    );
+  };
+
+  const trustedHumanEntries = [...issueComments, ...reviewComments, ...reviews]
+    .filter(isTrustedHuman)
+    .sort((left, right) => {
+      const leftAt = Date.parse(left.created_at || left.submitted_at || left.updated_at || "") || 0;
+      const rightAt = Date.parse(right.created_at || right.submitted_at || right.updated_at || "") || 0;
+      return leftAt - rightAt;
+    })
+    .slice(-30);
+  const trustedEntries = trustedHumanEntries
+    .map((entry) => {
+      const location = entry.path
+        ? ` on ${entry.path}:${entry.line ?? entry.original_line ?? "?"}`
+        : "";
+      return `- ${entry.user.login}${location}: ${truncate(String(entry.body || ""), 1500)}`;
+    });
+
+  const text = [
+    "### PR title",
+    String(pr.title || "(empty)"),
+    "",
+    "### PR body",
+    String(pr.body || "(empty)"),
+    "",
+    "### Trusted maintainer comments and reviews",
+    trustedEntries.join("\n") || "(none)",
+  ].join("\n");
+  const criteria = new Map<string, string>();
+  for (const source of [String(pr.body || ""), ...trustedHumanEntries.map((entry) => String(entry.body || ""))]) {
+    for (const criterion of listExplicitAcceptanceCriteria(source)) {
+      criteria.set(normalizedAcceptanceCriterion(criterion), criterion);
+    }
+  }
+  return { text, minimumCriteria: criteria.size, criteria: [...criteria.values()] };
+}
+
+export function countExplicitAcceptanceCriteria(value: string): number {
+  return new Set(listExplicitAcceptanceCriteria(value).map(normalizedAcceptanceCriterion)).size;
+}
+
+export function listExplicitAcceptanceCriteria(value: string): string[] {
+  const criteria: string[] = [];
+  let inAcceptanceSection = false;
+  for (const rawLine of value.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    const heading = line.match(/^#{1,6}\s+(.+)$/u);
+    if (heading) {
+      inAcceptanceSection = /(?:acceptance\s+criteria|requirements?|definition\s+of\s+done|인수\s*조건|완료\s*조건|검증\s*조건|요구\s*사항|요건)/iu.test(
+        heading[1] || "",
+      );
+      continue;
+    }
+
+    const checkbox = line.match(/^[-*+]\s+\[[ xX]\]\s+(.+)$/u);
+    const numberedCriterion = line.match(/^(?:AC[-\s]?\d+|인수\s*조건\s*\d+)\s*[:.)-]\s*(.+)$/iu);
+    const sectionItem = inAcceptanceSection
+      ? line.match(/^(?:[-*+]\s+|\d+[.)]\s+)(.+)$/u)
+      : null;
+    const text = checkbox?.[1] || numberedCriterion?.[1] || sectionItem?.[1];
+    if (text) {
+      criteria.push(text.normalize("NFKC").replace(/\s+/gu, " ").trim());
+      continue;
+    }
+
+    // Preserve a wrapped constraint under the preceding checklist/section item.
+    // Dropping lines such as "단, 사용자별로 분리한다" lets the model pass on
+    // only the first half of an explicitly stated acceptance criterion.
+    if (
+      criteria.length > 0 &&
+      line.length > 0 &&
+      /^(?: {2,}|\t)\S/u.test(rawLine) &&
+      !/^\s*(?:[-*+]\s+|\d+[.)]\s+)/u.test(rawLine)
+    ) {
+      criteria[criteria.length - 1] = `${criteria[criteria.length - 1]} ${line}`;
+    }
+  }
+  return criteria;
+}
+
+function normalizedAcceptanceCriterion(value: string): string {
+  return value.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase();
+}
+
+function isDeepContextFileFullyVisible(markdown: string, file: string, content: string): boolean {
+  const body = content.trimEnd();
+  if (!body) {
+    return false;
+  }
+  const header = `### ${file}\n`;
+  const sectionStart = markdown.indexOf(header);
+  if (sectionStart < 0) {
+    return false;
+  }
+  const bodyStart = markdown.indexOf(body, sectionStart + header.length);
+  if (bodyStart < 0) {
+    return false;
+  }
+  const sectionEnd = markdown.indexOf("\n````", bodyStart + body.length);
+  const nextSection = markdown.indexOf("\n\n### ", sectionStart + header.length);
+  return sectionEnd >= 0 && (nextSection < 0 || sectionEnd < nextSection);
 }
 
 async function buildChangedFileContents(

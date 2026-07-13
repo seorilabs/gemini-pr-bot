@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { AiReviewProviderName, Config } from "./config.js";
 import { CI_RECHECK_EVENT, STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
 import { GeminiClient, isAiProviderCooldownError } from "./gemini.js";
@@ -5,7 +6,7 @@ import { metrics, type GaugeSample } from "./metrics.js";
 import {
   approvePullRequest,
   buildPullRequestContext,
-  changedFilesBetween,
+  listExplicitAcceptanceCriteria,
   closePullRequest,
   commentAndCloseIssue,
   completeCheck,
@@ -38,20 +39,27 @@ import {
 } from "./github.js";
 import type { ReviewFindingStore } from "./workflow.js";
 import {
-  classifyConvergence,
   isBlocking,
   isBlockingAfterConvergence,
-  isOffloadable,
-  parseAnchorableLines,
-  parseStructuredReview,
   SEVERITY_LABEL,
   SEVERITY_ORDER,
-  toFindings,
   type ClassifiedFinding,
   type StoredFinding,
 } from "./review.js";
 import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./telegram.js";
 import { parseBotCommand, truncate } from "./text.js";
+import type { ReviewRunRecord } from "./review-run.js";
+import {
+  evaluateReviewGate,
+  type ReviewGateEvaluation,
+  type ReviewGateFatalBlocker,
+} from "./review-gate.js";
+import {
+  buildChangedLineEvidence,
+  isGroundedFatalBlocker,
+  isGroundedTestEvidence,
+  sameFatalBlockerSet,
+} from "./review-grounding.js";
 import {
   BOT_GITHUB_LOGIN,
   bodyIncludesBotActionMarker,
@@ -69,6 +77,8 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
+const REVIEW_GATE_PROMPT_VERSION = "conservative-merge-gate-v1";
+const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -151,13 +161,14 @@ export type WorkflowExecution = {
   findActiveReview?: (record: WorkflowTargetRecord) => Promise<ActiveReviewWorkflow | null>;
   enqueueSynthetic?: (eventName: string, dedupeKey: string, payload: any, delayMs?: number) => Promise<boolean>;
   reviewFindingStore?: ReviewFindingStore;
+  recordReviewRun?: (record: ReviewRunRecord) => Promise<void>;
 };
 
 type CiRecheckRequest = {
   checkRunId: number;
   prNumber: number;
   headSha: string;
-  mode: "review" | "agent";
+  mode: "review" | "review_gate" | "agent";
   sender: string;
   source: string;
   approvalReason: string;
@@ -724,7 +735,14 @@ export class PrBot {
         reason: request.approvalReason,
       },
     );
-    await completeCheck(octokit, repo, request.checkRunId, "success", "PR 승인 완료", request.approvalBody);
+    await completeCheck(
+      octokit,
+      repo,
+      request.checkRunId,
+      "success",
+      request.mode === "review_gate" ? "보수적 Gate 통과" : "PR 승인 완료",
+      request.approvalBody,
+    );
     await this.maybeSquashMergeApprovedPullRequest(
       octokit,
       repo,
@@ -835,8 +853,8 @@ export class PrBot {
       if (options.fastPathApproval) {
         reviewText = this.dependencyFastPathReviewText(options.fastPathApproval.reason);
       } else {
-        if (this.config.structuredReviewEnabled && workflow?.reviewFindingStore) {
-          const handled = await this.runStructuredReview(
+        if (this.config.structuredReviewEnabled) {
+          await this.runStructuredReview(
             octokit,
             repo,
             prNumber,
@@ -845,13 +863,7 @@ export class PrBot {
             check,
             workflow,
           );
-          if (handled) {
-            return;
-          }
-          this.logger.warn(
-            { repo: repo.fullName, prNumber, headSha: context.headSha },
-            "structured review unavailable; falling back to free-form review",
-          );
+          return;
         }
 
         reviewText = await this.createReviewTextFromContext(context, trigger);
@@ -1265,7 +1277,7 @@ export class PrBot {
     check: ActiveCheckRun | null,
     workflow: WorkflowExecution | undefined,
     approval: {
-      mode: "review" | "agent";
+      mode: "review" | "review_gate" | "agent";
       sender: string;
       source: string;
       reason: string;
@@ -1383,7 +1395,7 @@ export class PrBot {
     const headSha = String(raw.head_sha ?? raw.headSha ?? "");
     const startedAt = String(raw.started_at ?? raw.startedAt ?? new Date().toISOString());
     const attempt = Number(raw.attempt ?? 1);
-    const mode = raw.mode === "agent" ? "agent" : "review";
+    const mode = raw.mode === "agent" ? "agent" : raw.mode === "review_gate" ? "review_gate" : "review";
 
     if (!Number.isFinite(checkRunId) || !Number.isFinite(prNumber) || !headSha) {
       return null;
@@ -1568,10 +1580,8 @@ export class PrBot {
     return this.gemini.review(prompt);
   }
 
-  // Human-like review: one batched review with inline draft comments anchored to the
-  // problem lines, a Start-Review summary that tracks convergence across turns, and
-  // refactor/future-improvement Medium/Low offloaded to linked GitHub issues.
-  // Returns true when it fully handled the turn, false to fall back to free-form review.
+  // Conservative merge gate. The model extracts evidence; strict parsing,
+  // grounding and the final PASS/FAIL/ABSTAIN decision remain host-controlled.
   private async runStructuredReview(
     octokit: Octokit,
     repo: RepoRef,
@@ -1579,141 +1589,140 @@ export class PrBot {
     context: PullRequestContext,
     trigger: ReviewTrigger,
     check: ActiveCheckRun | null,
-    workflow: WorkflowExecution,
-  ): Promise<boolean> {
-    const store = workflow.reviewFindingStore!;
-    const prior = await store.listOpenReviewFindings(repo.fullName, prNumber);
-    const priorByFingerprint = new Map(prior.map((finding) => [finding.fingerprint, finding]));
-    const baseSha = prior.find((finding) => finding.lastSeenHead && finding.lastSeenHead !== context.headSha)?.lastSeenHead ?? "";
-    const changedFiles = await changedFilesBetween(octokit, repo, baseSha, context.headSha);
+    workflow?: WorkflowExecution,
+  ): Promise<void> {
+    const prompt = this.structuredReviewPrompt(context, trigger);
+    const aiResult = await this.gemini.reviewStructuredWithMetadata(prompt);
+    const changedLines = buildChangedLineEvidence(context.visibleChangedPatches);
+    const trustedRequest = this.trustedReviewRequest(trigger);
+    const trustedAcceptanceText = [context.acceptanceSourceText, trustedRequest]
+      .filter(Boolean)
+      .join("\n");
+    const testInventoryComplete = context.testInventoryComplete;
+    const explicitAcceptanceCriteria = this.uniqueAcceptanceCriteria([
+      ...context.explicitAcceptanceCriteria,
+      ...listExplicitAcceptanceCriteria(trustedRequest),
+    ]);
+    const evaluateOutput = (text: string): ReviewGateEvaluation =>
+      evaluateReviewGate(text, {
+        testInventoryComplete,
+        requiresAutomatedEvidence: ["product_logic", "mixed"].includes(context.changeClass),
+        minimumAcceptanceCriteria: explicitAcceptanceCriteria.length,
+        explicitAcceptanceCriteria,
+        requiresExplicitAcceptanceCriteria: true,
+        evidenceValidators: {
+          sourceQuote: (criterion) =>
+            criterion.sourceQuote.trim().length >= 4 &&
+            criterion.sourceQuote.trim().toLowerCase() !== "(empty)" &&
+            this.evidenceIncludes(trustedAcceptanceText, criterion.sourceQuote),
+          testEvidence: (criterion, evidence) => isGroundedTestEvidence(context, criterion, evidence),
+          fatalBlocker: (blocker) => isGroundedFatalBlocker(context, changedLines, blocker),
+        },
+      });
+    let evaluation = evaluateOutput(aiResult.text);
 
-    // Second-opinion escalation: if the review is oscillating (a prior finding
-    // persists while its file did not change — the model re-litigating unchanged
-    // code), route this round to a different model to break the loop.
-    const tiebreaker = this.tiebreakerProviderFor(prior, changedFiles);
-    if (tiebreaker) {
-      this.logger.info(
-        { repo: repo.fullName, prNumber, headSha: context.headSha, provider: tiebreaker },
-        "review oscillation detected; escalating to second-opinion provider",
-      );
+    if (evaluation.decision.verdict === "FAIL") {
+      const tiebreaker = this.config.aiReviewTiebreakerProvider;
+      const canConfirmFatal =
+        this.config.aiReviewTiebreakerEnabled &&
+        tiebreaker !== aiResult.provider &&
+        this.gemini.canUseProvider(tiebreaker);
+
+      if (!canConfirmFatal) {
+        evaluation = this.abstainReviewGate(
+          evaluation,
+          "치명 결함 후보를 독립된 2차 모델로 확인할 수 없어 수동 확인이 필요합니다.",
+        );
+      } else {
+        try {
+          const confirmationResult = await this.gemini.reviewStructuredWithMetadata(prompt, tiebreaker);
+          const confirmationEvaluation = evaluateOutput(confirmationResult.text);
+          await this.recordReviewGateRun(
+            workflow,
+            check,
+            repo,
+            prNumber,
+            context,
+            prompt,
+            confirmationResult,
+            confirmationEvaluation,
+          );
+          const independentlyConfirmed =
+            confirmationResult.provider === tiebreaker &&
+            confirmationResult.provider !== aiResult.provider &&
+            confirmationEvaluation.decision.verdict === "FAIL" &&
+            sameFatalBlockerSet(
+              evaluation.decision.fatalBlockers,
+              confirmationEvaluation.decision.fatalBlockers,
+            );
+          if (!independentlyConfirmed) {
+            evaluation = this.abstainReviewGate(
+              evaluation,
+              "독립된 2차 모델이 동일한 치명 결함 근거를 확인하지 않아 수동 확인으로 보류합니다.",
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            { error, repo: repo.fullName, prNumber, headSha: context.headSha, provider: tiebreaker },
+            "fatal review gate confirmation failed",
+          );
+          evaluation = this.abstainReviewGate(
+            evaluation,
+            "치명 결함 후보의 독립된 2차 검증에 실패해 수동 확인으로 보류합니다.",
+          );
+        }
+      }
     }
 
-    const structuredPrompt = this.structuredReviewPrompt(context, trigger, prior, changedFiles);
-    let parsed = parseStructuredReview(await this.gemini.reviewStructured(structuredPrompt, tiebreaker));
-    if (!parsed) {
-      // Providers occasionally wrap the JSON in prose despite the schema/JSON-mode
-      // request. Retry once before degrading to the free-form review (which loses
-      // convergence tracking and inline anchoring).
-      this.logger.warn(
-        { repo: repo.fullName, prNumber, headSha: context.headSha },
-        "structured review JSON parse failed; retrying once",
-      );
-      parsed = parseStructuredReview(await this.gemini.reviewStructured(structuredPrompt, tiebreaker));
-    }
-    if (!parsed) {
-      return false;
-    }
+    await this.recordReviewGateRun(workflow, check, repo, prNumber, context, prompt, aiResult, evaluation);
 
-    const findings = toFindings(parsed.findings);
-    const { classified, resolved } = classifyConvergence(findings, prior, changedFiles);
-
-    const anchors = await this.buildAnchorMap(octokit, repo, prNumber);
-
-    // Verify the head is still current before any side effects (issue creation,
-    // review submission). On a stale/closed head the helper completes the check.
     if (await this.cancelTrackedCheckIfShuttingDown(check, "리뷰 취소", "리뷰 결과를 게시하기 전에 봇이 중지되었습니다.")) {
-      return true;
+      return;
     }
     const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
     if (!latest) {
-      return true;
+      return;
+    }
+    if (this.hasMergeConflict(latest)) {
+      const conflictText = this.mergeConflictText(repo, prNumber, latest);
+      await requestChangesPullRequest(octokit, repo, prNumber, conflictText, latest.headSha);
+      await this.completeTrackedCheck(check, "action_required", "병합 충돌 해결 필요", conflictText);
+      return;
     }
 
-    const offloaded: OffloadedFinding[] = [];
-    const inlineComments: InlineReviewComment[] = [];
-    let labelEnsured = false;
-
-    for (const finding of classified) {
-      if (this.config.followupIssueEnabled && isOffloadable(finding)) {
-        const existingIssue = priorByFingerprint.get(finding.fingerprint)?.issueNumber ?? null;
-        if (existingIssue) {
-          offloaded.push({
-            finding,
-            issueNumber: existingIssue,
-            url: `https://github.com/${repo.fullName}/issues/${existingIssue}`,
-          });
-        } else {
-          if (!labelEnsured) {
-            await ensureLabelExists(octokit, repo, this.config.followupIssueLabel);
-            labelEnsured = true;
-          }
-          const created = await createFollowupIssue(octokit, repo, {
-            title: this.followupIssueTitle(finding),
-            body: this.followupIssueBody(repo, prNumber, finding),
-            labels: [this.config.followupIssueLabel],
-          });
-          offloaded.push({ finding, issueNumber: created.number, url: created.url });
-        }
-        continue;
-      }
-
-      if (finding.file && finding.line && anchors.get(finding.file)?.has(finding.line)) {
-        inlineComments.push({ path: finding.file, line: finding.line, body: this.inlineCommentBody(finding) });
-      }
+    const summary = this.buildReviewGateSummary(context.headSha, evaluation, testInventoryComplete);
+    if (evaluation.decision.verdict === "FAIL") {
+      const inlineComments: InlineReviewComment[] = evaluation.decision.fatalBlockers.map((blocker) => ({
+        path: blocker.file,
+        line: blocker.line,
+        body: this.fatalBlockerInlineBody(blocker),
+      }));
+      const reviewBody = this.actionRequiredText("review", context.headSha, summary);
+      await this.safeSubmitReview(
+        octokit,
+        repo,
+        prNumber,
+        context.headSha,
+        "REQUEST_CHANGES",
+        reviewBody,
+        inlineComments,
+      );
+      await this.completeTrackedCheck(check, "action_required", "보수적 Gate 실패", reviewBody);
+      return;
     }
 
-    const blockingCount = classified.filter((finding) => isBlockingAfterConvergence(finding, this.config.blockOnMedium)).length;
-    const summary = this.buildStructuredSummary({
-      headSha: context.headSha,
-      classified,
-      resolved,
-      offloaded,
-      blockingCount,
-      acceptanceCriteria: parsed.acceptanceCriteria,
-      anchors,
-      tiebreakerProvider: tiebreaker,
-    });
-
-    const event: ReviewSubmitEvent = blockingCount > 0 ? "REQUEST_CHANGES" : "COMMENT";
-    const reviewBody = blockingCount > 0 ? this.actionRequiredText("review", context.headSha, summary) : summary;
-    const shouldPostReview = blockingCount > 0 || inlineComments.length > 0 || classified.length > 0 || resolved.length > 0;
-    if (shouldPostReview) {
-      await this.safeSubmitReview(octokit, repo, prNumber, context.headSha, event, reviewBody, inlineComments);
+    if (evaluation.decision.verdict === "ABSTAIN") {
+      const holdBody = this.actionRequiredText("review", context.headSha, summary);
+      await postPrComment(octokit, repo, prNumber, holdBody);
+      await this.completeTrackedCheck(check, "action_required", "수동 확인 필요", holdBody);
+      return;
     }
-
-    await this.persistStructuredFindings(octokit, repo, prNumber, context.headSha, store, {
-      classified,
-      resolved,
-      offloaded,
-      priorByFingerprint,
-      hasInline: inlineComments.length > 0,
-    });
-
-    if (blockingCount > 0) {
-      await this.completeTrackedCheck(check, "action_required", "반드시 수정 필요", reviewBody);
-      return true;
-    }
-
-    const remainingNonBlocking = classified.filter(
-      (f) => !isBlockingAfterConvergence(f, this.config.blockOnMedium) && !offloaded.some((e) => e.finding.fingerprint === f.fingerprint),
-    );
-    const noBlockingReason =
-      remainingNonBlocking.length > 0 || offloaded.length > 0
-        ? `차단 결함(Critical/High) 없음 · 비차단 ${remainingNonBlocking.length}건/이관 ${offloaded.length}건은 후속 처리 권장`
-        : "차단 결함(Critical/High) 없이 깨끗하게 수렴";
-    const approvalSummary = this.buildApprovalSummary({
-      headSha: context.headSha,
-      classified,
-      resolved,
-      offloaded,
-      acceptanceCriteria: parsed.acceptanceCriteria,
-    });
 
     if (this.hasFailingStatusChecks(latest)) {
       const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
       await postPrComment(octokit, repo, prNumber, blockerText);
       await this.completeTrackedCheck(check, "action_required", "상태 체크 확인 필요", blockerText);
-      return true;
+      return;
     }
 
     if (this.shouldDeferApprovalForCi(trigger, latest)) {
@@ -1725,15 +1734,15 @@ export class PrBot {
         check,
         workflow,
         {
-          mode: "review",
+          mode: "review_gate",
           sender: trigger.sender,
           source: trigger.source,
-          reason: noBlockingReason,
-          body: approvalSummary,
+          reason: "명시적 인수조건 테스트가 확인됐고 증명된 치명 결함이 없습니다.",
+          body: summary,
         },
         this.hasPendingStatusChecks(latest) ? this.config.ciRecheckIntervalMs : this.config.ciInitialWaitMs,
       );
-      return true;
+      return;
     }
 
     await this.approveAndNotify(
@@ -1741,102 +1750,224 @@ export class PrBot {
       repo,
       prNumber,
       latest,
-      this.approvalText(trigger.sender, noBlockingReason, latest.headSha, approvalSummary),
+      this.approvalText(
+        trigger.sender,
+        "명시적 인수조건 테스트가 확인됐고 증명된 치명 결함이 없습니다.",
+        latest.headSha,
+        summary,
+      ),
       {
-        mode: "review",
+        mode: "review_gate",
         sender: trigger.sender,
         source: trigger.source,
-        reason: noBlockingReason,
+        reason: "명시적 인수조건 테스트가 확인됐고 증명된 치명 결함이 없습니다.",
       },
     );
-    await this.completeTrackedCheck(check, "success", "PR 승인 완료", approvalSummary);
-    await this.maybeSquashMergeApprovedPullRequest(octokit, repo, prNumber, latest.headSha, "review");
-    return true;
+    await this.completeTrackedCheck(check, "success", "보수적 Gate 통과", summary);
+    await this.maybeSquashMergeApprovedPullRequest(octokit, repo, prNumber, latest.headSha, "review_gate");
   }
 
-  // Returns the provider to hand this review to when oscillation is detected, or
-  // undefined for normal routing. Oscillation = a prior OPEN finding whose file
-  // was NOT changed since it was raised (the model keeps barking at unchanged
-  // code). Fires from the 2nd round onward. Skipped when the tiebreaker provider
-  // is unavailable (cooldown/no credential) so we never block the review.
-  private tiebreakerProviderFor(
-    prior: StoredFinding[],
-    changedFiles: Set<string>,
-  ): AiReviewProviderName | undefined {
-    if (!this.config.aiReviewTiebreakerEnabled) {
-      return undefined;
+  private evidenceIncludes(haystack: string, needle: string): boolean {
+    const normalizedNeedle = this.normalizedEvidence(needle);
+    return normalizedNeedle.length > 0 && this.normalizedEvidence(haystack).includes(normalizedNeedle);
+  }
+
+  private normalizedEvidence(value: string): string {
+    return value.normalize("NFKC").replace(/\s+/gu, " ").trim();
+  }
+
+  private uniqueAcceptanceCriteria(criteria: readonly string[]): string[] {
+    const unique = new Map<string, string>();
+    for (const criterion of criteria) {
+      const normalized = this.normalizedEvidence(criterion).toLowerCase();
+      if (normalized) {
+        unique.set(normalized, criterion);
+      }
     }
-    const oscillating = prior.some(
-      (finding) => finding.status === "open" && finding.file && !changedFiles.has(finding.file),
+    return [...unique.values()];
+  }
+
+  private abstainReviewGate(
+    evaluation: ReviewGateEvaluation,
+    reason: string,
+  ): ReviewGateEvaluation {
+    return {
+      ...evaluation,
+      decision: {
+        verdict: "ABSTAIN",
+        reasons: [reason],
+        missingCriteria: [],
+        fatalBlockers: [],
+      },
+    };
+  }
+
+  private async recordReviewGateRun(
+    workflow: WorkflowExecution | undefined,
+    check: ActiveCheckRun | null,
+    repo: RepoRef,
+    prNumber: number,
+    context: PullRequestContext,
+    prompt: string,
+    aiResult: { text: string; provider: string; model: string },
+    evaluation: ReviewGateEvaluation,
+  ): Promise<void> {
+    const record: ReviewRunRecord = {
+      repoFullName: repo.fullName,
+      prNumber,
+      headSha: context.headSha,
+      checkRunId: check?.checkRunId ?? workflow?.checkRunId ?? null,
+      provider: aiResult.provider,
+      model: aiResult.model,
+      promptVersion: REVIEW_GATE_PROMPT_VERSION,
+      promptSha256: createHash("sha256").update(prompt).digest("hex"),
+      contextSha256: createHash("sha256").update(context.reviewGateMarkdown).digest("hex"),
+      rawOutput: aiResult.text,
+      parseValid: evaluation.response !== null,
+      verdict: evaluation.decision.verdict,
+      validationErrors: [
+        ...evaluation.parseErrors,
+        ...(evaluation.decision.verdict === "ABSTAIN" ? evaluation.decision.reasons : []),
+      ],
+    };
+
+    try {
+      await workflow?.recordReviewRun?.(record);
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, prNumber, headSha: context.headSha },
+        "failed to persist review gate provenance",
+      );
+    }
+
+    this.logger.info(
+      {
+        repo: repo.fullName,
+        prNumber,
+        headSha: context.headSha,
+        provider: aiResult.provider,
+        model: aiResult.model,
+        promptVersion: REVIEW_GATE_PROMPT_VERSION,
+        verdict: evaluation.decision.verdict,
+      },
+      "conservative review gate evaluated",
     );
-    if (!oscillating) {
-      return undefined;
+  }
+
+  private buildReviewGateSummary(
+    headSha: string,
+    evaluation: ReviewGateEvaluation,
+    hostInventoryComplete: boolean,
+  ): string {
+    const response = evaluation.response;
+    const lines = [
+      "## Seori 보수적 Merge Gate",
+      "",
+      `HEAD: \`${headSha}\``,
+      `판정: **${evaluation.decision.verdict}**`,
+      `현재 HEAD 테스트 목록 완전성: **${hostInventoryComplete ? "complete" : "partial"}**`,
+    ];
+
+    if (response?.criteria.length) {
+      lines.push("", "### 인수조건 테스트 증거");
+      for (const criterion of response.criteria) {
+        const marker =
+          criterion.testability !== "automated"
+            ? "➖"
+            : criterion.coverage === "covered"
+              ? "✅"
+              : criterion.coverage === "missing"
+                ? "❓"
+                : "❓";
+        const evidence = criterion.testEvidence
+          ? ` — \`${criterion.testEvidence.file}\` / ${criterion.testEvidence.testName}`
+          : "";
+        lines.push(
+          `- ${marker} **${criterion.id}** [${criterion.testability}/${criterion.coverage}] ${truncate(criterion.sourceQuote, 220)}${evidence}`,
+        );
+      }
     }
-    const provider = this.config.aiReviewTiebreakerProvider;
-    return this.gemini.canUseProvider(provider) ? provider : undefined;
+
+    if (evaluation.decision.fatalBlockers.length > 0) {
+      lines.push("", "### 증명된 치명 결함");
+      for (const blocker of evaluation.decision.fatalBlockers) {
+        lines.push(
+          `- \`${blocker.file}:${blocker.line}\` **${this.fatalOutcomeLabel(blocker.outcome)}** — ${truncate(blocker.causalChain, 300)}`,
+        );
+      }
+    }
+
+    if (evaluation.decision.missingCriteria.length > 0) {
+      lines.push("", "### 테스트가 없는 자동화 인수조건");
+      for (const criterion of evaluation.decision.missingCriteria) {
+        lines.push(`- **${criterion.id}** ${truncate(criterion.sourceQuote, 260)}`);
+      }
+    }
+
+    lines.push("", "### 판정 근거");
+    for (const reason of evaluation.decision.reasons) {
+      lines.push(`- ${truncate(reason, 600)}`);
+    }
+
+    if (evaluation.decision.verdict === "ABSTAIN") {
+      lines.push(
+        "",
+        "_불확실성을 코드 결함으로 단정하지 않았습니다. 수동 확인 후 `/approve` 또는 보강 커밋을 선택하세요._",
+      );
+    } else if (evaluation.decision.verdict === "PASS") {
+      lines.push(
+        "",
+        "_PASS는 제공된 현재 HEAD 증거에서 인수조건 테스트가 확인되고 치명 결함이 증명되지 않았다는 뜻입니다. 일반 품질 리뷰를 대체하지 않습니다._",
+      );
+    }
+
+    return lines.join("\n");
+  }
+
+  private fatalBlockerInlineBody(blocker: ReviewGateFatalBlocker): string {
+    return [
+      `**[치명 결함 · ${this.fatalOutcomeLabel(blocker.outcome)}]**`,
+      `트리거: ${blocker.trigger}`,
+      `인과 경로: ${blocker.causalChain}`,
+      `근거 코드: \`${truncate(blocker.codeQuote, 240)}\``,
+    ].join("\n\n");
+  }
+
+  private fatalOutcomeLabel(outcome: ReviewGateFatalBlocker["outcome"]): string {
+    const labels: Record<ReviewGateFatalBlocker["outcome"], string> = {
+      deterministic_crash: "일반 경로 확정적 크래시",
+      permanent_data_loss_or_corruption: "영구 데이터 손실·손상",
+      exploitable_security_or_privacy_exposure: "악용 가능한 보안·개인정보 노출",
+      primary_flow_unusable: "핵심 사용자 흐름 사용 불가",
+    };
+    return labels[outcome];
   }
 
   private structuredReviewPrompt(
     context: PullRequestContext,
     trigger: ReviewTrigger,
-    prior: StoredFinding[],
-    changedFiles: Set<string>,
   ): string {
-    const priorList = prior.length
-      ? prior
-          .map((finding) => {
-            const fileUnchanged = Boolean(finding.file) && !changedFiles.has(finding.file!);
-            const carried =
-              Boolean(finding.firstSeenHead) &&
-              Boolean(finding.lastSeenHead) &&
-              finding.firstSeenHead !== finding.lastSeenHead;
-            const tags = [
-              fileUnchanged ? "file UNCHANGED since it was raised" : null,
-              carried ? "already repeated across rounds" : null,
-            ].filter(Boolean);
-            const suffix = tags.length ? ` [${tags.join("; ")}]` : "";
-            return `- [${finding.severity}] ${finding.file ? `${finding.file}: ` : ""}${finding.title}${suffix}`;
-          })
-          .join("\n")
-      : "(없음)";
+    const trustedRequest = this.trustedReviewRequest(trigger);
+    const explicitAcceptanceCriteria = this.uniqueAcceptanceCriteria([
+      ...context.explicitAcceptanceCriteria,
+      ...listExplicitAcceptanceCriteria(trustedRequest),
+    ]);
     return [
-      "Review this pull request and return findings as a single JSON object per the schema.",
-      "",
-      "Previously open Seori findings — for each, judge against the CURRENT diff and the PR conversation. If it is now fixed, simply omit it. If it still genuinely applies, include it again with the same title wording.",
-      "Re-evaluation rules (to converge instead of oscillating):",
-      "- If a finding is tagged 'file UNCHANGED since it was raised', its code did not change — do NOT re-raise it unless you can quote fresh diff evidence proving it is still a real defect. If a maintainer/author comment in the conversation rebuts it with a specific file:line, DROP it; do not restate it verbatim.",
-      "- Never manufacture a reworded or relocated variant of a finding that was already addressed or rebutted.",
-      "- A finding tagged 'already repeated across rounds' that you cannot newly ground in the current diff should be omitted, not repeated.",
-      priorList,
+      `Review gate prompt version: ${REVIEW_GATE_PROMPT_VERSION}`,
+      "Evaluate only the trusted acceptance sources and current-HEAD evidence below.",
+      "Do not use prior Seori findings as acceptance criteria or evidence.",
       "",
       `Trigger: ${trigger.source}`,
       `Requested by: ${trigger.sender}`,
-      trigger.request ? `User request: ${trigger.request}` : "",
+      trustedRequest ? `Trusted user request: ${trustedRequest}` : "Trusted user request: (none)",
+      `Minimum explicit acceptance criteria including request: ${explicitAcceptanceCriteria.length}`,
       "",
-      context.markdown,
+      context.reviewGateMarkdown,
     ].join("\n");
   }
 
-  private async buildAnchorMap(
-    octokit: Octokit,
-    repo: RepoRef,
-    prNumber: number,
-  ): Promise<Map<string, Set<number>>> {
-    const anchors = new Map<string, Set<number>>();
-    try {
-      const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
-        owner: repo.owner,
-        repo: repo.repo,
-        pull_number: prNumber,
-        per_page: 100,
-      });
-      for (const file of files) {
-        anchors.set(String(file.filename), parseAnchorableLines(file.patch));
-      }
-    } catch (error) {
-      this.logger.warn({ error, repo: repo.fullName, prNumber }, "failed to build inline anchor map");
-    }
-    return anchors;
+  private trustedReviewRequest(trigger: ReviewTrigger): string {
+    return trigger.request ? truncate(trigger.request, 2_000) : "";
   }
 
   private async safeSubmitReview(
@@ -2284,6 +2415,8 @@ export class PrBot {
     return {
       installationToken: workflow?.installationToken,
       deepContextRequested: Boolean(request && /\bdeep\b|전체\s*맥락|전체\s*코드|full\s*context/iu.test(request)),
+      reviewGatePromptReserveChars:
+        this.gemini.structuredReviewInstructionChars() + REVIEW_GATE_METADATA_RESERVE_CHARS,
     };
   }
 
@@ -2372,7 +2505,7 @@ export class PrBot {
     approvedHeadSha: string,
     mode: ApprovalNotificationMode,
   ): Promise<void> {
-    if (!this.config.autoSquashMergeEnabled || mode === "force_manual") {
+    if (!this.config.autoSquashMergeEnabled || mode === "force_manual" || mode === "review_gate") {
       return;
     }
 

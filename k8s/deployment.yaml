@@ -127,7 +127,7 @@ spec:
             - name: STRUCTURED_REVIEW_ENABLED
               value: "true"
             - name: FOLLOWUP_ISSUE_ENABLED
-              value: "true"
+              value: "false"
             - name: FOLLOWUP_ISSUE_LABEL
               value: seori-followup
             - name: BLOCK_ON_MEDIUM

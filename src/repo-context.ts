@@ -49,6 +49,57 @@ const BINARY_EXTENSIONS = new Set([
   ".zip",
 ]);
 
+const TEST_DIRECTORY_NAMES = new Set(["__tests__", "spec", "specs", "test", "tests"]);
+const TEST_DISCOVERY_IGNORED_DIRECTORIES = new Set([
+  ".git",
+  ".cache",
+  ".dart_tool",
+  ".expo",
+  ".godot",
+  ".gradle",
+  ".next",
+  ".pnpm-store",
+  ".turbo",
+  ".venv",
+  "build",
+  "coverage",
+  "deriveddata",
+  "dist",
+  "node_modules",
+  "pods",
+  "target",
+  "tmp",
+  "vendor",
+]);
+const MAX_TEST_CONTENT_SCAN_FILES = 400;
+const TEST_RELEVANCE_MIN_SCORE = 700;
+
+export type ChangeClass =
+  | "product_logic"
+  | "config_or_workflow"
+  | "tests_only"
+  | "docs_assets"
+  | "mixed"
+  | "other";
+
+type TestInventorySelection = {
+  discoveryComplete: boolean;
+  contentScanComplete: boolean;
+  discovered: string[];
+  relevant: string[];
+};
+
+type ContextFileSelection = {
+  files: string[];
+  changeClass: ChangeClass;
+  testInventory: TestInventorySelection;
+};
+
+type ScoredTestCandidate = {
+  path: string;
+  score: number;
+};
+
 export type DeepRepoContextInput = {
   repo: RepoRef;
   prNumber: number;
@@ -59,12 +110,22 @@ export type DeepRepoContextInput = {
   requested?: boolean;
 };
 
-export async function buildDeepRepoContext(input: DeepRepoContextInput): Promise<string> {
+export type DeepRepoContextResult = {
+  markdown: string;
+  testInventoryComplete: boolean;
+  fileContents: Readonly<Record<string, string>>;
+};
+
+export async function buildDeepRepoContext(input: DeepRepoContextInput): Promise<DeepRepoContextResult> {
   if (!shouldBuildDeepRepoContext(input)) {
-    return "";
+    return { markdown: "", testInventoryComplete: false, fileContents: {} };
   }
   if (!input.installationToken) {
-    return "Deep repository context skipped: installation token unavailable.";
+    return {
+      markdown: "Deep repository context skipped: installation token unavailable.",
+      testInventoryComplete: false,
+      fileContents: {},
+    };
   }
 
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "seori-pr-context-"));
@@ -75,7 +136,11 @@ export async function buildDeepRepoContext(input: DeepRepoContextInput): Promise
     await clonePullRequestHead(input, checkoutDir, askpassPath);
     return await collectRepositoryContext(input, checkoutDir);
   } catch (error) {
-    return `Deep repository context unavailable: ${sanitizeError(error)}`;
+    return {
+      markdown: `Deep repository context unavailable: ${sanitizeError(error)}`,
+      testInventoryComplete: false,
+      fileContents: {},
+    };
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -144,17 +209,20 @@ async function clonePullRequestHead(
   await git(["-C", checkoutDir, "checkout", "--detach", "FETCH_HEAD"], env, timeout);
 }
 
-async function collectRepositoryContext(input: DeepRepoContextInput, checkoutDir: string): Promise<string> {
-  const selected = await selectContextFiles(input, checkoutDir);
-  const sections: string[] = [
-    "Deep repository context source: shallow clone of PR HEAD.",
-    `Selected context files: ${selected.length}`,
-  ];
-  let totalBytes = sections.join("\n").length;
+async function collectRepositoryContext(
+  input: DeepRepoContextInput,
+  checkoutDir: string,
+): Promise<DeepRepoContextResult> {
+  const selection = await selectContextFiles(input, checkoutDir);
+  const maxBytes = input.config.deepRepoContextMaxBytes;
+  const headerReserve = Math.min(1_500, maxBytes);
+  const rendered: Array<{ path: string; section: string; content: string }> = [];
+  let renderedBytes = 0;
 
-  for (const relativePath of selected) {
+  for (const relativePath of selection.files) {
     const filePath = path.join(checkoutDir, relativePath);
-    const content = await readTextFile(filePath, input.config.deepRepoContextMaxBytes - totalBytes);
+    const remainingBytes = maxBytes - headerReserve - renderedBytes;
+    const content = await readTextFile(filePath, remainingBytes);
     if (!content) {
       continue;
     }
@@ -165,56 +233,517 @@ async function collectRepositoryContext(input: DeepRepoContextInput, checkoutDir
       content.trimEnd(),
       "````",
     ].join("\n");
-    if (totalBytes + section.length > input.config.deepRepoContextMaxBytes) {
-      sections.push("...additional deep repository context omitted...");
-      break;
+    if (renderedBytes + section.length > maxBytes - headerReserve) {
+      continue;
     }
 
-    sections.push(section);
-    totalBytes += section.length;
+    rendered.push({ path: relativePath, section, content });
+    renderedBytes += section.length;
   }
 
-  return sections.join("\n\n");
+  while (true) {
+    const includedPaths = new Set(rendered.map((item) => item.path));
+    const header = buildRepositoryContextHeader(input, selection, includedPaths);
+    const sections = [header, ...rendered.map((item) => item.section)];
+    if (includedPaths.size < selection.files.length) {
+      sections.push("...additional deep repository context omitted...");
+    }
+    const result = sections.join("\n\n");
+    if (result.length <= maxBytes) {
+      return {
+        markdown: result,
+        testInventoryComplete: isTestInventoryComplete(selection, includedPaths),
+        fileContents: Object.fromEntries(rendered.map((item) => [item.path, item.content])),
+      };
+    }
+    if (rendered.length === 0) {
+      return {
+        markdown: truncate(header, maxBytes),
+        testInventoryComplete: false,
+        fileContents: {},
+      };
+    }
+    rendered.pop();
+  }
 }
 
-async function selectContextFiles(input: DeepRepoContextInput, checkoutDir: string): Promise<string[]> {
-  const selected = new Set<string>();
+function buildRepositoryContextHeader(
+  input: DeepRepoContextInput,
+  selection: ContextFileSelection,
+  includedPaths: Set<string>,
+): string {
+  const inventory = selection.testInventory;
+  const includedTests = inventory.discovered.filter((file) => includedPaths.has(file));
+  const includedRelevantTests = inventory.relevant.filter((file) => includedPaths.has(file));
+  const inventoryComplete = isTestInventoryComplete(selection, includedPaths);
+
+  return [
+    `Deep repository context source: shallow clone of current PR HEAD ${input.headSha}.`,
+    `Change class: ${selection.changeClass}`,
+    `Selected context files: ${selection.files.length}`,
+    `Included context files: ${includedPaths.size}`,
+    `Context body complete: ${includedPaths.size === selection.files.length}`,
+    `Test discovery complete: ${inventory.discoveryComplete}`,
+    `Test evidence scan complete: ${inventory.contentScanComplete}`,
+    `Test inventory complete: ${inventoryComplete}`,
+    `Test inventory discovered: ${inventory.discovered.length}`,
+    `Test inventory relevant: ${inventory.relevant.length}`,
+    `Test inventory included: ${includedTests.length}`,
+    `Test inventory relevant included: ${includedRelevantTests.length}`,
+  ].join("\n");
+}
+
+function isTestInventoryComplete(
+  selection: ContextFileSelection,
+  includedPaths: Set<string>,
+): boolean {
+  const inventory = selection.testInventory;
+  return (
+    inventory.discoveryComplete &&
+    inventory.contentScanComplete &&
+    inventory.discovered.every((file) => includedPaths.has(file))
+  );
+}
+
+async function selectContextFiles(
+  input: DeepRepoContextInput,
+  checkoutDir: string,
+): Promise<ContextFileSelection> {
+  const changed = new Set<string>();
+  const allChangedPaths: string[] = [];
+  const supporting = new Set<string>();
 
   for (const file of input.files) {
-    const filename = normalizeRepoPath(String(file.filename || ""));
+    const rawFilename = String(file.filename || "");
+    const filename = rawFilename ? normalizeRepoPath(rawFilename) : "";
+    if (filename && !filename.startsWith("../") && !path.isAbsolute(filename)) {
+      allChangedPaths.push(filename);
+    }
     if (filename && shouldIncludePath(filename)) {
-      selected.add(filename);
-      addSiblingContextFiles(selected, filename);
+      changed.add(filename);
+      addSiblingContextFiles(supporting, filename);
     }
   }
 
   for (const file of DEFAULT_SUPPORT_FILES) {
-    selected.add(file);
+    supporting.add(file);
   }
 
   const godotAutoloads = await readGodotAutoloads(checkoutDir);
-  for (const file of [...selected]) {
+  const referenceSeeds = [...changed, ...supporting];
+  for (const file of referenceSeeds) {
     if (file.startsWith(".github/workflows/")) {
-      await addWorkflowContextFiles(selected, checkoutDir, file);
+      await addWorkflowContextFiles(supporting, checkoutDir, file);
     }
     if (isGodotScriptPath(file)) {
-      await addGodotReferenceFiles(selected, checkoutDir, file, godotAutoloads);
+      await addGodotReferenceFiles(supporting, checkoutDir, file, godotAutoloads);
     } else if (isSourcePath(file)) {
-      await addRelativeImportFiles(selected, checkoutDir, file);
+      await addRelativeImportFiles(supporting, checkoutDir, file);
     }
   }
 
-  const existing = [];
-  for (const file of selected) {
-    if (existing.length >= input.config.deepRepoContextMaxFiles) {
-      break;
-    }
-    if (await isReadableContextFile(checkoutDir, file)) {
-      existing.push(file);
+  const inventory = await buildTestInventory(checkoutDir, [...changed]);
+  const existing: string[] = [];
+  const included = new Set<string>();
+
+  async function addExistingFiles(candidates: Iterable<string>, maxSelected: number): Promise<void> {
+    for (const file of candidates) {
+      if (existing.length >= maxSelected) {
+        return;
+      }
+      if (included.has(file)) {
+        continue;
+      }
+      if (await isReadableContextFile(checkoutDir, file)) {
+        existing.push(file);
+        included.add(file);
+      }
     }
   }
 
-  return existing;
+  const maxFiles = input.config.deepRepoContextMaxFiles;
+  const primaryChanged = [...changed].filter(
+    (file) => !isTestCandidatePath(file) && !isDocsOrAssetPath(file),
+  );
+  const secondaryChanged = [...changed].filter((file) => !primaryChanged.includes(file));
+  const orderedTests = interleaveChangedAndExistingTests(inventory.relevant, changed);
+  const reservedTestSlots =
+    orderedTests.length === 0 || maxFiles <= 1
+      ? 0
+      : Math.min(orderedTests.length, Math.max(1, Math.floor(maxFiles / 3)), maxFiles - 1);
+
+  // Keep changed product/config files as primary evidence, but reserve part of
+  // the max-files budget for both changed and pre-existing related tests.
+  const initialPrimarySlots =
+    reservedTestSlots === 0
+      ? maxFiles
+      : Math.min(primaryChanged.length, Math.max(1, Math.floor((maxFiles - reservedTestSlots) / 3)));
+  await addExistingFiles(primaryChanged.slice(0, initialPrimarySlots), initialPrimarySlots);
+  await addExistingFiles(orderedTests, Math.min(maxFiles, existing.length + reservedTestSlots));
+  await addExistingFiles(primaryChanged.slice(initialPrimarySlots), maxFiles);
+  await addExistingFiles(secondaryChanged, maxFiles);
+  await addExistingFiles(supporting, maxFiles);
+
+  return {
+    files: existing,
+    changeClass: classifyChange(allChangedPaths),
+    testInventory: inventory,
+  };
+}
+
+function interleaveChangedAndExistingTests(relevant: string[], changed: Set<string>): string[] {
+  const changedTests = relevant.filter((file) => changed.has(file));
+  const existingTests = relevant.filter((file) => !changed.has(file));
+  const ordered: string[] = [];
+  const length = Math.max(changedTests.length, existingTests.length);
+  for (let index = 0; index < length; index += 1) {
+    const changedTest = changedTests[index];
+    const existingTest = existingTests[index];
+    if (changedTest) {
+      ordered.push(changedTest);
+    }
+    if (existingTest) {
+      ordered.push(existingTest);
+    }
+  }
+  return ordered;
+}
+
+async function buildTestInventory(
+  checkoutDir: string,
+  changedPaths: string[],
+): Promise<TestInventorySelection> {
+  const discovery = await discoverTestCandidates(checkoutDir);
+  const cheapScores = new Map(
+    discovery.paths.map((candidate) => [candidate, scoreTestPath(candidate, changedPaths)]),
+  );
+  const scanOrder = [...discovery.paths].sort((left, right) => {
+    const scoreDifference = (cheapScores.get(right) || 0) - (cheapScores.get(left) || 0);
+    return scoreDifference || left.localeCompare(right);
+  });
+  const scanPaths = new Set(scanOrder.slice(0, MAX_TEST_CONTENT_SCAN_FILES));
+  let contentScanComplete = discovery.paths.length <= MAX_TEST_CONTENT_SCAN_FILES;
+  const scored: ScoredTestCandidate[] = [];
+
+  for (const candidate of discovery.paths) {
+    let score = cheapScores.get(candidate) || 0;
+    if (scanPaths.has(candidate)) {
+      const content = await readTextFile(path.join(checkoutDir, candidate), 200_000);
+      if (content === null) {
+        contentScanComplete = false;
+      } else {
+        score += await scoreTestContent(checkoutDir, candidate, content, changedPaths);
+      }
+    }
+    scored.push({ path: candidate, score });
+  }
+
+  const relevant = scored
+    .filter((candidate) => candidate.score >= TEST_RELEVANCE_MIN_SCORE)
+    .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path))
+    .map((candidate) => candidate.path);
+
+  return {
+    discoveryComplete: discovery.complete,
+    contentScanComplete,
+    discovered: discovery.paths,
+    relevant,
+  };
+}
+
+async function discoverTestCandidates(
+  checkoutDir: string,
+): Promise<{ paths: string[]; complete: boolean }> {
+  const paths: string[] = [];
+  let complete = true;
+
+  async function walk(relativeDirectory: string): Promise<void> {
+    const absoluteDirectory = path.join(checkoutDir, relativeDirectory);
+    let entries: Array<import("node:fs").Dirent>;
+    try {
+      entries = await fs.readdir(absoluteDirectory, { withFileTypes: true });
+    } catch {
+      complete = false;
+      return;
+    }
+
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const relativePath = normalizeRepoPath(path.posix.join(relativeDirectory, entry.name));
+      if (entry.isSymbolicLink()) {
+        complete = false;
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (!TEST_DISCOVERY_IGNORED_DIRECTORIES.has(entry.name.toLowerCase())) {
+          await walk(relativePath);
+        }
+        continue;
+      }
+      if (!entry.isFile() || !isTestCandidatePath(relativePath)) {
+        continue;
+      }
+      if (shouldIncludePath(relativePath)) {
+        paths.push(relativePath);
+      } else if (!isBinaryPath(relativePath)) {
+        // A test-like file was found but cannot be represented in the text
+        // context. Do not claim that the inventory is complete.
+        complete = false;
+      }
+    }
+  }
+
+  await walk("");
+  return { paths, complete };
+}
+
+function scoreTestPath(candidate: string, changedPaths: string[]): number {
+  let bestScore = 0;
+  const candidateStem = testSubjectStem(candidate);
+  const candidateDirectory = logicalSourceDirectory(candidate);
+  const candidateTokens = meaningfulPathTokens(candidate);
+
+  for (const changedPath of changedPaths) {
+    if (candidate === changedPath) {
+      return 10_000;
+    }
+
+    let relationScore = 0;
+    const changedStem = testSubjectStem(changedPath);
+    if (candidateStem && changedStem && candidateStem === changedStem) {
+      relationScore += 4_000;
+    }
+    if (candidateDirectory === logicalSourceDirectory(changedPath)) {
+      relationScore += 300;
+    }
+
+    const changedTokens = meaningfulPathTokens(changedPath);
+    const sharedTokens = [...candidateTokens].filter((token) => changedTokens.has(token));
+    relationScore += Math.min(sharedTokens.length, 4) * 250;
+    bestScore = Math.max(bestScore, relationScore);
+  }
+
+  return bestScore;
+}
+
+async function scoreTestContent(
+  checkoutDir: string,
+  candidate: string,
+  content: string,
+  changedPaths: string[],
+): Promise<number> {
+  let bestScore = 0;
+  const references = await resolveRepositoryReferences(checkoutDir, candidate, content);
+
+  for (const changedPath of changedPaths) {
+    if (references.has(changedPath)) {
+      bestScore = Math.max(bestScore, 5_000);
+      continue;
+    }
+
+    const extension = pathExtension(changedPath);
+    const withoutExtension = extension ? changedPath.slice(0, -extension.length) : changedPath;
+    if (content.includes(changedPath) || content.includes(withoutExtension)) {
+      bestScore = Math.max(bestScore, 2_500);
+      continue;
+    }
+
+    const stem = testSubjectStem(changedPath);
+    if (stem && !GENERIC_TEST_SUBJECT_STEMS.has(stem) && new RegExp(`\\b${escapeRegExp(stem)}\\b`, "i").test(content)) {
+      bestScore = Math.max(bestScore, 800);
+    }
+  }
+
+  return bestScore;
+}
+
+const GENERIC_TEST_SUBJECT_STEMS = new Set([
+  "app",
+  "core",
+  "index",
+  "lib",
+  "main",
+  "service",
+  "types",
+  "utils",
+]);
+
+async function resolveRepositoryReferences(
+  checkoutDir: string,
+  sourcePath: string,
+  content: string,
+): Promise<Set<string>> {
+  const references = new Set<string>();
+  const directory = path.posix.dirname(sourcePath);
+  const relativeMatches = content.matchAll(
+    /(?:from\s+|import\s*\(\s*|require\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g,
+  );
+  for (const match of relativeMatches) {
+    const specifier = match[1];
+    if (!specifier) {
+      continue;
+    }
+    const resolved = await resolveImportPath(checkoutDir, path.posix.join(directory, specifier));
+    if (resolved) {
+      references.add(resolved);
+    }
+  }
+
+  for (const match of content.matchAll(/\b(?:preload|load)\s*\(\s*["']res:\/\/([^"']+)["']/g)) {
+    const resolved = normalizeRepoPath(match[1] || "");
+    if (resolved) {
+      references.add(resolved);
+    }
+  }
+
+  return references;
+}
+
+function testSubjectStem(filename: string): string {
+  let basename = path.posix.basename(filename).toLowerCase();
+  const extension = pathExtension(basename);
+  if (extension) {
+    basename = basename.slice(0, -extension.length);
+  }
+  return basename
+    .replace(/\.(?:integration\.)?(?:test|spec)$/i, "")
+    .replace(/^(?:test|spec)[_-]/i, "")
+    .replace(/[_-](?:test|spec)$/i, "");
+}
+
+function logicalSourceDirectory(filename: string): string {
+  const parts = path.posix.dirname(filename).split("/").filter(Boolean);
+  return parts.filter((part) => !isTestDirectoryName(part.toLowerCase())).join("/");
+}
+
+function meaningfulPathTokens(filename: string): Set<string> {
+  const ignored = new Set([
+    "apps",
+    "game",
+    "gdscript",
+    "godot",
+    "gradle",
+    "javascript",
+    "java",
+    "jsx",
+    "kotlin",
+    "mobile",
+    "packages",
+    "python",
+    "ruby",
+    "rust",
+    "scala",
+    "scripts",
+    "src",
+    "source",
+    "swift",
+    "test",
+    "tests",
+    "spec",
+    "specs",
+    "typescript",
+    "tsx",
+    "index",
+    "main",
+    "app",
+    "web",
+  ]);
+  return new Set(
+    filename
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((token) => token.length >= 3 && !ignored.has(token)),
+  );
+}
+
+function isTestCandidatePath(filename: string): boolean {
+  const segments = filename.toLowerCase().split("/");
+  const basename = segments.at(-1) || "";
+  if (segments.slice(0, -1).some(isTestDirectoryName)) {
+    return true;
+  }
+  return (
+    /(?:^|[._-])(?:test|spec|smoke|probe|check|validate|verify|acceptance|regression|assert|gate)(?:[._-]|$)/i.test(basename) ||
+    /(?:tests?|specs?)\.[^.]+$/i.test(basename) ||
+    /(?:^|[_-])test_runner\.[^.]+$/i.test(basename)
+  );
+}
+
+function isTestDirectoryName(segment: string): boolean {
+  return TEST_DIRECTORY_NAMES.has(segment) || /(?:tests?|specs?)$/u.test(segment);
+}
+
+export function classifyChange(changedPaths: string[]): ChangeClass {
+  if (changedPaths.length === 0) {
+    return "other";
+  }
+
+  const substantive = new Set<Exclude<ChangeClass, "tests_only" | "mixed">>();
+  let hasTests = false;
+  for (const filename of changedPaths) {
+    if (isTestCandidatePath(filename)) {
+      hasTests = true;
+    } else if (isConfigOrWorkflowPath(filename)) {
+      substantive.add("config_or_workflow");
+    } else if (isDocsOrAssetPath(filename)) {
+      substantive.add("docs_assets");
+    } else if (isSourcePath(filename)) {
+      substantive.add("product_logic");
+    } else {
+      substantive.add("other");
+    }
+  }
+
+  if (substantive.size === 0 && hasTests) {
+    return "tests_only";
+  }
+  if (substantive.size === 1) {
+    return [...substantive][0] || "other";
+  }
+  if (substantive.has("product_logic")) {
+    return "mixed";
+  }
+  if (substantive.has("config_or_workflow")) {
+    return "config_or_workflow";
+  }
+  if (substantive.has("other")) {
+    return "other";
+  }
+  return "docs_assets";
+}
+
+function isConfigOrWorkflowPath(filename: string): boolean {
+  const lower = filename.toLowerCase();
+  const basename = path.posix.basename(filename).toLowerCase();
+  return (
+    lower.startsWith(".github/workflows/") ||
+    lower.startsWith(".github/actions/") ||
+    lower.startsWith("tools/") ||
+    (lower.startsWith("scripts/") && /(?:^|[._-])(?:build|deploy|publish|release)(?:[._-]|$)/u.test(basename)) ||
+    isConfigPath(filename) ||
+    basename === "project.godot" ||
+    basename === "export_presets.cfg" ||
+    basename === "package.json" ||
+    basename.endsWith("lock.yaml") ||
+    basename.endsWith("lock.json")
+  );
+}
+
+function isDocsOrAssetPath(filename: string): boolean {
+  const lower = filename.toLowerCase();
+  const basename = path.posix.basename(lower);
+  return (
+    lower.startsWith("docs/") ||
+    lower.includes("/docs/") ||
+    lower.startsWith("assets/") ||
+    lower.includes("/assets/") ||
+    lower.startsWith("generated/") ||
+    lower.includes("/generated/") ||
+    /(?:^|[._-])generated(?:[._-]|$)/u.test(basename) ||
+    basename.startsWith("readme") ||
+    [".md", ".mdx", ".tres", ".tscn"].includes(pathExtension(lower)) ||
+    isBinaryPath(lower)
+  );
 }
 
 function addSiblingContextFiles(selected: Set<string>, filename: string): void {
@@ -441,7 +970,36 @@ function isConfigPath(filename: string): boolean {
 }
 
 function isSourcePath(filename: string): boolean {
-  return [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".gd"].includes(pathExtension(filename));
+  return [
+    ".cjs",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".dart",
+    ".gd",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".mjs",
+    ".lua",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".rules",
+    ".scala",
+    ".swift",
+    ".svelte",
+    ".ts",
+    ".tsx",
+    ".vue",
+  ].includes(pathExtension(filename));
 }
 
 function isGodotScriptPath(filename: string): boolean {
@@ -480,10 +1038,20 @@ function codeFenceLanguage(filename: string): string {
     case ".js":
     case ".mjs":
       return "javascript";
+    case ".bats":
+      return "bash";
     case ".css":
       return "css";
+    case ".c":
+    case ".cc":
+    case ".cpp":
+    case ".h":
+    case ".hpp":
+      return "cpp";
     case ".cs":
       return "csharp";
+    case ".dart":
+      return "dart";
     case ".gd":
       return "gdscript";
     case ".gdshader":
@@ -495,10 +1063,32 @@ function codeFenceLanguage(filename: string): string {
       return "json";
     case ".jsx":
       return "jsx";
+    case ".go":
+      return "go";
+    case ".gradle":
+      return "groovy";
+    case ".java":
+      return "java";
+    case ".kt":
+    case ".kts":
+      return "kotlin";
     case ".md":
+    case ".mdx":
       return "markdown";
+    case ".lua":
+      return "lua";
+    case ".php":
+      return "php";
     case ".py":
       return "python";
+    case ".rb":
+      return "ruby";
+    case ".rules":
+      return "javascript";
+    case ".rs":
+      return "rust";
+    case ".scala":
+      return "scala";
     case ".sh":
       return "bash";
     case ".ts":
@@ -507,8 +1097,16 @@ function codeFenceLanguage(filename: string): string {
       return "tsx";
     case ".txt":
       return "text";
+    case ".swift":
+      return "swift";
+    case ".svelte":
+      return "svelte";
+    case ".toml":
+      return "toml";
     case ".xml":
       return "xml";
+    case ".vue":
+      return "vue";
     case ".yaml":
     case ".yml":
       return "yaml";

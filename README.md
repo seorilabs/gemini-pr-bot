@@ -7,7 +7,7 @@ flowchart LR
   GitHub["GitHub App Webhook"] --> Ingress["K8s Ingress"]
   Ingress --> Bot["seori-pr-bot"]
   Bot --> GitHubAPI["GitHub App Installation API"]
-  Bot --> Providers["MiniMax / Copilot"]
+  Bot --> Providers["MiniMax merge gate / optional fallbacks"]
   Bot --> Comment["PR comments / inline replies / check runs"]
   Bot --> NATS["NATS telegram subject"]
   NATS --> Telegram["Telegram"]
@@ -16,28 +16,29 @@ flowchart LR
 ## Behavior
 
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
-- Reviews like a human: one batched review ("Start review") with **inline draft comments anchored to the problem lines**, plus a summary body that organizes findings by severity (Critical/High/Medium/Low) and category (`STRUCTURED_REVIEW_ENABLED`, requires `WORKFLOW_STORE=mysql`).
-- Tracks convergence across review turns in MySQL: the summary counts **🆕 new findings, ♻️ regressions introduced by review-response changes, ✅ previously-resolved defects, ⏳ carried, and 📤 issue-offloaded** items, so you can see at a glance whether the PR is converging.
-- Treats only **Critical/High as merge blockers** (`REQUEST_CHANGES`); Medium/Low are surfaced but do not block (`APPROVE`). Set `BLOCK_ON_MEDIUM=true` to also block on Medium.
-- Offloads **refactor / future-improvement Medium-Low** findings to linked GitHub issues (`FOLLOWUP_ISSUE_ENABLED`, label `FOLLOWUP_ISSUE_LABEL`) to keep review turns short, deduplicating by finding fingerprint.
-- **Resolves** an inline review thread once the finding is fixed (file actually changed and no longer reported) or moved to a follow-up issue, and closes the follow-up issue when resolved.
-- Falls back to the legacy single free-form review comment when structured output cannot be parsed or `WORKFLOW_STORE` is not MySQL.
+- Runs a conservative structured merge gate (`STRUCTURED_REVIEW_ENABLED`) instead of a general-purpose code review.
+- Maps only host-recognized checklist items or bullets under acceptance/requirements/definition-of-done headings to visible current-HEAD test evidence; unchanged tests count when their test body and assertion are present in context. Ordinary implementation prose cannot produce a gate `PASS`.
+- Product-logic or mixed changes require grounded automated evidence for every extracted criterion. Explicit acceptance/requirements checklist items are preserved across wrapped lines and must map one-to-one to distinct model criteria, so the model cannot duplicate, replace, or silently omit them and `PASS`.
+- Test evidence must come from a registered, active current-HEAD test with a real non-vacuous assertion. Commented code, skipped/disabled tests or suites, ordinary helper functions, comparison-only expressions, and assertion-shaped strings are rejected by the host.
+- Reports at most two fatal blockers, limited to a deterministic common-path crash, permanent data loss/corruption, exploitable security/privacy exposure, or a certainly unusable primary flow. The added root line must itself directly perform the fatal outcome and end a 2-6-line ordered causal chain; normal false/null returns, UI flags, and deny-by-default security rules are rejected.
+- Uses host-side strict schema and evidence validation. MiniMax does not assign severity or decide approval itself.
+- Produces `PASS`, `FAIL`, or `ABSTAIN`. `FAIL` requires both host-grounded source evidence and the same fatal signature from an enabled, distinct tiebreaker provider. If that confirmation is unavailable, the result is `ABSTAIN`. A missing/unknown test match, malformed JSON, incomplete context, an ungrounded source quote, or unverifiable evidence also becomes `ABSTAIN`; structured review never falls back to a free-form blocking review.
+- Omits Medium/Low findings, style/refactor suggestions, speculative risks, and automatic follow-up issue creation from the merge-gate path.
 - Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
-- Runs explicit review on `@gemini-cli /review`; if there are no actionable findings, it submits an approval review instead of only commenting.
+- Runs explicit review on `@gemini-cli /review`; a gate `PASS` submits approval, `FAIL` requests changes, and `ABSTAIN` holds approval for manual confirmation.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]`.
 - Allows trusted maintainers to bypass bot-side merge conflict and status-check approval blockers with `@gemini-cli /approve --skip-validation [reason]` or `@gemini-cli /force-approve [reason]`.
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
-- Keeps review loops bounded by stating acceptance criteria first, narrowing follow-up checks to new changes plus stability regressions once those criteria are met, and closing PRs that repeatedly fail the same criteria.
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Seori Review` check run for review and agent jobs.
-- Marks `Seori Review` as `success` only when the bot approves the current HEAD; actionable review findings complete as `action_required`.
+- Marks `Seori Review` as `success` only after a gate `PASS` and approval of the current HEAD; `FAIL` and `ABSTAIN` complete as `action_required` without treating uncertainty as a code defect.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
 - Can route AI jobs across MiniMax API (default) and GitHub Copilot CLI (fallback, returns 2026-07-01) with weighted fallback.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
-- When `AUTO_SQUASH_MERGE_ENABLED=true`, squash-merges the approved current HEAD only when the PR base branch is `main`, the PR is not draft, mergeable, and all status checks are green.
+- When `AUTO_SQUASH_MERGE_ENABLED=true`, squash-merges eligible manual, agent, dependency-fastpath, and legacy approvals only when the PR base branch is `main`, the PR is not draft, mergeable, and all status checks are green. A conservative gate `PASS` approves and marks the check successful but never directly auto-merges; a maintainer retains the final merge decision.
 - When `DEPENDENCY_FASTPATH_ENABLED=true`, dependabot/renovate dependency PRs skip the AI review and reuse the same approval path: `Seori Review` turns green once other CI checks pass (failing CI blocks, pending CI waits via the CI-recheck loop). Detection uses `DEPENDENCY_FASTPATH_AUTHORS` (PR author) or `DEPENDENCY_FASTPATH_LABELS` (PR label). Without this, bot-authored PRs are skipped entirely and never get the required `Seori Review` check, which blocks merge.
 - Ignores resolved inline review threads.
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
@@ -85,16 +86,21 @@ flowchart TD
   Review["/review or PR opened"] --> Context["Build PR context"]
   Context --> Conflict{"Merge conflict?"}
   Conflict -->|Yes| RequestChanges["REQUEST_CHANGES review with resolution steps"]
-  Conflict -->|No| AI["Strict review prompt"]
-  AI --> Decision{"Actionable findings?"}
-  Decision -->|Yes| Output["Post findings comment + check run"]
-  Decision -->|No| Approval["GitHub APPROVE review with HEAD marker"]
+  Conflict -->|No| AI["Conservative evidence prompt"]
+  AI --> Validate["Strict schema + source/test/diff evidence validation"]
+  Validate -->|"Grounded fatal candidate"| Confirm{"Distinct tiebreaker confirms same signature?"}
+  Confirm -->|Yes| Output["REQUEST_CHANGES + action_required"]
+  Confirm -->|No / unavailable| Hold
+  Validate -->|"ABSTAIN: evidence gap"| Hold["COMMENT + manual hold"]
+  Validate -->|PASS| GateApproval["GitHub APPROVE + success; no bot auto-merge"]
   Output --> Approve["Maintainer or trusted agent runs /approve"]
+  Hold --> Approve
   Approve --> Validation{"Bot-side validation passes?"}
-  Validation -->|Yes| Approval
+  Validation -->|Yes| Approval["Explicit/manual or agent approval"]
   Validation -->|No| Block["Comment blocker"]
   Output --> ForceApprove["Maintainer runs /force-approve or /approve --skip-validation"]
   ForceApprove --> ForceApproval["GitHub APPROVE review with skipped validation marker"]
+  GateApproval --> Agent
   Approval --> AutoMerge{"AUTO_SQUASH_MERGE_ENABLED and base main?"}
   AutoMerge -->|Yes + checks green| Squash["Squash Merge current HEAD"]
   AutoMerge -->|No| Agent
@@ -119,7 +125,7 @@ Approval from agent mode is guarded: the model output must include the approval 
 
 ## Deep Repository Context
 
-By default, `DEEP_REPO_CONTEXT_MODE=auto` shallow-clones the PR head only for code, workflow, action, and config changes that benefit from surrounding repository context. The bot extracts a bounded set of related text files into the prompt, then deletes the checkout from `/tmp`.
+By default, `DEEP_REPO_CONTEXT_MODE=auto` shallow-clones the PR head only for code, workflow, action, and config changes that benefit from surrounding repository context. The bot extracts a bounded set of related text files and relevant existing/changed test candidates, marks whether the test inventory is complete, then deletes the checkout from `/tmp`.
 
 ```text
 DEEP_REPO_CONTEXT_MODE=auto
@@ -149,6 +155,8 @@ flowchart TD
 ```
 
 The workflow table stores delivery dedupe keys, payload JSON, attempts, lease owner/expiry, PR identity, and `check_run_id`. If a pod restarts after creating a check-run, the next worker lease reuses that check-run instead of creating an untracked pending check.
+
+MySQL also stores conservative gate provenance in `gemini_pr_bot_review_runs`: workflow/check/repo/PR/HEAD identity, provider/model, prompt version and hashes, raw structured output, parse status, host verdict, and validation errors. Prompt source code is represented by a hash rather than persisted in full.
 
 For review workflows, the worker records `repo_full_name`, PR number, HEAD SHA, and `check_kind=review` before creating a new `Seori Review` check-run. If another older workflow is already queued/running for the same PR HEAD, or if the new request arrived while that older review was running, the newer request is coalesced into the older workflow instead of starting a parallel AI review. Queued duplicate requests are coalesced only when their review command source and request text match, so an explicit request such as `/review deep` is not swallowed by an unrelated queued automatic review.
 
@@ -215,7 +223,7 @@ The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMA
 Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions all use the multi-provider router. This keeps `/agent` approval decisions working when Gemini CLI is temporarily quota-blocked.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
-When `AUTO_SQUASH_MERGE_ENABLED=true`, approval is followed by a GitHub Squash Merge attempt only for PRs targeting `main`; there is no repo allowlist and no branch allowlist beyond exact `main`.
+When `AUTO_SQUASH_MERGE_ENABLED=true`, eligible non-gate approvals are followed by a GitHub Squash Merge attempt only for PRs targeting `main`; conservative gate approvals deliberately stop before merge. There is no repo allowlist and no branch allowlist beyond exact `main`.
 Providers with weight `0` are disabled for both random selection and fallback attempts.
 If every enabled provider is already in cooldown before a provider command is started, the workflow is requeued until the earliest cooldown expires instead of consuming retry attempts and failing immediately.
 The default keeps Copilot at weight `0` until its quota health is proven, while Cursor has a smaller positive weight so it can absorb traffic when Gemini is cooling down.

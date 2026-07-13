@@ -7,7 +7,7 @@ type Logger = {
   warn: (value: unknown, message?: string) => void;
 };
 
-export type ApprovalNotificationMode = "manual" | "force_manual" | "review" | "agent";
+export type ApprovalNotificationMode = "manual" | "force_manual" | "review" | "review_gate" | "agent";
 
 export type ApprovalNotification = {
   repoFullName: string;
@@ -34,6 +34,7 @@ const modeLabels: Record<ApprovalNotificationMode, string> = {
   manual: "명시 승인",
   force_manual: "검증 스킵 승인",
   review: "자동 리뷰 승인",
+  review_gate: "보수적 Gate 승인",
   agent: "에이전트 승인",
 };
 

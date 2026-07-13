@@ -12,6 +12,7 @@ import type { PrBot, WorkflowCheckRecord } from "./bot.js";
 import { isAiProviderCooldownError } from "./gemini.js";
 import { completeCheck, type RepoRef } from "./github.js";
 import type { StoredFinding } from "./review.js";
+import type { ReviewRunRecord } from "./review-run.js";
 import { metrics, type ActiveWorkflowMetric, type WorkflowQueueMetric } from "./metrics.js";
 
 type Logger = {
@@ -215,6 +216,32 @@ export class MysqlWorkflowStore {
         KEY idx_review_finding_pr (repo_full_name, pr_number, status)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS gemini_pr_bot_review_runs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        workflow_id BIGINT UNSIGNED NOT NULL,
+        check_run_id BIGINT UNSIGNED NULL,
+        repo_full_name VARCHAR(255) NOT NULL,
+        pr_number INT NOT NULL,
+        head_sha VARCHAR(64) NOT NULL,
+        provider VARCHAR(32) NOT NULL,
+        model VARCHAR(160) NOT NULL,
+        prompt_version VARCHAR(80) NOT NULL,
+        prompt_sha256 CHAR(64) NOT NULL,
+        context_sha256 CHAR(64) NOT NULL,
+        raw_output LONGTEXT NOT NULL,
+        parse_valid BOOLEAN NOT NULL,
+        verdict VARCHAR(16) NOT NULL,
+        validation_errors_json LONGTEXT NOT NULL,
+        created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        PRIMARY KEY (id),
+        KEY idx_review_runs_pr (repo_full_name, pr_number, head_sha),
+        KEY idx_review_runs_workflow (workflow_id),
+        KEY idx_review_runs_provider (provider, model, created_at),
+        KEY idx_review_runs_verdict (verdict, created_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
   }
 
   async listOpenReviewFindings(repoFullName: string, prNumber: number): Promise<StoredFinding[]> {
@@ -285,6 +312,34 @@ export class MysqlWorkflowStore {
       WHERE repo_full_name = ? AND pr_number = ? AND fingerprint = ?
       `,
       [repoFullName, prNumber, fingerprint],
+    );
+  }
+
+  async recordReviewRun(workflowId: number, record: ReviewRunRecord): Promise<void> {
+    await this.pool.execute(
+      `
+      INSERT INTO gemini_pr_bot_review_runs
+        (workflow_id, check_run_id, repo_full_name, pr_number, head_sha,
+         provider, model, prompt_version, prompt_sha256, context_sha256,
+         raw_output, parse_valid, verdict, validation_errors_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        workflowId,
+        record.checkRunId,
+        record.repoFullName,
+        record.prNumber,
+        record.headSha,
+        record.provider,
+        record.model,
+        record.promptVersion,
+        record.promptSha256,
+        record.contextSha256,
+        record.rawOutput,
+        record.parseValid,
+        record.verdict,
+        JSON.stringify(record.validationErrors),
+      ],
     );
   }
 
@@ -890,6 +945,7 @@ export class WorkflowEngine {
           markReviewFindingResolved: (repoFullName, prNumber, fingerprint) =>
             this.store.markReviewFindingResolved(repoFullName, prNumber, fingerprint),
         },
+        recordReviewRun: (record) => this.store.recordReviewRun(run.id, record),
       });
       await this.store.complete(run.id);
       metrics.recordWorkflowCompleted(run.eventName, elapsedSecondsSince(startedAt));
