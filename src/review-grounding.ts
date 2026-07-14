@@ -545,7 +545,13 @@ function asciiAnchorTokens(value: string): Set<string> {
   );
 }
 
-function isNonProductFatalPath(file: string): boolean {
+/**
+ * Host-owned path policy for fatal findings.
+ *
+ * Exported so context collection and finding validation use the same product
+ * boundary instead of drifting into separate extension/path allowlists.
+ */
+export function isNonProductFatalPath(file: string): boolean {
   const lower = file.toLowerCase();
   const segments = lower.split("/");
   const basename = segments.at(-1) || lower;

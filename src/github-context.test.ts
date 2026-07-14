@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { countExplicitAcceptanceCriteria, listExplicitAcceptanceCriteria } from "./github.js";
+import {
+  countExplicitAcceptanceCriteria,
+  isFatalContextComplete,
+  listExplicitAcceptanceCriteria,
+} from "./github.js";
 
-test("explicit acceptance sections, checkboxes, and AC labels form a deterministic floor", () => {
+test("only acceptance-section checkboxes and explicit AC labels form a deterministic floor", () => {
   const body = [
     "## 변경사항",
     "- 구현 세부사항은 인수조건으로 세지 않는다.",
@@ -14,8 +18,21 @@ test("explicit acceptance sections, checkboxes, and AC labels form a determinist
     "AC-4: 개인정보가 로그에 남지 않는다.",
     "- [x] 저장 후 값이 유지된다.",
   ].join("\n");
-  assert.equal(countExplicitAcceptanceCriteria(body), 4);
+  assert.equal(countExplicitAcceptanceCriteria(body), 3);
   assert.equal(countExplicitAcceptanceCriteria("## 변경사항\n- 내부 함수 이름 변경"), 0);
+});
+
+test("release and command checklists outside acceptance sections are not requirements", () => {
+  const body = [
+    "## 확인한 명령",
+    "- [x] npm run check",
+    "- [x] npm run build",
+    "## 릴리스 영향",
+    "- [x] export preset 이름을 확인했다.",
+    "- [x] 문서를 갱신했다.",
+  ].join("\n");
+
+  assert.deepEqual(listExplicitAcceptanceCriteria(body), []);
 });
 
 test("requirements headings and wrapped constraints remain explicit acceptance criteria", () => {
@@ -71,4 +88,81 @@ test("English behavior headings accept bullets and numbered items but Testing do
     "Back pauses an active level.",
     "Back asks before closing the app.",
   ]);
+});
+
+test("product fatal context is complete only when every current product file has full source and a usable patch", () => {
+  const files = [
+    { filename: "src/save.ts", status: "modified" },
+    { filename: "src/session.ts", status: "added" },
+    { filename: "tests/save.test.ts", status: "modified" },
+  ];
+  const contents = {
+    "src/save.ts": "export function save() {}\n",
+    "src/session.ts": "export function restore() {}\n",
+  };
+  const patches = {
+    "src/save.ts": "@@ -1 +1 @@\n-export function save() { return false; }\n+export function save() {}",
+    "src/session.ts": "@@ -0,0 +1 @@\n+export function restore() {}",
+  };
+
+  assert.equal(isFatalContextComplete("product_logic", files, contents, patches), true);
+  assert.equal(
+    isFatalContextComplete(
+      "mixed",
+      [...files, { filename: "README.md", status: "modified" }],
+      contents,
+      patches,
+    ),
+    true,
+  );
+  assert.equal(
+    isFatalContextComplete("product_logic", files, { "src/save.ts": contents["src/save.ts"] }, patches),
+    false,
+  );
+  assert.equal(
+    isFatalContextComplete("product_logic", files, contents, {
+      ...patches,
+      "src/session.ts": "(binary file or patch unavailable)",
+    }),
+    false,
+  );
+});
+
+test("tests/docs-only context is complete while deletion-only or mismatched product context fails closed", () => {
+  assert.equal(
+    isFatalContextComplete(
+      "tests_only",
+      [{ filename: "tests/save.test.ts", status: "modified" }],
+      {},
+      {},
+    ),
+    true,
+  );
+  assert.equal(
+    isFatalContextComplete(
+      "docs_assets",
+      [{ filename: "README.md", status: "modified" }],
+      {},
+      {},
+    ),
+    true,
+  );
+  assert.equal(
+    isFatalContextComplete(
+      "product_logic",
+      [{ filename: "src/save.ts", status: "removed" }],
+      {},
+      { "src/save.ts": "@@ -1 +0,0 @@\n-export function save() {}" },
+    ),
+    false,
+  );
+  assert.equal(
+    isFatalContextComplete(
+      "mixed",
+      [{ filename: "README.md", status: "modified" }],
+      {},
+      {},
+    ),
+    false,
+  );
 });

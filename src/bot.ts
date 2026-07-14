@@ -8,12 +8,9 @@ import {
   buildPullRequestContext,
   listExplicitAcceptanceCriteria,
   closePullRequest,
-  commentAndCloseIssue,
   completeCheck,
   completeLatestOwnReviewCheckAsSuccess,
-  createFollowupIssue,
   createInProgressCheck,
-  ensureLabelExists,
   getPullRequestStatus,
   isReviewThreadResolved,
   isPullRequestIssue,
@@ -38,7 +35,11 @@ import {
   type ReviewTrigger,
   updateInProgressCheck,
 } from "./github.js";
-import type { ReviewFindingStore } from "./workflow.js";
+import type {
+  CachedReviewRun,
+  ReviewFindingStore,
+  ReviewGateFindingStore,
+} from "./workflow.js";
 import {
   isBlocking,
   isBlockingAfterConvergence,
@@ -51,21 +52,39 @@ import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./teleg
 import { parseBotCommand, truncate } from "./text.js";
 import type { ReviewRunRecord } from "./review-run.js";
 import {
-  evaluateReviewGate,
-  type ReviewGateEvaluation,
-  type ReviewGateFatalBlocker,
-} from "./review-gate.js";
+  type MiniMaxReviewCandidate,
+} from "./minimax-review.js";
 import {
-  buildChangedLineEvidence,
-  isGroundedFatalBlocker,
-  isGroundedTestEvidence,
-} from "./review-grounding.js";
+  evaluateMiniMaxReviewGateCandidates,
+} from "./review-gate-pipeline.js";
 import {
-  resolveReviewGateSecondOpinion,
-  shouldRunReviewGateSecondOpinion,
-} from "./review-resolution.js";
+  fingerprintReviewFinding,
+  hashReviewFindingEvidence,
+  reconcileReviewFindingLedger,
+  refuteReviewFinding,
+  type ReviewFindingCandidate,
+  type ReviewFindingRegressionEvidence,
+  type StoredReviewFinding,
+} from "./review-finding-ledger.js";
+import {
+  formatReviewGateCheckOutput,
+  formatReviewGateFinding,
+  type ReviewGatePublicFinding,
+  type ReviewGatePublicVerdict,
+} from "./review-gate-format.js";
+import {
+  evaluateReviewAcceptanceCoverage,
+  normalizeReviewAcceptanceEvidence,
+} from "./review-acceptance-coverage.js";
+import {
+  REVIEW_GATE_CACHE_SCHEMA_VERSION,
+  decodeReviewGateCache,
+  encodeReviewGateCache,
+  type MiniMaxReviewGateCacheEnvelope,
+} from "./review-gate-cache.js";
 import {
   BOT_GITHUB_LOGIN,
+  LEGACY_BOT_GITHUB_LOGIN,
   bodyIncludesBotActionMarker,
   botActionMarker,
   botAutoSquashMergeFailedMarker,
@@ -81,7 +100,7 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
-const REVIEW_GATE_PROMPT_VERSION = "conservative-merge-gate-v2";
+const REVIEW_GATE_PROMPT_VERSION = "conservative-merge-gate-v4";
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
@@ -111,6 +130,18 @@ type OffloadedFinding = {
   finding: ClassifiedFinding;
   issueNumber: number;
   url: string;
+};
+
+type ReviewGateLedgerSnapshot = {
+  records: Array<{
+    finding: StoredReviewFinding;
+    reviewCommentId: number | null;
+    threadNodeId: string | null;
+  }>;
+  expectedHeadByFingerprint: Map<string, string | null>;
+  expectedContextByFingerprint: Map<string, string | null>;
+  publishedFingerprints: Set<string>;
+  threadByFingerprint: Map<string, { threadId: string; commentId: number | null }>;
 };
 
 type Logger = {
@@ -165,6 +196,14 @@ export type WorkflowExecution = {
   findActiveReview?: (record: WorkflowTargetRecord) => Promise<ActiveReviewWorkflow | null>;
   enqueueSynthetic?: (eventName: string, dedupeKey: string, payload: any, delayMs?: number) => Promise<boolean>;
   reviewFindingStore?: ReviewFindingStore;
+  reviewGateFindingStore?: ReviewGateFindingStore;
+  findCachedReviewGateRun?: (
+    repoFullName: string,
+    prNumber: number,
+    headSha: string,
+    promptVersion: string,
+    contextSha256: string,
+  ) => Promise<CachedReviewRun | null>;
   recordReviewRun?: (record: ReviewRunRecord) => Promise<void>;
 };
 
@@ -1254,6 +1293,42 @@ export class PrBot {
     }
   }
 
+  private async discardStaleTrackedCheck(
+    check: ActiveCheckRun | null,
+    headSha: string,
+  ): Promise<void> {
+    if (!check) {
+      return;
+    }
+    try {
+      const { data } = await check.octokit.rest.checks.get({
+        owner: check.repo.owner,
+        repo: check.repo.repo,
+        check_run_id: check.checkRunId,
+      });
+      if (data.status === "completed") {
+        this.releaseTrackedCheck(check);
+        return;
+      }
+      await this.completeTrackedCheck(
+        check,
+        "cancelled",
+        "오래된 리뷰 결과 폐기",
+        [
+          `HEAD: \`${headSha}\``,
+          "",
+          "더 최신인 같은 HEAD 검증 결과가 저장되어 이 작업의 게시를 취소했습니다.",
+        ].join("\n"),
+      );
+    } catch (error) {
+      this.releaseTrackedCheck(check);
+      this.logger.warn(
+        { error, repo: check.repo.fullName, checkRunId: check.checkRunId },
+        "failed to close stale review gate check",
+      );
+    }
+  }
+
   private releaseTrackedCheck(check: ActiveCheckRun | null): void {
     if (check) {
       this.activeChecks.delete(check.key);
@@ -1595,109 +1670,228 @@ export class PrBot {
     check: ActiveCheckRun | null,
     workflow?: WorkflowExecution,
   ): Promise<void> {
-    const prompt = this.structuredReviewPrompt(context, trigger);
-    const aiResult = await this.gemini.reviewStructuredWithMetadata(prompt);
-    const changedLines = buildChangedLineEvidence(context.visibleChangedPatches);
     const trustedRequest = this.trustedReviewRequest(trigger);
-    const trustedAcceptanceText = [context.acceptanceSourceText, trustedRequest]
-      .filter(Boolean)
-      .join("\n");
-    const testInventoryComplete = context.testInventoryComplete;
     const explicitAcceptanceCriteria = this.uniqueAcceptanceCriteria([
       ...context.explicitAcceptanceCriteria,
       ...listExplicitAcceptanceCriteria(trustedRequest),
     ]);
-    const evaluateOutput = (text: string): ReviewGateEvaluation =>
-      evaluateReviewGate(text, {
-        testInventoryComplete,
-        requiresAutomatedEvidence: ["product_logic", "mixed"].includes(context.changeClass),
-        minimumAcceptanceCriteria: explicitAcceptanceCriteria.length,
-        explicitAcceptanceCriteria,
-        requiresExplicitAcceptanceCriteria: true,
-        evidenceValidators: {
-          sourceQuote: (criterion) =>
-            criterion.sourceQuote.trim().length >= 4 &&
-            criterion.sourceQuote.trim().toLowerCase() !== "(empty)" &&
-            this.evidenceIncludes(trustedAcceptanceText, criterion.sourceQuote),
-          testEvidence: (criterion, evidence) => isGroundedTestEvidence(context, criterion, evidence),
-          fatalBlocker: (blocker) => isGroundedFatalBlocker(context, changedLines, blocker),
-        },
-      });
-    let evaluation = evaluateOutput(aiResult.text);
-    await this.recordReviewGateRun(workflow, check, repo, prNumber, context, prompt, aiResult, evaluation);
+    const ledgerSnapshot = await this.loadReviewGateLedgerSnapshot(
+      octokit,
+      repo,
+      prNumber,
+      context,
+      workflow?.reviewGateFindingStore,
+    );
+    const prompts = this.miniMaxReviewGatePrompts(
+      context,
+      trigger,
+      explicitAcceptanceCriteria,
+      ledgerSnapshot.records.map((record) => record.finding),
+    );
+    const contextHash = this.reviewGateContextHash({
+      context,
+      trustedRequest,
+      explicitAcceptanceCriteria,
+      findings: ledgerSnapshot.records.map((record) => record.finding),
+    });
 
-    if (shouldRunReviewGateSecondOpinion(evaluation, this.config.aiReviewTiebreakerEnabled)) {
-      const secondOpinionProvider = this.config.aiReviewTiebreakerProvider;
-      const canRunSecondOpinion =
-        this.config.aiReviewTiebreakerEnabled &&
-        secondOpinionProvider !== aiResult.provider &&
-        this.gemini.canUseProviderAsSecondOpinion(secondOpinionProvider);
-
-      if (!canRunSecondOpinion) {
-        evaluation = this.abstainReviewGate(
-          evaluation,
-          "독립된 2차 모델을 사용할 수 없어 이번 자동 판정을 확정하지 않았습니다.",
-        );
-      } else {
-        try {
-          const secondOpinionResult = await this.gemini.reviewStructuredWithProvider(
-            prompt,
-            secondOpinionProvider,
-          );
-          const secondOpinionEvaluation = evaluateOutput(secondOpinionResult.text);
-          await this.recordReviewGateRun(
-            workflow,
-            check,
-            repo,
-            prNumber,
-            context,
-            prompt,
-            secondOpinionResult,
-            secondOpinionEvaluation,
-          );
-          evaluation = resolveReviewGateSecondOpinion(evaluation, secondOpinionEvaluation);
-        } catch (error) {
-          this.logger.warn(
-            {
-              error,
-              repo: repo.fullName,
-              prNumber,
-              headSha: context.headSha,
-              provider: secondOpinionProvider,
-            },
-            "review gate second opinion failed",
-          );
-          evaluation = this.abstainReviewGate(
-            evaluation,
-            "독립된 2차 검증을 완료하지 못해 이번 자동 판정을 확정하지 않았습니다.",
-          );
-        }
-      }
+    let cacheEnvelope: MiniMaxReviewGateCacheEnvelope | null = null;
+    try {
+      const cached = await workflow?.findCachedReviewGateRun?.(
+        repo.fullName,
+        prNumber,
+        context.headSha,
+        REVIEW_GATE_PROMPT_VERSION,
+        contextHash,
+      );
+      cacheEnvelope = cached
+        ? this.decodeReviewGateCache(cached, explicitAcceptanceCriteria)
+        : null;
+    } catch (error) {
+      this.logger.warn({ error, repo: repo.fullName, prNumber }, "review gate cache lookup failed");
     }
 
-    await this.recordReviewGateRun(
+    let envelope: MiniMaxReviewGateCacheEnvelope;
+    try {
+      if (cacheEnvelope) {
+        envelope = cacheEnvelope;
+        this.logger.info(
+          { repo: repo.fullName, prNumber, headSha: context.headSha },
+          "reused completed MiniMax review gate extraction",
+        );
+      } else {
+        const candidateResult = await this.gemini.reviewGateCandidates(
+          prompts.candidateSystem,
+          prompts.candidateUser,
+          explicitAcceptanceCriteria,
+        );
+        const verificationResult = candidateResult.value.candidates.length === 0
+          ? { verifications: [] }
+          : (await this.gemini.verifyReviewGateCandidates(
+              prompts.verifierSystem,
+              this.miniMaxVerifierPrompt(
+                prompts.candidateUser,
+                candidateResult.value.candidates,
+              ),
+              candidateResult.value.candidates,
+            )).value;
+        envelope = {
+          schemaVersion: REVIEW_GATE_CACHE_SCHEMA_VERSION,
+          acceptanceCoverage: candidateResult.value.acceptanceCoverage,
+          candidates: candidateResult.value.candidates,
+          verifications: verificationResult.verifications,
+        };
+      }
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, prNumber, headSha: context.headSha },
+        "MiniMax conservative review gate could not produce validated evidence",
+      );
+      const output = formatReviewGateCheckOutput({
+        headSha: context.headSha,
+        verdict: "ABSTAIN",
+        htmlMarkers: [`${NO_ACTION_REQUIRED_MARKER} head=${context.headSha}`],
+        abstainSummaryKo: "자동 검증을 완료하지 못했지만 작성자에게 확인을 떠넘기지 않고 병합을 차단하지 않습니다.",
+      });
+      await this.recordMiniMaxReviewGateRun(
+        workflow,
+        check,
+        repo,
+        prNumber,
+        context,
+        contextHash,
+        prompts,
+        null,
+        "ABSTAIN",
+        [error instanceof Error ? error.message : String(error)],
+      );
+      await this.completeTrackedCheck(check, output.conclusion, output.title, output.text);
+      return;
+    }
+
+    const pipeline = evaluateMiniMaxReviewGateCandidates({
+      candidates: envelope.candidates,
+      verifications: envelope.verifications,
+      explicitAcceptanceCriteria,
+      testInventoryComplete: context.testInventoryComplete,
+      testInventoryFileCount: context.testInventoryFileCount,
+      currentHeadFileContents: context.currentHeadFileContents,
+      visibleChangedPatches: context.visibleChangedPatches,
+    });
+    const coverage = evaluateReviewAcceptanceCoverage(
+      context,
+      explicitAcceptanceCriteria,
+      envelope.acceptanceCoverage,
+    );
+    const identity = { headSha: context.headSha, contextHash };
+    const regressionEvidence = await this.reviewGateRegressionEvidence(
+      octokit,
+      repo,
+      context.headSha,
+      ledgerSnapshot.records.map((record) => record.finding),
+      pipeline.ledgerCandidates,
+    );
+    const priorLedgerFindings = ledgerSnapshot.records.map((record) => record.finding);
+    const disprovenFingerprints = this.reviewGateDisprovenFingerprints(
+      coverage.groundedAcceptanceCriteria,
+      priorLedgerFindings,
+    );
+    const evidenceInventory = this.reviewGateEvidenceInventory(
+      priorLedgerFindings,
+      pipeline.ledgerCandidates,
+      context,
+      disprovenFingerprints,
+    );
+    const ledger = reconcileReviewFindingLedger(
+      priorLedgerFindings,
+      {
+        identity,
+        candidates: pipeline.ledgerCandidates,
+        evidenceInventory,
+        regressionEvidence,
+      },
+    );
+
+    const publicByFingerprint = new Map(
+      pipeline.accepted.map((accepted) => [
+        fingerprintReviewFinding(accepted.ledgerCandidate),
+        accepted.publicFinding,
+      ]),
+    );
+    const openFindings = ledger.findings.filter((finding) => finding.state === "open");
+    const currentConfirmedFingerprints = new Set(
+      pipeline.ledgerCandidates.map((candidate) => fingerprintReviewFinding(candidate)),
+    );
+    const blockingOpenFindings = openFindings.filter((finding) =>
+      currentConfirmedFingerprints.has(finding.semanticFingerprint),
+    );
+    const hasUnresolvedValidation =
+      !pipeline.inputValid ||
+      !context.fatalContextComplete ||
+      !coverage.complete ||
+      blockingOpenFindings.length !== openFindings.length ||
+      pipeline.rejected.some((rejected) => {
+        const verification = envelope.verifications.find((item) => item.candidateId === rejected.candidateId);
+        return verification?.verdict === "uncertain";
+      });
+    const verdict: ReviewGatePublicVerdict = blockingOpenFindings.length > 0
+      ? "FAIL"
+      : hasUnresolvedValidation
+        ? "ABSTAIN"
+        : "PASS";
+    const publicFindings = verdict === "FAIL"
+      ? this.reviewGatePublicFindings(blockingOpenFindings, publicByFingerprint, context)
+      : [];
+    const output = formatReviewGateCheckOutput({
+      headSha: context.headSha,
+      verdict,
+      findings: publicFindings,
+      htmlMarkers: [
+        verdict === "FAIL"
+          ? `${ACTION_REQUIRED_MARKER} kind=review-gate head=${context.headSha}`
+          : `${NO_ACTION_REQUIRED_MARKER} head=${context.headSha}`,
+      ],
+      passSummaryKo: explicitAcceptanceCriteria.length === 0
+        ? "명시적 인수조건이 없어 현재 변경 전체에서 치명 결함만 검사했으며, 증명된 치명 결함이 없습니다."
+        : "모든 자동 검증 대상 인수조건의 현재 HEAD 테스트 근거와 변경 전체의 치명 결함 검사를 확인했습니다.",
+      abstainSummaryKo: "현재 근거만으로 확정할 수 없지만 작성자에게 추가 확인을 요구하지 않고 병합을 차단하지 않습니다.",
+      coveredCriteria: verdict === "PASS"
+        ? envelope.acceptanceCoverage.flatMap((item) =>
+            item.testEvidence && coverage.groundedAcceptanceCriteria.has(
+              normalizeReviewAcceptanceEvidence(item.acceptanceCriterion),
+            )
+              ? [{
+                  criterionId: item.criterionId,
+                  acceptanceCriterion: item.acceptanceCriterion,
+                  file: item.testEvidence.file,
+                  line: item.testEvidence.line,
+                  testName: item.testEvidence.testName,
+                }]
+              : [])
+        : [],
+    });
+
+    await this.recordMiniMaxReviewGateRun(
       workflow,
       check,
       repo,
       prNumber,
       context,
-      prompt,
-      {
-        provider: "host",
-        model: "review-gate-consensus-v2",
-        text: JSON.stringify({
-          verdict: evaluation.decision.verdict,
-          failure_kind: evaluation.decision.failureKind,
-          reasons: evaluation.decision.reasons,
-        }),
-      },
-      evaluation,
+      contextHash,
+      prompts,
+      envelope,
+      verdict,
+      [
+        ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
+        ...coverage.validationErrors,
+        ...(!context.fatalContextComplete ? ["fatal_context_incomplete"] : []),
+      ],
     );
 
     if (await this.cancelTrackedCheckIfShuttingDown(check, "리뷰 취소", "리뷰 결과를 게시하기 전에 봇이 중지되었습니다.")) {
       return;
     }
-    const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+    let latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
     if (!latest) {
       return;
     }
@@ -1708,43 +1902,88 @@ export class PrBot {
       return;
     }
 
-    const summary = this.buildReviewGateSummary(context.headSha, evaluation, testInventoryComplete);
-    if (evaluation.decision.verdict === "FAIL") {
-      const inlineComments: InlineReviewComment[] = evaluation.decision.fatalBlockers.map((blocker) => ({
-        path: blocker.file,
-        line: blocker.line,
-        body: this.fatalBlockerInlineBody(blocker),
-      }));
-      const missingTests = evaluation.decision.failureKind === "missing_tests";
-      const reviewBody = this.actionRequiredText(
-        missingTests ? "review-test" : "review-fatal",
-        context.headSha,
-        summary,
+    const ledgerPersisted = await this.persistReviewGateLedger(
+      octokit,
+      repo,
+      prNumber,
+      ledgerSnapshot,
+      ledger.findings,
+      ledger.transitions.filter((transition) => transition.kind === "resolved").map((transition) => transition.finding),
+      workflow?.reviewGateFindingStore,
+    );
+    if (!ledgerPersisted) {
+      this.logger.info(
+        { repo: repo.fullName, prNumber, headSha: context.headSha },
+        "stale review gate result discarded before GitHub publication",
       );
-      await this.safeSubmitReview(
-        octokit,
-        repo,
-        prNumber,
-        context.headSha,
-        "REQUEST_CHANGES",
-        reviewBody,
-        inlineComments,
-      );
-      await this.completeTrackedCheck(
-        check,
-        "action_required",
-        missingTests ? "인수조건 테스트 누락" : "치명 결함 확인",
-        reviewBody,
-      );
+      await this.discardStaleTrackedCheck(check, context.headSha);
+      return;
+    }
+    latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+    if (!latest) {
+      return;
+    }
+    if (this.hasMergeConflict(latest)) {
+      const conflictText = this.mergeConflictText(repo, prNumber, latest);
+      await requestChangesPullRequest(octokit, repo, prNumber, conflictText, latest.headSha);
+      await this.completeTrackedCheck(check, "action_required", "병합 충돌 해결 필요", conflictText);
       return;
     }
 
-    if (evaluation.decision.verdict === "ABSTAIN") {
-      const noteBody = [`<!-- ${NO_ACTION_REQUIRED_MARKER} head=${context.headSha} -->`, summary].join("\n");
-      await postPrComment(octokit, repo, prNumber, noteBody);
-      await this.completeTrackedCheck(check, "neutral", "자동 판정 제한 · 병합 비차단", noteBody);
+    if (verdict === "FAIL") {
+      const transitionByFingerprint = new Map(
+        ledger.transitions.map((transition) => [transition.semanticFingerprint, transition.kind]),
+      );
+      const publishableFingerprints = new Set(
+        blockingOpenFindings
+          .map((finding) => finding.semanticFingerprint)
+          .filter((fingerprint) => {
+            if (!ledgerSnapshot.publishedFingerprints.has(fingerprint)) {
+              return true;
+            }
+            const transition = transitionByFingerprint.get(fingerprint);
+            return transition === "updated" || transition === "reopened";
+          }),
+      );
+      if (publishableFingerprints.size > 0) {
+        const inlineComments: InlineReviewComment[] = publicFindings
+          .filter((finding) =>
+            finding.kind === "fatal_defect" &&
+            Boolean(finding.fingerprint && publishableFingerprints.has(finding.fingerprint)))
+          .map((finding, index) => ({
+            path: finding.kind === "fatal_defect" ? finding.evidence.file : "",
+            line: finding.kind === "fatal_defect" ? finding.evidence.line : 1,
+            body: formatReviewGateFinding(finding, index + 1),
+          }));
+        await this.safeSubmitReview(
+          octokit,
+          repo,
+          prNumber,
+          context.headSha,
+          "REQUEST_CHANGES",
+          output.text,
+          inlineComments,
+        );
+        await this.refreshPublishedReviewGateThreads(
+          octokit,
+          repo,
+          prNumber,
+          ledger.findings,
+          workflow?.reviewGateFindingStore,
+        );
+      }
+      await this.completeTrackedCheck(check, output.conclusion, output.title, output.text);
       return;
     }
+
+    if (verdict === "ABSTAIN") {
+      await this.completeTrackedCheck(check, output.conclusion, output.title, output.text);
+      return;
+    }
+
+    const passReason = explicitAcceptanceCriteria.length === 0
+      ? "명시적 인수조건이 없어 치명 결함만 검사했고 증명된 결함이 없습니다."
+      : "명시적 인수조건 테스트가 확인됐고 증명된 치명 결함이 없습니다.";
 
     if (this.hasFailingStatusChecks(latest)) {
       const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
@@ -1765,8 +2004,8 @@ export class PrBot {
           mode: "review_gate",
           sender: trigger.sender,
           source: trigger.source,
-          reason: "명시적 인수조건 테스트가 확인됐고 증명된 치명 결함이 없습니다.",
-          body: summary,
+          reason: passReason,
+          body: output.text,
         },
         this.hasPendingStatusChecks(latest) ? this.config.ciRecheckIntervalMs : this.config.ciInitialWaitMs,
       );
@@ -1780,24 +2019,19 @@ export class PrBot {
       latest,
       this.approvalText(
         trigger.sender,
-        "명시적 인수조건 테스트가 확인됐고 증명된 치명 결함이 없습니다.",
+        passReason,
         latest.headSha,
-        summary,
+        output.text,
       ),
       {
         mode: "review_gate",
         sender: trigger.sender,
         source: trigger.source,
-        reason: "명시적 인수조건 테스트가 확인됐고 증명된 치명 결함이 없습니다.",
+        reason: passReason,
       },
     );
-    await this.completeTrackedCheck(check, "success", "보수적 게이트 통과", summary);
+    await this.completeTrackedCheck(check, output.conclusion, output.title, output.text);
     await this.maybeSquashMergeApprovedPullRequest(octokit, repo, prNumber, latest.headSha, "review_gate");
-  }
-
-  private evidenceIncludes(haystack: string, needle: string): boolean {
-    const normalizedNeedle = this.normalizedEvidence(needle);
-    return normalizedNeedle.length > 0 && this.normalizedEvidence(haystack).includes(normalizedNeedle);
   }
 
   private normalizedEvidence(value: string): string {
@@ -1815,49 +2049,172 @@ export class PrBot {
     return [...unique.values()];
   }
 
-  private abstainReviewGate(
-    evaluation: ReviewGateEvaluation,
-    reason: string,
-  ): ReviewGateEvaluation {
-    return {
-      ...evaluation,
-      decision: {
-        verdict: "ABSTAIN",
-        failureKind: null,
-        reasons: [reason],
-        missingCriteria: [],
-        fatalBlockers: [],
-      },
-    };
+  private miniMaxReviewGatePrompts(
+    context: PullRequestContext,
+    trigger: ReviewTrigger,
+    explicitAcceptanceCriteria: readonly string[],
+    priorFindings: readonly StoredReviewFinding[],
+  ): {
+    candidateSystem: string;
+    candidateUser: string;
+    verifierSystem: string;
+  } {
+    const candidateSystem = [
+      "당신은 Seori의 보수적 PR 병합 게이트에서 후보만 찾는 조사자입니다. 최종 판정자는 host입니다.",
+      "일반 코드 리뷰, 개선 제안, 스타일, 유지보수성, 잠재 위험, 검증 요청은 출력하지 마세요.",
+      "허용 후보는 최대 2개이며 fatal_defect 또는 missing_acceptance_test뿐입니다.",
+      "모든 공개 설명 필드는 한글로 쓰고 경로, symbol, code_quote, 인수조건 원문은 입력 그대로 복사하세요.",
+      "현재 HEAD의 제공된 코드와 테스트 인벤토리만 근거로 사용하고, 이전 Seori 지적은 증거로 사용하지 마세요.",
+      "acceptance_coverage에는 Host가 준 모든 AC를 AC-1부터 순서와 원문 그대로 한 번씩 제출하세요. AC가 없으면 빈 배열입니다.",
+      "covered는 실행되는 현재 HEAD 테스트 안의 정확한 assertion 한 줄이 해당 AC 전체를 직접 증명할 때만 사용하고, file/line/test_name/assertion_quote를 정확히 복사하세요.",
+      "전체 테스트 인벤토리가 불완전하거나 테스트 근거를 확정하지 못하면 missing이 아니라 unknown입니다. complete inventory에서 대응 테스트가 없을 때만 missing입니다.",
+      "missing_acceptance_test는 host가 test_inventory_complete=true라고 명시했고 AC-N 원문에 대응하는 테스트가 전체 인벤토리에 없을 때만 제출하세요.",
+      "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
+      "치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하고, 마지막 근거는 결과를 직접 일으키는 root line이어야 합니다.",
+      "가드가 있는 경로, 단순 return false/null, UI 옵션, deny 규칙, 부분 diff의 부재, 프레임워크 동작 추측은 치명 결함이 아닙니다.",
+      "refuted 상태는 현재 Changed Files에 같은 file/symbol의 새 added root가 직접 보일 때만 회귀 후보로 제출하세요. 현재 파일에 코드가 남았다는 이유만으로 반복하지 마세요.",
+      "후보가 없더라도 acceptance_coverage는 모두 채우고 candidates만 빈 배열로 제출하세요.",
+      "예시 1: complete inventory에 AC 테스트가 없으면 missing_acceptance_test 후보입니다.",
+      "예시 2: 테스트 파일 일부만 보이고 테스트를 못 찾았으면 후보가 아니라 빈 배열입니다.",
+      "예시 3: 정상 호출에서 guard 없이 persistent storage delete가 직접 실행되고 전 경로가 보이면 fatal_defect 후보입니다.",
+      "예시 4: pointerEvents, ref 연결, 일반 false 반환처럼 런타임 결과를 추측해야 하면 후보가 아닙니다.",
+    ].join("\n");
+    const verifierSystem = [
+      "당신은 Seori 병합 게이트의 반증 우선 검증자입니다. 전달된 후보는 신뢰하지 마세요.",
+      "현재 HEAD에서 기존 테스트, 가드, 호출 조건, 반대 코드, 이미 적용된 수정부터 찾아 후보를 깨뜨리세요.",
+      "직접 반증되면 rejected, 근거가 일부라도 부족하면 uncertain, 모든 조건과 정확한 종단 근거가 남을 때만 confirmed입니다.",
+      "fatal_defect confirmed/rejected는 현재 HEAD의 동일 root file:line:code_quote를 포함해야 합니다.",
+      "missing_acceptance_test는 host의 complete inventory와 AC 원문만으로 confirmed할 수 있으며 코드 evidence는 비워 둡니다.",
+      "reason_ko와 evidence 설명은 한글로 쓰고 정의된 submit_review 도구를 정확히 한 번 사용하세요.",
+    ].join("\n");
+    const criteria = explicitAcceptanceCriteria.length === 0
+      ? "(명시적 인수조건 없음)"
+      : explicitAcceptanceCriteria.map((criterion, index) => `AC-${index + 1}: ${criterion}`).join("\n");
+    const ledger = priorFindings.length === 0
+      ? "(이전 지적 없음)"
+      : [...priorFindings]
+          .sort((left, right) => left.semanticFingerprint.localeCompare(right.semanticFingerprint))
+          .map((finding) => {
+            const target = finding.candidate.file
+              ? `${finding.candidate.file}#${finding.candidate.symbol || "(symbol 없음)"}`
+              : finding.candidate.kind === "missing_tests"
+                ? finding.candidate.acceptanceCriterion
+                : "(target 없음)";
+            return `- ${finding.semanticFingerprint} state=${finding.state} kind=${finding.candidate.kind} target=${target}`;
+          })
+          .join("\n");
+    const trustedRequest = this.trustedReviewRequest(trigger);
+    const candidateUser = [
+      `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`,
+      "## Host 검증 사실",
+      `head_sha: ${context.headSha}`,
+      `change_class: ${context.changeClass}`,
+      `test_inventory_complete: ${context.testInventoryComplete}`,
+      `test_inventory_file_count: ${context.testInventoryFileCount}`,
+      `fatal_context_complete: ${context.fatalContextComplete}`,
+      "",
+      "## Host가 추출한 명시적 인수조건",
+      criteria,
+      "",
+      "## 신뢰된 명시 요청",
+      trustedRequest || "(없음)",
+      "",
+      "## 지적 원장",
+      ledger,
+      "",
+      context.reviewGateMarkdown,
+      "",
+      "## 수행할 작업",
+      "위 현재 HEAD 근거만으로 허용된 후보를 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
+    ].join("\n");
+    return { candidateSystem, candidateUser, verifierSystem };
   }
 
-  private async recordReviewGateRun(
+  private miniMaxVerifierPrompt(
+    candidateUser: string,
+    candidates: readonly MiniMaxReviewCandidate[],
+  ): string {
+    return [
+      candidateUser,
+      "",
+      "## 반증할 후보",
+      JSON.stringify({ candidates }, null, 2),
+      "",
+      "## 수행할 작업",
+      "각 후보를 현재 HEAD에서 먼저 반증하고, 후보 순서대로 confirmed/rejected/uncertain 중 하나를 submit_review 도구로 제출하세요.",
+    ].join("\n");
+  }
+
+  private reviewGateContextHash(input: {
+    context: PullRequestContext;
+    trustedRequest: string;
+    explicitAcceptanceCriteria: readonly string[];
+    findings: readonly StoredReviewFinding[];
+  }): string {
+    const canonical = {
+      version: REVIEW_GATE_PROMPT_VERSION,
+      reviewGateMarkdown: input.context.reviewGateMarkdown,
+      trustedRequest: input.trustedRequest,
+      explicitAcceptanceCriteria: input.explicitAcceptanceCriteria,
+      testInventoryComplete: input.context.testInventoryComplete,
+      testInventoryFileCount: input.context.testInventoryFileCount,
+      fatalContextComplete: input.context.fatalContextComplete,
+      findings: [...input.findings]
+        .sort((left, right) => left.semanticFingerprint.localeCompare(right.semanticFingerprint))
+        .map((finding) => ({
+          semanticFingerprint: finding.semanticFingerprint,
+          evidenceHash: finding.evidenceHash,
+          state: finding.state,
+          candidate: finding.candidate,
+          refutation: finding.refutation,
+        })),
+    };
+    return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+  }
+
+  private decodeReviewGateCache(
+    cached: CachedReviewRun,
+    explicitAcceptanceCriteria: readonly string[],
+  ): MiniMaxReviewGateCacheEnvelope | null {
+    if (cached.verdict === "ABSTAIN") {
+      return null;
+    }
+    return decodeReviewGateCache(cached.rawOutput, explicitAcceptanceCriteria);
+  }
+
+  private async recordMiniMaxReviewGateRun(
     workflow: WorkflowExecution | undefined,
     check: ActiveCheckRun | null,
     repo: RepoRef,
     prNumber: number,
     context: PullRequestContext,
-    prompt: string,
-    aiResult: { text: string; provider: string; model: string },
-    evaluation: ReviewGateEvaluation,
+    contextHash: string,
+    prompts: { candidateSystem: string; candidateUser: string; verifierSystem: string },
+    envelope: MiniMaxReviewGateCacheEnvelope | null,
+    verdict: ReviewGatePublicVerdict,
+    validationErrors: string[],
   ): Promise<void> {
+    const promptDigestInput = [
+      prompts.candidateSystem,
+      prompts.candidateUser,
+      prompts.verifierSystem,
+    ].join("\n---\n");
     const record: ReviewRunRecord = {
       repoFullName: repo.fullName,
       prNumber,
       headSha: context.headSha,
       checkRunId: check?.checkRunId ?? workflow?.checkRunId ?? null,
-      provider: aiResult.provider,
-      model: aiResult.model,
+      provider: "host",
+      model: "MiniMax-M3-candidate-verifier",
       promptVersion: REVIEW_GATE_PROMPT_VERSION,
-      promptSha256: createHash("sha256").update(prompt).digest("hex"),
-      contextSha256: createHash("sha256").update(context.reviewGateMarkdown).digest("hex"),
-      rawOutput: aiResult.text,
-      parseValid: evaluation.response !== null,
-      verdict: evaluation.decision.verdict,
-      validationErrors: [
-        ...evaluation.parseErrors,
-        ...(evaluation.decision.verdict === "ABSTAIN" ? evaluation.decision.reasons : []),
-      ],
+      promptSha256: createHash("sha256").update(promptDigestInput).digest("hex"),
+      contextSha256: contextHash,
+      rawOutput: envelope
+        ? JSON.stringify(encodeReviewGateCache(envelope))
+        : JSON.stringify({ schemaVersion: REVIEW_GATE_CACHE_SCHEMA_VERSION, error: "validation_failed" }),
+      parseValid: envelope !== null,
+      verdict,
+      validationErrors,
     };
 
     try {
@@ -1874,142 +2231,439 @@ export class PrBot {
         repo: repo.fullName,
         prNumber,
         headSha: context.headSha,
-        provider: aiResult.provider,
-        model: aiResult.model,
+        provider: record.provider,
+        model: record.model,
         promptVersion: REVIEW_GATE_PROMPT_VERSION,
-        verdict: evaluation.decision.verdict,
+        verdict,
+        validationErrors: validationErrors.length,
       },
       "conservative review gate evaluated",
     );
   }
 
-  private buildReviewGateSummary(
-    headSha: string,
-    evaluation: ReviewGateEvaluation,
-    hostInventoryComplete: boolean,
-  ): string {
-    const response = evaluation.response;
-    const verdictLabels = {
-      PASS: "통과",
-      FAIL: "차단",
-      ABSTAIN: "자동 판정 제한",
-    } as const;
-    const testabilityLabels = {
-      automated: "자동화",
-      manual: "수동",
-      not_applicable: "해당 없음",
-    } as const;
-    const coverageLabels = {
-      covered: "확인됨",
-      missing: "테스트 없음",
-      unknown: "확인 불가",
-    } as const;
-    const lines = [
-      "## Seori 보수적 병합 게이트",
-      "",
-      `HEAD: \`${headSha}\``,
-      `판정: **${verdictLabels[evaluation.decision.verdict]}**`,
-      `현재 HEAD 테스트 목록: **${hostInventoryComplete ? "전체 확인" : "일부 확인"}**`,
-    ];
-
-    if (response?.criteria.length) {
-      lines.push("", "### 인수조건 테스트 증거");
-      for (const criterion of response.criteria) {
-        const marker =
-          criterion.testability !== "automated"
-            ? "➖"
-            : criterion.coverage === "covered"
-              ? "✅"
-              : criterion.coverage === "missing"
-                ? "❌"
-                : "❓";
-        const evidence = criterion.testEvidence
-          ? ` — \`${criterion.testEvidence.file}\` / ${criterion.testEvidence.testName}`
-          : "";
-        lines.push(
-          `- ${marker} **${criterion.id}** [${testabilityLabels[criterion.testability]}/${coverageLabels[criterion.coverage]}] ${truncate(criterion.sourceQuote, 220)}${evidence}`,
-        );
-      }
-    }
-
-    if (evaluation.decision.fatalBlockers.length > 0) {
-      lines.push("", "### 증명된 치명 결함");
-      for (const blocker of evaluation.decision.fatalBlockers) {
-        lines.push(
-          `- \`${blocker.file}:${blocker.line}\` **${this.fatalOutcomeLabel(blocker.outcome)}** — ${truncate(blocker.causalChain, 300)}`,
-        );
-      }
-    }
-
-    if (evaluation.decision.missingCriteria.length > 0) {
-      lines.push("", "### 테스트가 없는 자동화 인수조건");
-      for (const criterion of evaluation.decision.missingCriteria) {
-        lines.push(`- **${criterion.id}** ${truncate(criterion.sourceQuote, 260)}`);
-      }
-    }
-
-    lines.push("", "### 판정 근거");
-    for (const reason of evaluation.decision.reasons) {
-      lines.push(`- ${truncate(reason, 600)}`);
-    }
-
-    if (evaluation.decision.verdict === "ABSTAIN") {
-      lines.push(
-        "",
-        "_모델 불확실성은 작성자 조치로 전환하지 않았으며 이 판정은 병합을 차단하지 않습니다._",
-      );
-    } else if (evaluation.decision.verdict === "PASS") {
-      lines.push(
-        "",
-        "_통과는 현재 HEAD에서 인수조건 테스트가 확인되고 치명 결함이 증명되지 않았다는 뜻이며, 일반 품질 리뷰를 대체하지 않습니다._",
-      );
-    } else if (evaluation.decision.failureKind === "missing_tests") {
-      lines.push("", "_PR 작성자가 누락된 인수조건 테스트를 추가하면 다시 자동 검토합니다._");
-    }
-
-    return lines.join("\n");
-  }
-
-  private fatalBlockerInlineBody(blocker: ReviewGateFatalBlocker): string {
-    return [
-      `**[치명 결함 · ${this.fatalOutcomeLabel(blocker.outcome)}]**`,
-      `트리거: ${blocker.trigger}`,
-      `인과 경로: ${blocker.causalChain}`,
-      `근거 코드: \`${truncate(blocker.codeQuote, 240)}\``,
-    ].join("\n\n");
-  }
-
-  private fatalOutcomeLabel(outcome: ReviewGateFatalBlocker["outcome"]): string {
-    const labels: Record<ReviewGateFatalBlocker["outcome"], string> = {
-      deterministic_crash: "일반 경로 확정적 크래시",
-      permanent_data_loss_or_corruption: "영구 데이터 손실·손상",
-      exploitable_security_or_privacy_exposure: "악용 가능한 보안·개인정보 노출",
-      primary_flow_unusable: "핵심 사용자 흐름 사용 불가",
-    };
-    return labels[outcome];
-  }
-
-  private structuredReviewPrompt(
+  private async loadReviewGateLedgerSnapshot(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
     context: PullRequestContext,
-    trigger: ReviewTrigger,
-  ): string {
-    const trustedRequest = this.trustedReviewRequest(trigger);
-    const explicitAcceptanceCriteria = this.uniqueAcceptanceCriteria([
-      ...context.explicitAcceptanceCriteria,
-      ...listExplicitAcceptanceCriteria(trustedRequest),
-    ]);
-    return [
-      `Review gate prompt version: ${REVIEW_GATE_PROMPT_VERSION}`,
-      "Evaluate only the trusted acceptance sources and current-HEAD evidence below.",
-      "Do not use prior Seori findings as acceptance criteria or evidence.",
-      "",
-      `Trigger: ${trigger.source}`,
-      `Requested by: ${trigger.sender}`,
-      trustedRequest ? `Trusted user request: ${trustedRequest}` : "Trusted user request: (none)",
-      `Minimum explicit acceptance criteria including request: ${explicitAcceptanceCriteria.length}`,
-      "",
-      context.reviewGateMarkdown,
-    ].join("\n");
+    store: ReviewGateFindingStore | undefined,
+  ): Promise<ReviewGateLedgerSnapshot> {
+    const storedRecords = store
+      ? await store.listReviewGateFindings(repo.fullName, prNumber)
+      : [];
+    const expectedHeadByFingerprint = new Map(
+      storedRecords.map((record) => [
+        record.finding.semanticFingerprint,
+        record.finding.lastEvaluatedHeadSha || null,
+      ]),
+    );
+    const expectedContextByFingerprint = new Map(
+      storedRecords.map((record) => [
+        record.finding.semanticFingerprint,
+        record.finding.contextHash || null,
+      ]),
+    );
+    const publishedFingerprints = new Set<string>();
+    const threadByFingerprint = new Map<string, { threadId: string; commentId: number | null }>();
+    let threads: Awaited<ReturnType<typeof listReviewThreads>> = [];
+
+    const collectMarkers = (body: string): void => {
+      for (const match of body.matchAll(/seori-finding:([0-9a-f]{64})/gu)) {
+        publishedFingerprints.add(match[1]);
+      }
+    };
+
+    try {
+      threads = await listReviewThreads(octokit, repo, prNumber);
+      for (const thread of threads) {
+        for (const body of thread.bodies) {
+          collectMarkers(body);
+          for (const match of body.matchAll(/seori-finding:([0-9a-f]{64})/gu)) {
+            if (!threadByFingerprint.has(match[1])) {
+              threadByFingerprint.set(match[1], {
+                threadId: thread.threadId,
+                commentId: thread.commentDatabaseIds[0] ?? null,
+              });
+            }
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.warn({ error, repo: repo.fullName, prNumber }, "failed to inspect review gate threads");
+    }
+
+    try {
+      const [reviews, comments] = await Promise.all([
+        octokit.paginate(octokit.rest.pulls.listReviews, {
+          owner: repo.owner,
+          repo: repo.repo,
+          pull_number: prNumber,
+          per_page: 100,
+        }),
+        octokit.paginate(octokit.rest.issues.listComments, {
+          owner: repo.owner,
+          repo: repo.repo,
+          issue_number: prNumber,
+          per_page: 100,
+        }),
+      ]);
+      for (const entry of [...reviews, ...comments]) {
+        collectMarkers(String(entry.body || ""));
+      }
+    } catch (error) {
+      this.logger.warn({ error, repo: repo.fullName, prNumber }, "failed to recover published review gate markers");
+    }
+
+    const provisionalIdentity = {
+      headSha: context.headSha,
+      contextHash: createHash("sha256").update(context.reviewGateMarkdown).digest("hex"),
+    };
+    const records = storedRecords.map((record) => {
+      const mappedThread = threadByFingerprint.get(record.finding.semanticFingerprint);
+      const thread = threads.find((item) =>
+        item.threadId === record.threadNodeId || item.threadId === mappedThread?.threadId,
+      );
+      let finding = record.finding;
+      if (finding.state === "open" && thread) {
+        const maintainerReply = thread.comments.find((comment) =>
+          comment.authorLogin !== BOT_GITHUB_LOGIN &&
+          comment.authorLogin !== LEGACY_BOT_GITHUB_LOGIN &&
+          !comment.authorLogin.toLowerCase().endsWith("[bot]") &&
+          isTrustedAssociation(comment.authorAssociation, this.config) &&
+          /^\s*\/seori\s+refute(?:\s+.+)?\s*$/imu.test(comment.body),
+        );
+        const humanResolved = Boolean(
+          thread.isResolved &&
+          thread.resolvedByLogin &&
+          thread.resolvedByLogin !== BOT_GITHUB_LOGIN &&
+          thread.resolvedByLogin !== LEGACY_BOT_GITHUB_LOGIN &&
+          context.headSha !== finding.lastSeenHeadSha,
+        );
+        if (maintainerReply || humanResolved) {
+          const evidence = maintainerReply?.body ||
+            `관리자 ${thread.resolvedByLogin || "unknown"}가 리뷰 스레드를 해결 처리했습니다.`;
+          finding = refuteReviewFinding(finding, provisionalIdentity, truncate(evidence, 1_000));
+        }
+      }
+      return {
+        finding,
+        reviewCommentId: mappedThread?.commentId ?? record.reviewCommentId,
+        threadNodeId: mappedThread?.threadId ?? record.threadNodeId,
+      };
+    });
+
+    return {
+      records,
+      expectedHeadByFingerprint,
+      expectedContextByFingerprint,
+      publishedFingerprints,
+      threadByFingerprint,
+    };
+  }
+
+  private reviewGateEvidenceInventory(
+    priorFindings: readonly StoredReviewFinding[],
+    currentCandidates: readonly ReviewFindingCandidate[],
+    context: PullRequestContext,
+    disprovenFingerprints: ReadonlySet<string>,
+  ): {
+    complete: boolean;
+    evidenceHashes: string[];
+    provenAbsentFingerprints: string[];
+  } {
+    const currentByFingerprint = new Map(
+      currentCandidates.map((candidate) => [fingerprintReviewFinding(candidate), candidate]),
+    );
+    const evidenceHashes = new Set(
+      currentCandidates.map((candidate) => hashReviewFindingEvidence(candidate.evidence)),
+    );
+    const provenAbsentFingerprints = new Set<string>();
+    let complete = true;
+
+    for (const prior of priorFindings) {
+      if (prior.state !== "open" || currentByFingerprint.has(prior.semanticFingerprint)) {
+        continue;
+      }
+      if (prior.candidate.kind === "missing_tests") {
+        if (disprovenFingerprints.has(prior.semanticFingerprint)) {
+          // A grounded current-HEAD test is direct positive counterevidence for
+          // this exact AC. It does not require an exhaustive inventory to prove
+          // that the previously missing test now exists.
+          provenAbsentFingerprints.add(prior.semanticFingerprint);
+          continue;
+        }
+        if (!context.testInventoryComplete) {
+          complete = false;
+        } else {
+          // Candidate omission is not proof that a test was added. Keep the
+          // finding open until host-grounded current-HEAD evidence disproves it.
+          evidenceHashes.add(prior.evidenceHash);
+        }
+        continue;
+      }
+      const file = prior.candidate.file;
+      const content = file ? context.currentHeadFileContents[file] : undefined;
+      if (content === undefined) {
+        complete = false;
+        continue;
+      }
+      if (disprovenFingerprints.has(prior.semanticFingerprint)) {
+        provenAbsentFingerprints.add(prior.semanticFingerprint);
+        continue;
+      }
+      const normalizedLines = new Set(
+        content.split(/\r?\n/gu).map((line) => this.normalizedEvidence(line)),
+      );
+      const exactEvidenceStillPresent = prior.candidate.evidence
+        .filter((evidence) => evidence.kind === "code")
+        .every((evidence) => normalizedLines.has(this.normalizedEvidence(evidence.quote)));
+      if (exactEvidenceStillPresent) {
+        evidenceHashes.add(prior.evidenceHash);
+      } else {
+        provenAbsentFingerprints.add(prior.semanticFingerprint);
+      }
+    }
+
+    return {
+      complete,
+      evidenceHashes: [...evidenceHashes].sort(),
+      provenAbsentFingerprints: [...provenAbsentFingerprints].sort(),
+    };
+  }
+
+  private reviewGateDisprovenFingerprints(
+    groundedAcceptanceCriteria: ReadonlySet<string>,
+    priorFindings: readonly StoredReviewFinding[],
+  ): Set<string> {
+    const result = new Set<string>();
+    for (const prior of priorFindings) {
+      if (
+        prior.state === "open" &&
+        prior.candidate.kind === "missing_tests" &&
+        groundedAcceptanceCriteria.has(
+          this.normalizedEvidence(prior.candidate.acceptanceCriterion).toLowerCase(),
+        )
+      ) {
+        result.add(prior.semanticFingerprint);
+      }
+    }
+    return result;
+  }
+
+  private async reviewGateRegressionEvidence(
+    octokit: Octokit,
+    repo: RepoRef,
+    headSha: string,
+    priorFindings: readonly StoredReviewFinding[],
+    currentCandidates: readonly ReviewFindingCandidate[],
+  ): Promise<ReviewFindingRegressionEvidence[]> {
+    const currentByFingerprint = new Map(
+      currentCandidates.map((candidate) => [fingerprintReviewFinding(candidate), candidate]),
+    );
+    const result: ReviewFindingRegressionEvidence[] = [];
+    for (const prior of priorFindings) {
+      const candidate = currentByFingerprint.get(prior.semanticFingerprint);
+      if (
+        prior.state !== "refuted" ||
+        !prior.refutation ||
+        !candidate?.file ||
+        !candidate.symbol ||
+        prior.refutation.headSha === headSha
+      ) {
+        continue;
+      }
+      try {
+        const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
+          owner: repo.owner,
+          repo: repo.repo,
+          basehead: `${prior.refutation.headSha}...${headSha}`,
+        });
+        const changed = (data.files || []).find((file: any) => String(file.filename) === candidate.file);
+        const patch = String(changed?.patch || "");
+        const addedQuotes = candidate.evidence
+          .filter((evidence) => evidence.kind === "code")
+          .map((evidence) => this.normalizedEvidence(evidence.quote));
+        const hasAddedRoot = patch
+          .split(/\r?\n/gu)
+          .some((line) => line.startsWith("+") && addedQuotes.includes(this.normalizedEvidence(line.slice(1))));
+        if (patch.includes(candidate.symbol) && hasAddedRoot) {
+          result.push({
+            file: candidate.file,
+            symbol: candidate.symbol,
+            diffEvidence: truncate(patch, 2_000),
+          });
+        }
+      } catch (error) {
+        this.logger.warn(
+          { error, repo: repo.fullName, fingerprint: prior.semanticFingerprint },
+          "failed to verify review gate regression evidence",
+        );
+      }
+    }
+    return result;
+  }
+
+  private reviewGatePublicFindings(
+    findings: readonly StoredReviewFinding[],
+    currentPublic: ReadonlyMap<string, ReviewGatePublicFinding>,
+    context: PullRequestContext,
+  ): ReviewGatePublicFinding[] {
+    return [...findings]
+      .sort((left, right) => {
+        const currentOrder = Number(currentPublic.has(right.semanticFingerprint)) -
+          Number(currentPublic.has(left.semanticFingerprint));
+        return currentOrder || left.semanticFingerprint.localeCompare(right.semanticFingerprint);
+      })
+      .slice(0, 2)
+      .map((finding) => currentPublic.get(finding.semanticFingerprint) ||
+        this.reviewGateStoredPublicFinding(finding, context));
+  }
+
+  private reviewGateStoredPublicFinding(
+    finding: StoredReviewFinding,
+    context: PullRequestContext,
+  ): ReviewGatePublicFinding {
+    if (finding.candidate.kind === "missing_tests") {
+      return {
+        kind: "missing_acceptance_test",
+        title: "인수조건 자동화 테스트가 아직 확인되지 않았습니다",
+        problem: "이전에 전체 테스트 인벤토리에서 확인한 테스트 누락의 동일 근거가 현재 HEAD에도 남아 있습니다.",
+        trigger: `다음 명시적 인수조건을 검증할 때입니다: ${finding.candidate.acceptanceCriterion}`,
+        impact: "요구 동작이 깨져도 병합 전에 자동으로 발견할 수 없습니다.",
+        requiredAction: "인수조건을 직접 실행하고 결과를 단언하는 자동화 테스트를 추가해야 합니다.",
+        evidence: {
+          acceptanceCriterion: finding.candidate.acceptanceCriterion,
+          testInventoryComplete: true,
+          testFilesInspected: context.testInventoryFileCount,
+        },
+        fingerprint: finding.semanticFingerprint,
+      };
+    }
+    const root = [...finding.candidate.evidence]
+      .reverse()
+      .find((evidence) => evidence.kind === "code" && evidence.file && evidence.line);
+    if (!root?.file || !root.line) {
+      throw new Error(`fatal finding ${finding.semanticFingerprint} has no grounded root evidence`);
+    }
+    const outcome = this.reviewGateFatalOutcomeKo(finding.candidate.outcome);
+    return {
+      kind: "fatal_defect",
+      title: `${outcome} 근거가 아직 남아 있습니다`,
+      problem: "이전에 확인한 치명 결함의 동일한 종단 코드가 현재 HEAD에도 존재합니다.",
+      trigger: `현재 HEAD에서 ${finding.candidate.file}의 ${finding.candidate.symbol || "지정 경로"}가 실행될 때입니다.`,
+      impact: `${outcome}이 확정적으로 발생해 병합을 차단합니다.`,
+      requiredAction: "아래 종단 결과를 제거하고 같은 실행 경로의 회귀 테스트를 추가해야 합니다.",
+      evidence: { file: root.file, line: root.line, code: root.quote },
+      fingerprint: finding.semanticFingerprint,
+    };
+  }
+
+  private reviewGateFatalOutcomeKo(outcome: string): string {
+    const labels: Record<string, string> = {
+      deterministic_crash: "정상 경로의 확정적 크래시",
+      permanent_data_loss_or_corruption: "영구 데이터 손실 또는 손상",
+      exploitable_security_or_privacy_exposure: "악용 가능한 보안 또는 개인정보 노출",
+      primary_flow_unusable: "핵심 사용자 흐름 완전 불능",
+    };
+    return labels[outcome] || "치명적인 실행 결과";
+  }
+
+  private async persistReviewGateLedger(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    snapshot: ReviewGateLedgerSnapshot,
+    findings: readonly StoredReviewFinding[],
+    resolved: readonly StoredReviewFinding[],
+    store: ReviewGateFindingStore | undefined,
+  ): Promise<boolean> {
+    const previousByFingerprint = new Map(
+      snapshot.records.map((record) => [record.finding.semanticFingerprint, record]),
+    );
+    if (store) {
+      for (const finding of findings) {
+        const previous = previousByFingerprint.get(finding.semanticFingerprint);
+        const mappedThread = snapshot.threadByFingerprint.get(finding.semanticFingerprint);
+        const applied = await store.upsertReviewGateFinding(repo.fullName, prNumber, {
+          finding,
+          reviewCommentId: mappedThread?.commentId ?? previous?.reviewCommentId ?? null,
+          threadNodeId: mappedThread?.threadId ?? previous?.threadNodeId ?? null,
+          expectedLastEvaluatedHeadSha:
+            snapshot.expectedHeadByFingerprint.get(finding.semanticFingerprint) ?? null,
+          expectedContextHash:
+            snapshot.expectedContextByFingerprint.get(finding.semanticFingerprint) ?? null,
+        });
+        if (!applied) {
+          return false;
+        }
+      }
+      const persisted = await store.listReviewGateFindings(repo.fullName, prNumber);
+      const persistedByFingerprint = new Map(
+        persisted.map((record) => [record.finding.semanticFingerprint, record.finding]),
+      );
+      const stillCurrent = findings.every((finding) => {
+        const stored = persistedByFingerprint.get(finding.semanticFingerprint);
+        return Boolean(
+          stored &&
+          stored.state === finding.state &&
+          stored.lastEvaluatedHeadSha === finding.lastEvaluatedHeadSha &&
+          stored.contextHash === finding.contextHash &&
+          stored.evidenceHash === finding.evidenceHash,
+        );
+      });
+      if (!stillCurrent) {
+        return false;
+      }
+    }
+    for (const finding of resolved) {
+      const threadNodeId = previousByFingerprint.get(finding.semanticFingerprint)?.threadNodeId ||
+        snapshot.threadByFingerprint.get(finding.semanticFingerprint)?.threadId;
+      if (threadNodeId) {
+        await this.tryResolveThread(octokit, threadNodeId);
+      }
+    }
+    return true;
+  }
+
+  private async refreshPublishedReviewGateThreads(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    findings: readonly StoredReviewFinding[],
+    store: ReviewGateFindingStore | undefined,
+  ): Promise<void> {
+    if (!store) {
+      return;
+    }
+    try {
+      const threads = await listReviewThreads(octokit, repo, prNumber);
+      const byFingerprint = new Map<string, { threadId: string; commentId: number | null }>();
+      for (const thread of threads) {
+        for (const body of thread.bodies) {
+          for (const match of body.matchAll(/seori-finding:([0-9a-f]{64})/gu)) {
+            byFingerprint.set(match[1], {
+              threadId: thread.threadId,
+              commentId: thread.commentDatabaseIds[0] ?? null,
+            });
+          }
+        }
+      }
+      for (const finding of findings) {
+        const thread = byFingerprint.get(finding.semanticFingerprint);
+        if (!thread) {
+          continue;
+        }
+        await store.upsertReviewGateFinding(repo.fullName, prNumber, {
+          finding,
+          reviewCommentId: thread.commentId,
+          threadNodeId: thread.threadId,
+          expectedLastEvaluatedHeadSha: finding.lastEvaluatedHeadSha,
+          expectedContextHash: finding.contextHash,
+        });
+      }
+    } catch (error) {
+      this.logger.warn({ error, repo: repo.fullName, prNumber }, "failed to persist review gate thread ids");
+    }
   }
 
   private trustedReviewRequest(trigger: ReviewTrigger): string {
@@ -2043,82 +2697,6 @@ export class PrBot {
         "review submit failed; falling back to a plain PR comment",
       );
       await postPrComment(octokit, repo, prNumber, body);
-    }
-  }
-
-  private async persistStructuredFindings(
-    octokit: Octokit,
-    repo: RepoRef,
-    prNumber: number,
-    headSha: string,
-    store: ReviewFindingStore,
-    data: {
-      classified: ClassifiedFinding[];
-      resolved: StoredFinding[];
-      offloaded: OffloadedFinding[];
-      priorByFingerprint: Map<string, StoredFinding>;
-      hasInline: boolean;
-    },
-  ): Promise<void> {
-    const offloadByFingerprint = new Map(data.offloaded.map((entry) => [entry.finding.fingerprint, entry]));
-
-    const threadByFingerprint = new Map<string, { threadId: string; commentId: number | null }>();
-    if (data.hasInline) {
-      try {
-        const threads = await listReviewThreads(octokit, repo, prNumber);
-        for (const thread of threads) {
-          for (const body of thread.bodies) {
-            const match = body.match(/seori-finding:([0-9a-f]{40})/);
-            if (match && !threadByFingerprint.has(match[1])) {
-              threadByFingerprint.set(match[1], {
-                threadId: thread.threadId,
-                commentId: thread.commentDatabaseIds[0] ?? null,
-              });
-            }
-          }
-        }
-      } catch (error) {
-        this.logger.warn({ error, repo: repo.fullName, prNumber }, "failed to map review threads to findings");
-      }
-    }
-
-    for (const finding of data.classified) {
-      const thread = threadByFingerprint.get(finding.fingerprint);
-      const offload = offloadByFingerprint.get(finding.fingerprint);
-      await store.upsertReviewFinding(repo.fullName, prNumber, {
-        fingerprint: finding.fingerprint,
-        severity: finding.severity,
-        category: finding.category,
-        file: finding.file,
-        title: finding.title,
-        headSha,
-        reviewCommentId: thread?.commentId ?? null,
-        threadNodeId: thread?.threadId ?? null,
-        issueNumber: offload?.issueNumber ?? null,
-      });
-
-      // A finding that moved to a follow-up issue no longer needs an open inline thread.
-      if (offload) {
-        const priorThread = data.priorByFingerprint.get(finding.fingerprint)?.threadNodeId;
-        if (priorThread) {
-          await this.tryResolveThread(octokit, priorThread);
-        }
-      }
-    }
-
-    for (const finding of data.resolved) {
-      if (finding.threadNodeId) {
-        await this.tryResolveThread(octokit, finding.threadNodeId);
-      }
-      if (finding.issueNumber) {
-        await commentAndCloseIssue(
-          octokit,
-          repo,
-          finding.issueNumber,
-          "Seori: PR에서 해당 지적이 반영되어 follow-up 이슈를 닫습니다.",
-        );
-      }
-      await store.markReviewFindingResolved(repo.fullName, prNumber, finding.fingerprint);
     }
   }
 

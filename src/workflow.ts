@@ -13,6 +13,10 @@ import { isAiProviderCooldownError } from "./gemini.js";
 import { completeCheck, type RepoRef } from "./github.js";
 import type { StoredFinding } from "./review.js";
 import type { ReviewRunRecord } from "./review-run.js";
+import {
+  parseStoredReviewFinding,
+  type StoredReviewFinding,
+} from "./review-finding-ledger.js";
 import { metrics, type ActiveWorkflowMetric, type WorkflowQueueMetric } from "./metrics.js";
 
 type Logger = {
@@ -61,6 +65,23 @@ type ReviewFindingRow = RowDataPacket & {
   last_seen_head: string;
 };
 
+type ReviewGateFindingRow = RowDataPacket & {
+  finding_json: string;
+  review_comment_id: number | string | null;
+  thread_node_id: string | null;
+};
+
+type ReviewGateFindingHeadRow = RowDataPacket & {
+  last_evaluated_head: string;
+  context_hash: string;
+  state: string;
+};
+
+type CachedReviewRunRow = RowDataPacket & {
+  raw_output: string;
+  verdict: string;
+};
+
 export type ReviewFindingUpsert = {
   fingerprint: string;
   severity: string;
@@ -77,6 +98,29 @@ export type ReviewFindingStore = {
   listOpenReviewFindings: (repoFullName: string, prNumber: number) => Promise<StoredFinding[]>;
   upsertReviewFinding: (repoFullName: string, prNumber: number, finding: ReviewFindingUpsert) => Promise<void>;
   markReviewFindingResolved: (repoFullName: string, prNumber: number, fingerprint: string) => Promise<void>;
+};
+
+export type ReviewGateFindingRecord = {
+  finding: StoredReviewFinding;
+  reviewCommentId: number | null;
+  threadNodeId: string | null;
+  /** Snapshot loaded before this write. Used to reject stale cross-HEAD updates. */
+  expectedLastEvaluatedHeadSha?: string | null;
+  expectedContextHash?: string | null;
+};
+
+export type ReviewGateFindingStore = {
+  listReviewGateFindings: (repoFullName: string, prNumber: number) => Promise<ReviewGateFindingRecord[]>;
+  upsertReviewGateFinding: (
+    repoFullName: string,
+    prNumber: number,
+    record: ReviewGateFindingRecord,
+  ) => Promise<boolean>;
+};
+
+export type CachedReviewRun = {
+  rawOutput: string;
+  verdict: ReviewRunRecord["verdict"];
 };
 
 export type ExpiredWorkflowRun = WorkflowRun & {
@@ -242,6 +286,182 @@ export class MysqlWorkflowStore {
         KEY idx_review_runs_verdict (verdict, created_at)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
+
+    await this.pool.execute(`
+      CREATE TABLE IF NOT EXISTS gemini_pr_bot_review_gate_findings (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        repo_full_name VARCHAR(255) NOT NULL,
+        pr_number INT NOT NULL,
+        semantic_fingerprint CHAR(64) NOT NULL,
+        state VARCHAR(16) NOT NULL,
+        first_seen_head VARCHAR(64) NOT NULL,
+        last_seen_head VARCHAR(64) NOT NULL,
+        last_evaluated_head VARCHAR(64) NOT NULL,
+        context_hash CHAR(64) NOT NULL,
+        finding_json LONGTEXT NOT NULL,
+        review_comment_id BIGINT UNSIGNED NULL,
+        thread_node_id VARCHAR(120) NULL,
+        created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_review_gate_finding (repo_full_name, pr_number, semantic_fingerprint),
+        KEY idx_review_gate_finding_pr (repo_full_name, pr_number, state)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+  }
+
+  async listReviewGateFindings(
+    repoFullName: string,
+    prNumber: number,
+  ): Promise<ReviewGateFindingRecord[]> {
+    const [rows] = await this.pool.execute<ReviewGateFindingRow[]>(
+      `
+      SELECT finding_json, review_comment_id, thread_node_id
+      FROM gemini_pr_bot_review_gate_findings
+      WHERE repo_full_name = ? AND pr_number = ?
+      ORDER BY id ASC
+      `,
+      [repoFullName, prNumber],
+    );
+    const records: ReviewGateFindingRecord[] = [];
+    for (const row of rows) {
+      try {
+        records.push({
+          finding: parseStoredReviewFinding(JSON.parse(row.finding_json)),
+          reviewCommentId: row.review_comment_id == null ? null : Number(row.review_comment_id),
+          threadNodeId: row.thread_node_id,
+        });
+      } catch (error) {
+        this.logger.warn({ error, repoFullName, prNumber }, "invalid stored review gate finding ignored");
+      }
+    }
+    return records;
+  }
+
+  async upsertReviewGateFinding(
+    repoFullName: string,
+    prNumber: number,
+    record: ReviewGateFindingRecord,
+  ): Promise<boolean> {
+    const finding = record.finding;
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [rows] = await connection.execute<ReviewGateFindingHeadRow[]>(
+        `
+        SELECT last_evaluated_head, context_hash, state
+        FROM gemini_pr_bot_review_gate_findings
+        WHERE repo_full_name = ? AND pr_number = ? AND semantic_fingerprint = ?
+        FOR UPDATE
+        `,
+        [repoFullName, prNumber, finding.semanticFingerprint],
+      );
+      const existingHead = rows[0]?.last_evaluated_head ?? null;
+      const existingContext = rows[0]?.context_hash ?? null;
+      const existingState = rows[0]?.state ?? null;
+      const expectedHead = record.expectedLastEvaluatedHeadSha ?? null;
+      const expectedContext = record.expectedContextHash ?? null;
+      const expectedSnapshotMatches =
+        existingHead === expectedHead && existingContext === expectedContext;
+      const idAttachmentForSameSnapshot =
+        existingHead === finding.lastEvaluatedHeadSha &&
+        existingContext === finding.contextHash &&
+        existingState === finding.state;
+      if (
+        existingHead !== null &&
+        !expectedSnapshotMatches &&
+        !idAttachmentForSameSnapshot
+      ) {
+        await connection.rollback();
+        this.logger.warn(
+          {
+            repoFullName,
+            prNumber,
+            fingerprint: finding.semanticFingerprint,
+            existingHead,
+            existingContext,
+            existingState,
+            expectedHead,
+            expectedContext,
+            attemptedHead: finding.lastEvaluatedHeadSha,
+            attemptedContext: finding.contextHash,
+            attemptedState: finding.state,
+          },
+          "stale review gate finding write ignored",
+        );
+        return false;
+      }
+
+      await connection.execute(
+        `
+        INSERT INTO gemini_pr_bot_review_gate_findings
+          (repo_full_name, pr_number, semantic_fingerprint, state,
+           first_seen_head, last_seen_head, last_evaluated_head, context_hash,
+           finding_json, review_comment_id, thread_node_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          state = VALUES(state),
+          last_seen_head = VALUES(last_seen_head),
+          last_evaluated_head = VALUES(last_evaluated_head),
+          context_hash = VALUES(context_hash),
+          finding_json = VALUES(finding_json),
+          review_comment_id = COALESCE(VALUES(review_comment_id), review_comment_id),
+          thread_node_id = COALESCE(VALUES(thread_node_id), thread_node_id)
+        `,
+        [
+          repoFullName,
+          prNumber,
+          finding.semanticFingerprint,
+          finding.state,
+          finding.firstSeenHeadSha,
+          finding.lastSeenHeadSha,
+          finding.lastEvaluatedHeadSha,
+          finding.contextHash,
+          JSON.stringify(finding),
+          record.reviewCommentId,
+          record.threadNodeId,
+        ],
+      );
+      await connection.commit();
+      return true;
+    } catch (error) {
+      await rollbackQuietly(connection, this.logger);
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
+  async findCachedReviewGateRun(
+    repoFullName: string,
+    prNumber: number,
+    headSha: string,
+    promptVersion: string,
+    contextSha256: string,
+  ): Promise<CachedReviewRun | null> {
+    const [rows] = await this.pool.execute<CachedReviewRunRow[]>(
+      `
+      SELECT runs.raw_output, runs.verdict
+      FROM gemini_pr_bot_review_runs AS runs
+      INNER JOIN gemini_pr_bot_workflows AS workflows
+        ON workflows.id = runs.workflow_id
+      WHERE runs.repo_full_name = ? AND runs.pr_number = ? AND runs.head_sha = ?
+        AND runs.provider = 'host' AND runs.prompt_version = ? AND runs.context_sha256 = ?
+        AND runs.parse_valid = TRUE AND runs.verdict IN ('PASS', 'FAIL')
+        AND workflows.status = 'completed'
+      ORDER BY runs.id DESC
+      LIMIT 1
+      `,
+      [repoFullName, prNumber, headSha, promptVersion, contextSha256],
+    );
+    const row = rows[0];
+    if (!row || !["PASS", "FAIL", "ABSTAIN"].includes(row.verdict)) {
+      return null;
+    }
+    return {
+      rawOutput: row.raw_output,
+      verdict: row.verdict as ReviewRunRecord["verdict"],
+    };
   }
 
   async listOpenReviewFindings(repoFullName: string, prNumber: number): Promise<StoredFinding[]> {
@@ -945,6 +1165,20 @@ export class WorkflowEngine {
           markReviewFindingResolved: (repoFullName, prNumber, fingerprint) =>
             this.store.markReviewFindingResolved(repoFullName, prNumber, fingerprint),
         },
+        reviewGateFindingStore: {
+          listReviewGateFindings: (repoFullName, prNumber) =>
+            this.store.listReviewGateFindings(repoFullName, prNumber),
+          upsertReviewGateFinding: (repoFullName, prNumber, record) =>
+            this.store.upsertReviewGateFinding(repoFullName, prNumber, record),
+        },
+        findCachedReviewGateRun: (repoFullName, prNumber, headSha, promptVersion, contextSha256) =>
+          this.store.findCachedReviewGateRun(
+            repoFullName,
+            prNumber,
+            headSha,
+            promptVersion,
+            contextSha256,
+          ),
         recordReviewRun: (record) => this.store.recordReviewRun(run.id, record),
       });
       await this.store.complete(run.id);

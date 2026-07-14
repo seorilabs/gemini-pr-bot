@@ -1,5 +1,6 @@
 import type { Config } from "./config.js";
 import { buildDeepRepoContext, classifyChange, type ChangeClass } from "./repo-context.js";
+import { isNonProductFatalPath } from "./review-grounding.js";
 import { githubCommentBody, truncate } from "./text.js";
 import { bodyIncludesBotStatusMarker } from "./identity.js";
 
@@ -80,8 +81,11 @@ export type PullRequestContext = PullRequestStatus & {
   reviewGateMarkdown: string;
   acceptanceSourceText: string;
   testInventoryComplete: boolean;
+  testInventoryFileCount: number;
   currentHeadFileContents: Readonly<Record<string, string>>;
   visibleChangedPatches: Readonly<Record<string, string>>;
+  /** True when every changed product path needed for fatal review is fully host-visible. */
+  fatalContextComplete: boolean;
   changeClass: ChangeClass;
   minimumAcceptanceCriteria: number;
   explicitAcceptanceCriteria: readonly string[];
@@ -288,6 +292,9 @@ export async function buildPullRequestContext(
     requested: options.deepContextRequested,
   });
   const deepRepoContext = deepRepoContextResult.markdown;
+  const testInventoryFileCount = Number(
+    deepRepoContext.match(/^Test inventory discovered:\s*(\d+)$/mu)?.[1] || 0,
+  );
 
   const recentIssueComments = issueComments
     .slice(-50)
@@ -438,6 +445,12 @@ export async function buildPullRequestContext(
       .filter(({ section }) => truncatedReviewGateMarkdown.includes(section))
       .map(({ filename, patch }) => [filename, patch]),
   );
+  const fatalContextComplete = isFatalContextComplete(
+    changeClass,
+    files,
+    visibleCurrentHeadFileContents,
+    visibleChangedPatches,
+  );
 
   return {
     state: String(pr.state || "unknown"),
@@ -456,12 +469,61 @@ export async function buildPullRequestContext(
     reviewGateMarkdown: truncatedReviewGateMarkdown,
     acceptanceSourceText: truncate(acceptanceSourceText, config.maxContextChars),
     testInventoryComplete: deepRepoContextResult.testInventoryComplete && deepContextFullyVisible,
+    testInventoryFileCount,
     currentHeadFileContents: visibleCurrentHeadFileContents,
     visibleChangedPatches,
+    fatalContextComplete,
     changeClass,
     minimumAcceptanceCriteria: trustedAcceptanceSources.minimumCriteria,
     explicitAcceptanceCriteria: trustedAcceptanceSources.criteria,
   };
+}
+
+/**
+ * Fatal review is safe only when the host, model, and later grounding checks
+ * all see the same current product source and its diff. Deleted product files
+ * have no current-HEAD line to ground, so a deletion-only product change stays
+ * conservative instead of being treated as complete by vacuous truth.
+ */
+export function isFatalContextComplete(
+  changeClass: ChangeClass,
+  files: readonly any[],
+  currentHeadFileContents: Readonly<Record<string, string>>,
+  visibleChangedPatches: Readonly<Record<string, string>>,
+): boolean {
+  const productFiles = files
+    .map((file) => ({
+      filename: String(file?.filename || ""),
+      status: String(file?.status || "").toLowerCase(),
+    }))
+    .filter(({ filename }) => filename.length > 0 && !isNonProductFatalPath(filename));
+
+  if (productFiles.length === 0) {
+    // A product/mixed classification without a reviewable product path means
+    // host selection and fatal-path policy disagree. Fail closed.
+    return changeClass !== "product_logic" && changeClass !== "mixed";
+  }
+
+  const currentProductFiles = productFiles.filter(
+    ({ status }) => status !== "removed" && status !== "deleted",
+  );
+  if (currentProductFiles.length === 0) {
+    return false;
+  }
+
+  return currentProductFiles.every(({ filename }) => {
+    const content = currentHeadFileContents[filename];
+    const patch = visibleChangedPatches[filename];
+    return typeof content === "string" && content.length > 0 && isUsableReviewPatch(patch);
+  });
+}
+
+function isUsableReviewPatch(value: string | undefined): boolean {
+  return Boolean(
+    value &&
+    value !== "(binary file or patch unavailable)" &&
+    /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/mu.test(value),
+  );
 }
 
 function buildTrustedAcceptanceSourceText(
@@ -543,7 +605,13 @@ export function listExplicitAcceptanceCriteria(value: string): string[] {
       continue;
     }
 
-    const checkbox = line.match(/^[-*+]\s+\[[ xX]\]\s+(.+)$/u);
+    // A checkbox is only an acceptance criterion inside an explicitly named
+    // acceptance/requirements/behavior section. Release checklists and command
+    // verification lists often use the same syntax but are not product
+    // requirements, and counting them created an impossible host/model floor.
+    const checkbox = inAcceptanceSection
+      ? line.match(/^[-*+]\s+\[[ xX]\]\s+(.+)$/u)
+      : null;
     const numberedCriterion = line.match(/^(?:AC[-\s]?\d+|인수\s*조건\s*\d+)\s*[:.)-]\s*(.+)$/iu);
     const sectionItem = inAcceptanceSection
       ? line.match(/^(?:[-*+]\s+|\d+[.)]\s+)(.+)$/u)
@@ -1345,8 +1413,15 @@ export async function submitReviewWithInlineComments(
 export type ReviewThreadInfo = {
   threadId: string;
   isResolved: boolean;
+  resolvedByLogin: string | null;
   commentDatabaseIds: number[];
   bodies: string[];
+  comments: Array<{
+    databaseId: number | null;
+    body: string;
+    authorLogin: string;
+    authorAssociation: string;
+  }>;
 };
 
 export async function listReviewThreads(
@@ -1362,10 +1437,13 @@ export async function listReviewThreads(
             nodes {
               id
               isResolved
+              resolvedBy { login }
               comments(first: 20) {
                 nodes {
                   databaseId
                   body
+                  author { login }
+                  authorAssociation
                 }
               }
             }
@@ -1394,10 +1472,17 @@ export async function listReviewThreads(
       threads.push({
         threadId: String(thread.id),
         isResolved: Boolean(thread.isResolved),
+        resolvedByLogin: thread.resolvedBy?.login ? String(thread.resolvedBy.login) : null,
         commentDatabaseIds: comments
           .map((comment: any) => Number(comment.databaseId))
           .filter((id: number) => Number.isFinite(id)),
         bodies: comments.map((comment: any) => String(comment.body || "")),
+        comments: comments.map((comment: any) => ({
+          databaseId: Number.isFinite(Number(comment.databaseId)) ? Number(comment.databaseId) : null,
+          body: String(comment.body || ""),
+          authorLogin: String(comment.author?.login || ""),
+          authorAssociation: String(comment.authorAssociation || ""),
+        })),
       });
     }
     after = reviewThreads?.pageInfo?.hasNextPage ? reviewThreads.pageInfo.endCursor : null;

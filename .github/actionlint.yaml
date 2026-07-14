@@ -1,0 +1,4 @@
+self-hosted-runner:
+  labels:
+    - seorilabs-rpi-arm64
+    - seorilabs-rpi-arm64-dind

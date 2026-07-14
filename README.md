@@ -22,7 +22,7 @@ flowchart LR
 - Test evidence must come from a registered, active current-HEAD test with a real non-vacuous assertion. Commented code, skipped/disabled tests or suites, ordinary helper functions, comparison-only expressions, and assertion-shaped strings are rejected by the host.
 - Reports at most two fatal blockers, limited to a deterministic common-path crash, permanent data loss/corruption, exploitable security/privacy exposure, or a certainly unusable primary flow. The added root line must itself directly perform the fatal outcome and end a 2-6-line ordered causal chain; normal false/null returns, UI flags, and deny-by-default security rules are rejected.
 - Uses host-side strict schema and evidence validation. MiniMax does not assign severity or decide approval itself.
-- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. An exhaustive current-HEAD inventory with a grounded automated-test omission blocks without a paid second model. Uncertainty and a MiniMax-only fatal candidate complete as nonblocking `neutral`; when a no-cost second-opinion provider is enabled, matching fatal evidence may block.
+- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. A missing acceptance test blocks only after exhaustive current-HEAD inventory search; a fatal defect blocks only when MiniMax's separate verifier confirms the same host-grounded added root. Uncertainty completes as nonblocking `neutral`.
 - Omits Medium/Low findings, style/refactor suggestions, speculative risks, and automatic follow-up issue creation from the merge-gate path.
 - Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
 - Runs explicit review on `@gemini-cli /review`; a gate pass submits approval, confirmed blockers request changes, and inconclusive results do not assign manual verification or block merge.
@@ -86,12 +86,13 @@ flowchart TD
   Review["/review or PR opened"] --> Context["Build PR context"]
   Context --> Conflict{"Merge conflict?"}
   Conflict -->|Yes| RequestChanges["REQUEST_CHANGES review with resolution steps"]
-  Conflict -->|No| AI["Conservative evidence prompt"]
-  AI --> Validate["Strict schema + source/test/diff evidence validation"]
-  Validate -->|"차단 또는 불확실"| Confirm{"2차 모델이 같은 근거를 확인?"}
-  Confirm -->|"치명 결함/테스트 누락 확인"| Output["REQUEST_CHANGES + action_required"]
-  Confirm -->|"불일치/확인 불가"| Neutral["한글 안내 + neutral; 병합 비차단"]
-  Validate -->|통과| GateApproval["GitHub APPROVE + success; bot 자동 병합 없음"]
+  Conflict -->|No| Candidate["MiniMax 후보 최대 2건"]
+  Candidate --> Verifier["같은 MiniMax의 반증 우선 검증"]
+  Verifier --> Host["Host: AC 원문·전체 테스트·현재 HEAD exact 근거 검증"]
+  Host --> Ledger["finding 원장: open / resolved / refuted"]
+  Ledger -->|"확정 치명 결함 또는 테스트 누락"| Output["한글 REQUEST_CHANGES + action_required"]
+  Ledger -->|"근거 불완전"| Neutral["PR 댓글 없이 neutral; 병합 비차단"]
+  Ledger -->|통과| GateApproval["GitHub APPROVE 후 check success; bot 자동 병합 없음"]
   Output --> Approve["Maintainer or trusted agent runs /approve"]
   Approve --> Validation{"Bot-side validation passes?"}
   Validation -->|Yes| Approval["승인 리뷰 + 현재 HEAD Seori check success"]
@@ -218,9 +219,9 @@ PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
-The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMAX_API_BASE_URL}/chat/completions` and disables M3 thinking so the response contains only the review text. Second-opinion support remains implemented, but production keeps it disabled until a no-additional-cost provider is available. Copilot CLI, Gemini, and Cursor are not part of the production route.
+The conservative gate uses MiniMax-M3's Anthropic-compatible Messages API at `https://api.minimax.io/anthropic/v1/messages`. It runs adaptive thinking in two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. No paid Gemini API call participates in the production review route. Copilot CLI, Gemini, and Cursor are not part of the production route.
 
-Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions use the configured provider router. With second opinion disabled, incomplete/ambiguous evidence and fatal candidates become nonblocking neutral decisions, while an exhaustive host-grounded missing-test result remains actionable.
+Structured PR reviews use the bounded MiniMax candidate/verifier gate above. PR Q&A and agent commands still use the configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable; incomplete or ambiguous evidence becomes a nonblocking neutral decision without posting a task back to the author.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
 When `AUTO_SQUASH_MERGE_ENABLED=true`, eligible non-gate approvals are followed by a GitHub Squash Merge attempt only for PRs targeting `main`; conservative gate approvals deliberately stop before merge. There is no repo allowlist and no branch allowlist beyond exact `main`.
@@ -271,7 +272,31 @@ kubectl -n apps rollout restart deployment/seori-pr-bot
 kubectl -n apps rollout status deployment/seori-pr-bot
 ```
 
-If the local machine does not have Docker, build and push from the cluster with Kaniko:
+On macOS, `build-and-push.sh` starts and uses the Colima Docker context when no context is explicitly selected. The default build archives committed `HEAD` and stops on tracked uncommitted changes. Before updating `latest`, it runs `git fetch --quiet origin main` and then requires `main` to track `origin/main` with both refs at the exact same commit. A fetch failure, or a branch that is ahead, behind, diverged, detached, missing an upstream, or tracking a different upstream, pushes only its commit tag and prints a warning.
+
+For a temporary worktree image, opt in explicitly. When `TAG` is omitted, the script creates a unique `<sha>-worktree-<timestamp>-<pid>` tag and does not update `latest`:
+
+```bash
+BUILD_WORKTREE=1 ./scripts/build-and-push.sh
+```
+
+Use an explicit tag when another environment must pull that worktree image. Updating `latest` from a worktree or non-`main` branch is intentionally opt-in:
+
+```bash
+BUILD_WORKTREE=1 TAG="review-gate-local" ./scripts/build-and-push.sh
+BUILD_WORKTREE=1 TAG="review-gate-local" PUSH_LATEST=1 ./scripts/build-and-push.sh
+```
+
+`PUSH_LATEST=1` is also the explicit override when an operator intentionally needs to publish `latest` while local `main` does not exactly match `origin/main`.
+
+The same ARM64 build and push remains available as a manual GitHub Actions workflow. A non-`main` run publishes only its requested/SHA tag; only `main` updates `latest`.
+
+```bash
+gh workflow run build-image.yml --ref main
+gh run watch --exit-status
+```
+
+Kaniko remains an emergency fallback when neither local Colima nor the Actions runner is available:
 
 ```bash
 ./scripts/build-in-cluster.sh

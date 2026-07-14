@@ -4,6 +4,16 @@ import { existsSync } from "node:fs";
 import { AI_REVIEW_PROVIDER_NAMES, type AiReviewProviderName, type Config } from "./config.js";
 import { botActionMarker } from "./identity.js";
 import { metrics, type GaugeSample } from "./metrics.js";
+import {
+  buildMiniMaxReviewRequest,
+  buildMiniMaxVerificationRequest,
+  parseMiniMaxReviewResponse,
+  parseMiniMaxVerificationResponse,
+  type MiniMaxMessagesRequest,
+  type MiniMaxReviewCandidate,
+  type MiniMaxReviewResult,
+  type MiniMaxVerificationResult,
+} from "./minimax-review.js";
 import { truncate } from "./text.js";
 
 type Logger = {
@@ -34,6 +44,10 @@ export type AiProviderResult = {
   selectedProvider: AiReviewProviderName;
   provider: AiReviewProviderName;
   model: string;
+};
+
+export type MiniMaxGateResult<T> = AiProviderResult & {
+  value: T;
 };
 
 export class AiProviderCooldownError extends Error {
@@ -97,6 +111,33 @@ export class GeminiClient {
       { jsonOutput: true },
       provider,
       true,
+    );
+  }
+
+  async reviewGateCandidates(
+    systemPrompt: string,
+    userPrompt: string,
+    expectedAcceptanceCriteria: readonly string[],
+  ): Promise<MiniMaxGateResult<MiniMaxReviewResult>> {
+    return this.runMiniMaxGateRequest(
+      () => buildMiniMaxReviewRequest({ systemPrompt, userPrompt }),
+      (response) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria }),
+      userPrompt,
+      "후보 추출",
+    );
+  }
+
+  async verifyReviewGateCandidates(
+    systemPrompt: string,
+    userPrompt: string,
+    candidates: readonly MiniMaxReviewCandidate[],
+  ): Promise<MiniMaxGateResult<MiniMaxVerificationResult>> {
+    const expectedCandidates = candidates.map(({ candidateId, kind }) => ({ candidateId, kind }));
+    return this.runMiniMaxGateRequest(
+      () => buildMiniMaxVerificationRequest({ systemPrompt, userPrompt }),
+      (response) => parseMiniMaxVerificationResponse(response, { expectedCandidates }),
+      userPrompt,
+      "후보 반증",
     );
   }
 
@@ -679,6 +720,104 @@ export class GeminiClient {
         return this.emptyResponseText(kind);
       }
       return text;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async runMiniMaxGateRequest<T>(
+    buildRequest: () => MiniMaxMessagesRequest,
+    parseResponse: (response: unknown) =>
+      | { ok: true; value: T; source: "tool_use" | "text" }
+      | { ok: false; errors: string[] },
+    originalUserPrompt: string,
+    phaseLabel: string,
+  ): Promise<MiniMaxGateResult<T>> {
+    if (!this.config.minimaxApiKey) {
+      throw new Error("MiniMax API key is not configured");
+    }
+    if (this.config.minimaxModel !== "MiniMax-M3") {
+      throw new Error(`MiniMax conservative gate requires MiniMax-M3, got ${this.config.minimaxModel}`);
+    }
+
+    let request = buildRequest();
+    let response = await this.callMiniMaxMessages(request, phaseLabel);
+    let parsed = parseResponse(response);
+
+    if (!parsed.ok) {
+      const repairPrompt = [
+        originalUserPrompt,
+        "",
+        "이전 출력은 서버 검증을 통과하지 못했습니다.",
+        `검증 오류: ${parsed.errors.slice(0, 8).join(" | ")}`,
+        "추론 설명을 본문에 쓰지 말고, 정의된 submit_review 도구를 정확히 한 번 호출해 전체 결과를 다시 제출하세요.",
+      ].join("\n");
+      request = {
+        ...buildRequest(),
+        messages: [{ role: "user", content: [{ type: "text", text: repairPrompt }] }],
+      };
+      response = await this.callMiniMaxMessages(request, `${phaseLabel} 형식 보정`);
+      parsed = parseResponse(response);
+    }
+
+    if (!parsed.ok) {
+      throw new Error(`MiniMax ${phaseLabel} output failed validation: ${parsed.errors.join(" | ")}`);
+    }
+
+    return {
+      selectedProvider: "minimax",
+      provider: "minimax",
+      model: this.config.minimaxModel,
+      text: JSON.stringify(parsed.value),
+      value: parsed.value,
+    };
+  }
+
+  private async callMiniMaxMessages(
+    request: MiniMaxMessagesRequest,
+    phaseLabel: string,
+  ): Promise<unknown> {
+    const configuredBase = this.config.minimaxApiBaseUrl.replace(/\/+$/u, "");
+    const apiRoot = configuredBase.endsWith("/anthropic")
+      ? configuredBase
+      : configuredBase.replace(/\/v1$/u, "");
+    const url = apiRoot.endsWith("/anthropic")
+      ? `${apiRoot}/v1/messages`
+      : `${apiRoot}/anthropic/v1/messages`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.config.minimaxTimeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Api-Key": this.config.minimaxApiKey,
+        },
+        body: JSON.stringify(request),
+        signal: controller.signal,
+      });
+      const rawText = await response.text();
+      if (!response.ok) {
+        throw new Error(`MiniMax Messages API request failed (${response.status}): ${truncate(rawText, 600)}`);
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        throw new Error(`MiniMax Messages API returned non-JSON response: ${truncate(rawText, 600)}`);
+      }
+      this.logger?.info(
+        {
+          phase: phaseLabel,
+          model: parsed?.model || this.config.minimaxModel,
+          inputTokens: Number(parsed?.usage?.input_tokens || 0),
+          outputTokens: Number(parsed?.usage?.output_tokens || 0),
+          cacheReadInputTokens: Number(parsed?.usage?.cache_read_input_tokens || 0),
+          stopReason: parsed?.stop_reason || "unknown",
+        },
+        "MiniMax review gate request completed",
+      );
+      return parsed;
     } finally {
       clearTimeout(timer);
     }
