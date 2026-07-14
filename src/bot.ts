@@ -60,7 +60,10 @@ import {
   isGroundedFatalBlocker,
   isGroundedTestEvidence,
 } from "./review-grounding.js";
-import { resolveReviewGateSecondOpinion } from "./review-resolution.js";
+import {
+  resolveReviewGateSecondOpinion,
+  shouldRunReviewGateSecondOpinion,
+} from "./review-resolution.js";
 import {
   BOT_GITHUB_LOGIN,
   bodyIncludesBotActionMarker,
@@ -1623,7 +1626,7 @@ export class PrBot {
     let evaluation = evaluateOutput(aiResult.text);
     await this.recordReviewGateRun(workflow, check, repo, prNumber, context, prompt, aiResult, evaluation);
 
-    if (evaluation.decision.verdict !== "PASS") {
+    if (shouldRunReviewGateSecondOpinion(evaluation, this.config.aiReviewTiebreakerEnabled)) {
       const secondOpinionProvider = this.config.aiReviewTiebreakerProvider;
       const canRunSecondOpinion =
         this.config.aiReviewTiebreakerEnabled &&

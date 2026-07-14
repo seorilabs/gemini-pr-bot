@@ -41,6 +41,15 @@ export function resolveReviewGateSecondOpinion(
   );
 }
 
+export function shouldRunReviewGateSecondOpinion(
+  evaluation: ReviewGateEvaluation,
+  enabled: boolean,
+): boolean {
+  return evaluation.decision.verdict !== "PASS" && !(
+    evaluation.decision.failureKind === "missing_tests" && !enabled
+  );
+}
+
 function sameMissingCriteriaSet(
   left: ReviewGateEvaluation["decision"]["missingCriteria"],
   right: ReviewGateEvaluation["decision"]["missingCriteria"],

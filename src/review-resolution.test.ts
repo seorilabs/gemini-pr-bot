@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveReviewGateSecondOpinion } from "./review-resolution.js";
+import {
+  resolveReviewGateSecondOpinion,
+  shouldRunReviewGateSecondOpinion,
+} from "./review-resolution.js";
 import { evaluateReviewGate, type ReviewGateEvaluation } from "./review-gate.js";
 
 const OPTIONS = { testInventoryComplete: true };
@@ -31,6 +34,12 @@ test("model disagreement becomes a nonblocking internal abstention", () => {
   const result = resolveReviewGateSecondOpinion(missingTestsEvaluation(), passEvaluation());
   assert.equal(result.decision.verdict, "ABSTAIN");
   assert.match(result.decision.reasons[0] || "", /병합을 차단하지 않습니다/u);
+});
+
+test("host-confirmed missing tests remain blocking when second opinion is disabled", () => {
+  assert.equal(shouldRunReviewGateSecondOpinion(missingTestsEvaluation(), false), false);
+  assert.equal(shouldRunReviewGateSecondOpinion(missingTestsEvaluation(), true), true);
+  assert.equal(shouldRunReviewGateSecondOpinion(abstainEvaluation(), false), true);
 });
 
 function passEvaluation(): ReviewGateEvaluation {

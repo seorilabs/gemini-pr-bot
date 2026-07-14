@@ -22,7 +22,7 @@ flowchart LR
 - Test evidence must come from a registered, active current-HEAD test with a real non-vacuous assertion. Commented code, skipped/disabled tests or suites, ordinary helper functions, comparison-only expressions, and assertion-shaped strings are rejected by the host.
 - Reports at most two fatal blockers, limited to a deterministic common-path crash, permanent data loss/corruption, exploitable security/privacy exposure, or a certainly unusable primary flow. The added root line must itself directly perform the fatal outcome and end a 2-6-line ordered causal chain; normal false/null returns, UI flags, and deny-by-default security rules are rejected.
 - Uses host-side strict schema and evidence validation. MiniMax does not assign severity or decide approval itself.
-- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. An uncertain or blocking MiniMax result is retried once with the configured second-opinion provider. Confirmed fatal defects and confirmed automated-test omissions block; unresolved uncertainty completes the GitHub check as nonblocking `neutral` with Korean-only judgment text.
+- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. An exhaustive current-HEAD inventory with a grounded automated-test omission blocks without a paid second model. Uncertainty and a MiniMax-only fatal candidate complete as nonblocking `neutral`; when a no-cost second-opinion provider is enabled, matching fatal evidence may block.
 - Omits Medium/Low findings, style/refactor suggestions, speculative risks, and automatic follow-up issue creation from the merge-gate path.
 - Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
 - Runs explicit review on `@gemini-cli /review`; a gate pass submits approval, confirmed blockers request changes, and inconclusive results do not assign manual verification or block merge.
@@ -220,7 +220,7 @@ AUTO_SQUASH_MERGE_ENABLED=true
 
 The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMAX_API_BASE_URL}/chat/completions` and disables M3 thinking so the response contains only the review text. Second-opinion support remains implemented, but production keeps it disabled until a no-additional-cost provider is available. Copilot CLI, Gemini, and Cursor are not part of the production route.
 
-Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions use the configured provider router. When second opinion is disabled, every primary non-PASS result becomes a nonblocking neutral decision unless a future no-cost provider is explicitly enabled.
+Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions use the configured provider router. With second opinion disabled, incomplete/ambiguous evidence and fatal candidates become nonblocking neutral decisions, while an exhaustive host-grounded missing-test result remains actionable.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
 When `AUTO_SQUASH_MERGE_ENABLED=true`, eligible non-gate approvals are followed by a GitHub Squash Merge attempt only for PRs targeting `main`; conservative gate approvals deliberately stop before merge. There is no repo allowlist and no branch allowlist beyond exact `main`.
