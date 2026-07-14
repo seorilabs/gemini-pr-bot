@@ -65,6 +65,7 @@ const TEST_DISCOVERY_IGNORED_DIRECTORIES = new Set([
   "coverage",
   "deriveddata",
   "dist",
+  "generated",
   "node_modules",
   "pods",
   "target",
@@ -366,7 +367,12 @@ async function selectContextFiles(
     (file) => !isTestCandidatePath(file) && !isDocsOrAssetPath(file),
   );
   const secondaryChanged = [...changed].filter((file) => !primaryChanged.includes(file));
-  const orderedTests = interleaveChangedAndExistingTests(inventory.relevant, changed);
+  const prioritizedTests = interleaveChangedAndExistingTests(inventory.relevant, changed);
+  const prioritizedTestSet = new Set(prioritizedTests);
+  const orderedTests = [
+    ...prioritizedTests,
+    ...inventory.discovered.filter((file) => !prioritizedTestSet.has(file)),
+  ];
   const reservedTestSlots =
     orderedTests.length === 0 || maxFiles <= 1
       ? 0
@@ -383,6 +389,10 @@ async function selectContextFiles(
   await addExistingFiles(primaryChanged.slice(initialPrimarySlots), maxFiles);
   await addExistingFiles(secondaryChanged, maxFiles);
   await addExistingFiles(supporting, maxFiles);
+  // Relevant tests stay ahead of unrelated tests, while every discovered test
+  // remains eligible when the file/byte budgets are large enough to carry an
+  // exhaustive inventory.
+  await addExistingFiles(orderedTests, maxFiles);
 
   return {
     files: existing,
@@ -471,7 +481,12 @@ async function discoverTestCandidates(
     for (const entry of entries) {
       const relativePath = normalizeRepoPath(path.posix.join(relativeDirectory, entry.name));
       if (entry.isSymbolicLink()) {
-        complete = false;
+        // Never follow repository-controlled symlinks. They are deliberately
+        // outside the regular-file inventory. A test-shaped symlink could still
+        // be executable, so only that case makes the inventory partial.
+        if (isTestCandidatePath(relativePath)) {
+          complete = false;
+        }
         continue;
       }
       if (entry.isDirectory()) {

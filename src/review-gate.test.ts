@@ -115,7 +115,7 @@ test("manual and not-applicable criteria are nonblocking", () => {
   assert.equal(evaluateReviewGate(JSON.stringify(response), HOST_COMPLETE).decision.verdict, "PASS");
 });
 
-test("product-logic changes cannot pass with only manual or not-applicable criteria", () => {
+test("explicitly manual product criteria remain nonblocking", () => {
   const response = wireResponse({
     criteria: [
       {
@@ -132,8 +132,27 @@ test("product-logic changes cannot pass with only manual or not-applicable crite
       testInventoryComplete: true,
       requiresAutomatedEvidence: true,
     }).decision.verdict,
-    "ABSTAIN",
+    "PASS",
   );
+});
+
+test("product behavior cannot pass when a model downgrades it to manual without source support", () => {
+  const response = wireResponse({
+    criteria: [
+      {
+        id: "AC-1",
+        source_quote: "뒤로가기를 누르면 일시정지 메뉴가 열린다.",
+        testability: "manual",
+        coverage: "unknown",
+        test_evidence: null,
+      },
+    ],
+  });
+  const result = evaluateReviewGate(JSON.stringify(response), {
+    testInventoryComplete: true,
+    requiresAutomatedEvidence: true,
+  });
+  assert.equal(result.decision.verdict, "ABSTAIN");
 });
 
 test("the model cannot pass after omitting explicit acceptance checklist items", () => {
@@ -223,9 +242,12 @@ test("host-extracted explicit criteria require distinct exact one-to-one mapping
   );
 });
 
-test("missing automated coverage always holds for manual confirmation", () => {
+test("missing automated coverage blocks only with a complete current-HEAD inventory", () => {
   const complete = wireResponse({ criteria: [missingCriterion()] });
-  assert.equal(evaluateReviewGate(JSON.stringify(complete), HOST_COMPLETE).decision.verdict, "ABSTAIN");
+  const completeResult = evaluateReviewGate(JSON.stringify(complete), HOST_COMPLETE);
+  assert.equal(completeResult.decision.verdict, "FAIL");
+  assert.equal(completeResult.decision.failureKind, "missing_tests");
+  assert.equal(completeResult.decision.missingCriteria.length, 1);
 
   const modelIncomplete = wireResponse({
     test_inventory_complete: false,
@@ -307,10 +329,14 @@ test("insufficient context and explicit abstain reasons abstain", () => {
     context_status: "insufficient",
     abstain_reasons: ["관련 테스트 본문이 제공되지 않았다."],
   });
-  assert.equal(evaluateReviewGate(JSON.stringify(insufficient), HOST_COMPLETE).decision.verdict, "ABSTAIN");
+  const insufficientResult = evaluateReviewGate(JSON.stringify(insufficient), HOST_COMPLETE);
+  assert.equal(insufficientResult.decision.verdict, "ABSTAIN");
+  assert.deepEqual(insufficientResult.decision.reasons, ["자동 판정에 필요한 현재 HEAD 근거가 충분하지 않습니다."]);
 
   const explicit = wireResponse({ abstain_reasons: ["서로 상충하는 근거가 있다."] });
-  assert.equal(evaluateReviewGate(JSON.stringify(explicit), HOST_COMPLETE).decision.verdict, "ABSTAIN");
+  const explicitResult = evaluateReviewGate(JSON.stringify(explicit), HOST_COMPLETE);
+  assert.equal(explicitResult.decision.verdict, "ABSTAIN");
+  assert.deepEqual(explicitResult.decision.reasons, ["모델이 현재 근거만으로 판정을 확정하지 못했습니다."]);
 });
 
 test("malformed and incomplete responses abstain instead of being normalized", () => {

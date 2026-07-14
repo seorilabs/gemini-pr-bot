@@ -17,24 +17,24 @@ flowchart LR
 
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
 - Runs a conservative structured merge gate (`STRUCTURED_REVIEW_ENABLED`) instead of a general-purpose code review.
-- Maps only host-recognized checklist items or bullets under acceptance/requirements/definition-of-done headings to visible current-HEAD test evidence; unchanged tests count when their test body and assertion are present in context. Ordinary implementation prose cannot produce a gate `PASS`.
-- Product-logic or mixed changes require grounded automated evidence for every extracted criterion. Explicit acceptance/requirements checklist items are preserved across wrapped lines and must map one-to-one to distinct model criteria, so the model cannot duplicate, replace, or silently omit them and `PASS`.
+- Maps only host-recognized checklist items or bullets under acceptance/requirements/definition-of-done/behavior headings (`동작`, `기대 동작` 포함) to visible current-HEAD test evidence; unchanged tests count when their test body and assertion are present in context. Validation-result sections such as `검증` are not acceptance criteria.
+- Explicit acceptance criteria are preserved across wrapped lines and must map one-to-one to distinct model criteria. Automated criteria need grounded test evidence; explicitly manual, visual, or real-device criteria are nonblocking notes.
 - Test evidence must come from a registered, active current-HEAD test with a real non-vacuous assertion. Commented code, skipped/disabled tests or suites, ordinary helper functions, comparison-only expressions, and assertion-shaped strings are rejected by the host.
 - Reports at most two fatal blockers, limited to a deterministic common-path crash, permanent data loss/corruption, exploitable security/privacy exposure, or a certainly unusable primary flow. The added root line must itself directly perform the fatal outcome and end a 2-6-line ordered causal chain; normal false/null returns, UI flags, and deny-by-default security rules are rejected.
 - Uses host-side strict schema and evidence validation. MiniMax does not assign severity or decide approval itself.
-- Produces `PASS`, `FAIL`, or `ABSTAIN`. `FAIL` requires both host-grounded source evidence and the same fatal signature from an enabled, distinct tiebreaker provider. If that confirmation is unavailable, the result is `ABSTAIN`. A missing/unknown test match, malformed JSON, incomplete context, an ungrounded source quote, or unverifiable evidence also becomes `ABSTAIN`; structured review never falls back to a free-form blocking review.
+- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. An uncertain or blocking MiniMax result is retried once with the configured second-opinion provider. Confirmed fatal defects and confirmed automated-test omissions block; unresolved uncertainty completes the GitHub check as nonblocking `neutral` with Korean-only judgment text.
 - Omits Medium/Low findings, style/refactor suggestions, speculative risks, and automatic follow-up issue creation from the merge-gate path.
 - Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
-- Runs explicit review on `@gemini-cli /review`; a gate `PASS` submits approval, `FAIL` requests changes, and `ABSTAIN` holds approval for manual confirmation.
-- Submits a GitHub approval review on `@gemini-cli /approve [reason]`.
+- Runs explicit review on `@gemini-cli /review`; a gate pass submits approval, confirmed blockers request changes, and inconclusive results do not assign manual verification or block merge.
+- Submits a GitHub approval review on `@gemini-cli /approve [reason]` and changes the latest `Seori Review` check for the same HEAD to `success` (or creates a successful check when none exists).
 - Allows trusted maintainers to bypass bot-side merge conflict and status-check approval blockers with `@gemini-cli /approve --skip-validation [reason]` or `@gemini-cli /force-approve [reason]`.
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Seori Review` check run for review and agent jobs.
-- Marks `Seori Review` as `success` only after a gate `PASS` and approval of the current HEAD; `FAIL` and `ABSTAIN` complete as `action_required` without treating uncertainty as a code defect.
+- Marks `Seori Review` as `success` after a gate pass or explicit current-HEAD approval. Confirmed blockers complete as `action_required`; unresolved model uncertainty completes as nonblocking `neutral`.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
-- Can route AI jobs across MiniMax API (default) and GitHub Copilot CLI (fallback, returns 2026-07-01) with weighted fallback.
+- Can route AI jobs across MiniMax, Gemini API, GitHub Copilot CLI, and Cursor; production uses MiniMax for primary traffic and the paid Gemini API for second opinions.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
@@ -88,15 +88,13 @@ flowchart TD
   Conflict -->|Yes| RequestChanges["REQUEST_CHANGES review with resolution steps"]
   Conflict -->|No| AI["Conservative evidence prompt"]
   AI --> Validate["Strict schema + source/test/diff evidence validation"]
-  Validate -->|"Grounded fatal candidate"| Confirm{"Distinct tiebreaker confirms same signature?"}
-  Confirm -->|Yes| Output["REQUEST_CHANGES + action_required"]
-  Confirm -->|No / unavailable| Hold
-  Validate -->|"ABSTAIN: evidence gap"| Hold["COMMENT + manual hold"]
-  Validate -->|PASS| GateApproval["GitHub APPROVE + success; no bot auto-merge"]
+  Validate -->|"차단 또는 불확실"| Confirm{"2차 모델이 같은 근거를 확인?"}
+  Confirm -->|"치명 결함/테스트 누락 확인"| Output["REQUEST_CHANGES + action_required"]
+  Confirm -->|"불일치/확인 불가"| Neutral["한글 안내 + neutral; 병합 비차단"]
+  Validate -->|통과| GateApproval["GitHub APPROVE + success; bot 자동 병합 없음"]
   Output --> Approve["Maintainer or trusted agent runs /approve"]
-  Hold --> Approve
   Approve --> Validation{"Bot-side validation passes?"}
-  Validation -->|Yes| Approval["Explicit/manual or agent approval"]
+  Validation -->|Yes| Approval["승인 리뷰 + 현재 HEAD Seori check success"]
   Validation -->|No| Block["Comment blocker"]
   Output --> ForceApprove["Maintainer runs /force-approve or /approve --skip-validation"]
   ForceApprove --> ForceApproval["GitHub APPROVE review with skipped validation marker"]
@@ -189,6 +187,7 @@ export GITHUB_APP_ID="..."
 export GITHUB_PRIVATE_KEY_FILE="/path/to/seorilabs-seori-pr-bot.private-key.pem"
 export GITHUB_WEBHOOK_SECRET="..."
 export MINIMAX_API_KEY="..."
+export GEMINI_API_KEY="..."
 
 ./scripts/create-k8s-secret.sh
 ./scripts/create-gemini-cli-oauth-secret.sh
@@ -204,29 +203,32 @@ Optional multi-provider review routing:
 
 Use a dedicated automation account for these credentials. Personal tokens are acceptable for a short smoke test, but not for steady production use.
 
-The production default is:
+The production routing is:
 
 ```text
-AI_REVIEW_PROVIDERS=minimax,copilot
-AI_REVIEW_PROVIDER_WEIGHTS=minimax:100,copilot:25
-AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax,copilot
+AI_REVIEW_PROVIDERS=minimax
+AI_REVIEW_PROVIDER_WEIGHTS=minimax:100
+AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax
+AI_REVIEW_TIEBREAKER_ENABLED=true
+AI_REVIEW_TIEBREAKER_PROVIDER=gemini
 MINIMAX_MODEL=MiniMax-M3
 MINIMAX_API_BASE_URL=https://api.minimax.io/v1
+GEMINI_PROVIDER=api
+GEMINI_MODEL=gemini-3-flash-preview
 COPILOT_MODEL=auto
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
 PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
-The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMAX_API_BASE_URL}/chat/completions` and disables M3 thinking so the response contains only the review text. GitHub Copilot CLI is the optional fallback (quota returns 2026-07-01). The legacy Gemini CLI and Cursor Agent integrations remain in source and can be re-enabled by listing them in `AI_REVIEW_PROVIDERS` with a positive weight, but they are not loaded by default.
+The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMAX_API_BASE_URL}/chat/completions` and disables M3 thinking so the response contains only the review text. The paid Gemini API is reserved for one automatic second opinion when the primary gate is uncertain or blocking; it does not receive normal production traffic. Copilot CLI, Gemini CLI, and Cursor remain optional integrations, but are not part of the production route.
 
-Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions all use the multi-provider router. This keeps `/agent` approval decisions working when Gemini CLI is temporarily quota-blocked.
+Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions use the configured provider router. The structured gate additionally uses the direct second-opinion provider when required.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
 When `AUTO_SQUASH_MERGE_ENABLED=true`, eligible non-gate approvals are followed by a GitHub Squash Merge attempt only for PRs targeting `main`; conservative gate approvals deliberately stop before merge. There is no repo allowlist and no branch allowlist beyond exact `main`.
-Providers with weight `0` are disabled for both random selection and fallback attempts.
+Providers with weight `0` are disabled for normal random selection and fallback attempts. The explicitly configured second-opinion provider may still be called directly when it has credentials and is not cooling down.
 If every enabled provider is already in cooldown before a provider command is started, the workflow is requeued until the earliest cooldown expires instead of consuming retry attempts and failing immediately.
-The default keeps Copilot at weight `0` until its quota health is proven, while Cursor has a smaller positive weight so it can absorb traffic when Gemini is cooling down.
 
 Optional approval Telegram notifications use the same NATS message contract as `fundevel/cronjobs`: publish `{ "text": "..." }` to `telegram.<bot>.<channel>`.
 
@@ -252,6 +254,8 @@ STALE_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
 ```
 
 The stale scanner only considers hidden bot markers for the current PR HEAD. If a non-bot response appears after an action-required marker but does not mention the bot, the scanner queues one synthetic agent follow-up instead of closing immediately. If that follow-up still leaves action required, the bot writes:
+
+The latest same-HEAD `no-action-required` marker clears older blockers. Legacy `kind=review` markers are treated as nonblocking because older gate versions used them for model uncertainty; new confirmed blockers use `kind=review-test` or `kind=review-fatal` and remain stale-close eligible.
 
 ```html
 <!-- seorilabs-seori-pr-bot:status=action-required kind=stale-self-trigger blocked_kind=<review|status-check|merge-conflict> head=<head-sha> response_at=<timestamp> -->

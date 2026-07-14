@@ -369,14 +369,74 @@ async function findStaleReviewAction(
   return { type: "close", candidate };
 }
 
-function latestReviewSignal(issueComments: any[], reviews: any[], headSha: string): ReviewSignal | null {
-  const signals = [
-    ...issueComments.flatMap((comment) => signalFromBody(comment.body, comment.created_at, comment.user, headSha)),
-    ...reviews.flatMap((review) => signalFromBody(review.body, review.submitted_at, review.user, headSha)),
+export function latestReviewSignal(issueComments: any[], reviews: any[], headSha: string): ReviewSignal | null {
+  const states = [
+    ...issueComments.flatMap((comment) => reviewStateFromBody(
+      comment.body,
+      comment.created_at,
+      comment.user,
+      headSha,
+    )),
+    ...reviews.flatMap((review) => reviewStateFromBody(
+      review.body,
+      review.submitted_at,
+      review.user,
+      headSha,
+    )),
   ];
 
-  signals.sort((left, right) => Date.parse(right.at) - Date.parse(left.at));
-  return signals[0] || null;
+  states.sort((left, right) => {
+    const timeDifference = Date.parse(right.at) - Date.parse(left.at);
+    if (timeDifference !== 0) {
+      return timeDifference;
+    }
+
+    // GitHub timestamps may have only second precision. In a tie, prefer the
+    // nonblocking state so the scanner cannot close a PR after it was settled.
+    return Number(right.resolved) - Number(left.resolved);
+  });
+  return states[0]?.signal || null;
+}
+
+type ReviewState = {
+  at: string;
+  resolved: boolean;
+  signal: ReviewSignal | null;
+};
+
+function reviewStateFromBody(
+  body: string | undefined,
+  at: string | undefined,
+  user: any,
+  headSha: string,
+): ReviewState[] {
+  if (!body || !at || !isBotUser(user)) {
+    return [];
+  }
+
+  const markerHeadSha = markerHeadShaFromBody(body);
+  if (markerHeadSha && markerHeadSha !== headSha) {
+    return [];
+  }
+
+  if (bodyIncludesBotStatusMarker(body, "no-action-required")) {
+    // A no-action marker without a recorded HEAD is too ambiguous to resolve a
+    // current-HEAD blocker. Current bot writers always include the HEAD.
+    return markerHeadSha === headSha ? [{ at, resolved: true, signal: null }] : [];
+  }
+
+  const signals = signalFromBody(body, at, user, headSha);
+  return signals.map((signal) => {
+    // Older conservative-gate ABSTAIN comments used generic `kind=review`.
+    // They represented uncertainty, not an author-owned defect. New actionable
+    // markers use explicit kinds such as review-test and review-fatal.
+    const resolved = signal.kind === "action-required" && signal.actionKind === "review";
+    return {
+      at,
+      resolved,
+      signal: resolved ? null : signal,
+    };
+  });
 }
 
 function signalFromBody(body: string | undefined, at: string | undefined, user: any, headSha: string): ReviewSignal[] {

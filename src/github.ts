@@ -526,13 +526,20 @@ export function countExplicitAcceptanceCriteria(value: string): number {
 export function listExplicitAcceptanceCriteria(value: string): string[] {
   const criteria: string[] = [];
   let inAcceptanceSection = false;
+  let canContinueCriterion = false;
   for (const rawLine of value.split(/\r?\n/u)) {
     const line = rawLine.trim();
     const heading = line.match(/^#{1,6}\s+(.+)$/u);
     if (heading) {
-      inAcceptanceSection = /(?:acceptance\s+criteria|requirements?|definition\s+of\s+done|인수\s*조건|완료\s*조건|검증\s*조건|요구\s*사항|요건)/iu.test(
-        heading[1] || "",
-      );
+      const headingText = (heading[1] || "")
+        .normalize("NFKC")
+        .replace(/\s+#+\s*$/u, "")
+        .trim();
+      inAcceptanceSection =
+        /(?:acceptance\s+criteria|requirements?|definition\s+of\s+done|인수\s*조건|완료\s*조건|검증\s*조건|요구\s*사항|요건)/iu.test(
+          headingText,
+        ) || /^(?:expected\s+behavior|behavior|기대\s*동작|동작)$/iu.test(headingText);
+      canContinueCriterion = false;
       continue;
     }
 
@@ -544,6 +551,7 @@ export function listExplicitAcceptanceCriteria(value: string): string[] {
     const text = checkbox?.[1] || numberedCriterion?.[1] || sectionItem?.[1];
     if (text) {
       criteria.push(text.normalize("NFKC").replace(/\s+/gu, " ").trim());
+      canContinueCriterion = true;
       continue;
     }
 
@@ -551,13 +559,16 @@ export function listExplicitAcceptanceCriteria(value: string): string[] {
     // Dropping lines such as "단, 사용자별로 분리한다" lets the model pass on
     // only the first half of an explicitly stated acceptance criterion.
     if (
+      canContinueCriterion &&
       criteria.length > 0 &&
       line.length > 0 &&
       /^(?: {2,}|\t)\S/u.test(rawLine) &&
       !/^\s*(?:[-*+]\s+|\d+[.)]\s+)/u.test(rawLine)
     ) {
       criteria[criteria.length - 1] = `${criteria[criteria.length - 1]} ${line}`;
+      continue;
     }
+    canContinueCriterion = false;
   }
   return criteria;
 }
@@ -1146,6 +1157,62 @@ export async function completeCheck(
       summary: truncate(summary, 65000),
     },
   });
+}
+
+export async function completeLatestOwnReviewCheckAsSuccess(
+  octokit: Octokit,
+  repo: RepoRef,
+  headSha: string,
+  title: string,
+  summary: string,
+): Promise<number | null> {
+  const { data } = await octokit.rest.checks.listForRef({
+    owner: repo.owner,
+    repo: repo.repo,
+    ref: headSha,
+    per_page: 100,
+  });
+  let latestOwnCheck: any | null = null;
+  for (const run of data.check_runs || []) {
+    if (!isOwnReviewCheck(run.name) || !Number.isFinite(Number(run.id))) {
+      continue;
+    }
+    if (latestOwnCheck === null || Number(run.id) > Number(latestOwnCheck.id)) {
+      latestOwnCheck = run;
+    }
+  }
+
+  if (!latestOwnCheck) {
+    const { data: created } = await octokit.rest.checks.create({
+      owner: repo.owner,
+      repo: repo.repo,
+      name: REVIEW_CHECK_NAME,
+      head_sha: headSha,
+      status: "completed",
+      conclusion: "success",
+      completed_at: new Date().toISOString(),
+      output: {
+        title,
+        summary: truncate(summary, 65000),
+      },
+    });
+    return Number.isFinite(Number(created.id)) ? Number(created.id) : null;
+  }
+
+  const checkRunId = Number(latestOwnCheck.id);
+  await octokit.rest.checks.update({
+    owner: repo.owner,
+    repo: repo.repo,
+    check_run_id: checkRunId,
+    status: "completed",
+    conclusion: "success",
+    completed_at: new Date().toISOString(),
+    output: {
+      title,
+      summary: truncate(summary, 65000),
+    },
+  });
+  return checkRunId;
 }
 
 export async function approvePullRequest(

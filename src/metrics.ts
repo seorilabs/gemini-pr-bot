@@ -111,7 +111,7 @@ const METADATA: Record<string, { type: "counter" | "gauge" | "histogram"; help: 
   },
   seori_pr_bot_ai_provider_configured: {
     type: "gauge",
-    help: "Whether an AI provider is listed in AI_REVIEW_PROVIDERS.",
+    help: "Whether an AI provider is used by normal routing or second-opinion review.",
   },
   seori_pr_bot_ai_provider_weight: {
     type: "gauge",
@@ -125,9 +125,13 @@ const METADATA: Record<string, { type: "counter" | "gauge" | "histogram"; help: 
     type: "gauge",
     help: "Whether an AI provider can be selected by routing based on config weight.",
   },
+  seori_pr_bot_ai_provider_second_opinion_enabled: {
+    type: "gauge",
+    help: "Whether an AI provider is configured for direct second-opinion review.",
+  },
   seori_pr_bot_ai_provider_available: {
     type: "gauge",
-    help: "Whether an AI provider is configured, weighted, credentialed, and not in cooldown.",
+    help: "Whether an AI provider is usable by routing or second-opinion review right now.",
   },
   seori_pr_bot_ai_provider_cooldown_remaining_seconds: {
     type: "gauge",

@@ -58,9 +58,11 @@ export type ReviewGateParseResult =
   | { ok: false; errors: string[] };
 
 export type ReviewGateVerdict = "PASS" | "FAIL" | "ABSTAIN";
+export type ReviewGateFailureKind = "fatal" | "missing_tests" | null;
 
 export type ReviewGateDecision = {
   verdict: ReviewGateVerdict;
+  failureKind: ReviewGateFailureKind;
   reasons: string[];
   missingCriteria: ReviewGateCriterion[];
   fatalBlockers: ReviewGateFatalBlocker[];
@@ -75,7 +77,7 @@ export type ReviewGateEvidenceValidators = {
 export type ReviewGateEvaluationOptions = {
   /** Whether the host supplied an exhaustive current-HEAD test inventory. */
   testInventoryComplete: boolean;
-  /** Product-logic changes require automated evidence for every emitted criterion. */
+  /** Product changes may use non-automated classifications only when the AC text explicitly supports them. */
   requiresAutomatedEvidence?: boolean;
   /** Deterministic lower bound from explicit AC checklists/sections in trusted text. */
   minimumAcceptanceCriteria?: number;
@@ -200,11 +202,11 @@ export function decideReviewGate(
   options: ReviewGateEvaluationOptions,
 ): ReviewGateDecision {
   if (response.contextStatus === "insufficient") {
-    return abstain(response.abstainReasons.length > 0 ? response.abstainReasons : ["검토 컨텍스트가 불충분합니다."]);
+    return abstain(["자동 판정에 필요한 현재 HEAD 근거가 충분하지 않습니다."]);
   }
 
   if (response.abstainReasons.length > 0) {
-    return abstain(response.abstainReasons);
+    return abstain(["모델이 현재 근거만으로 판정을 확정하지 못했습니다."]);
   }
 
   const invalidEvidence = validateReviewGateEvidence(response, options.evidenceValidators);
@@ -220,8 +222,9 @@ export function decideReviewGate(
   if (response.fatalBlockers.length > 0) {
     return {
       verdict: "FAIL",
+      failureKind: "fatal",
       reasons: response.fatalBlockers.map(
-        (blocker) => `${blocker.file}:${blocker.line}의 치명 결함: ${blocker.outcome}`,
+        (blocker) => `${blocker.file}:${blocker.line}에서 ${fatalOutcomeLabel(blocker.outcome)}이 확인됐습니다.`,
       ),
       missingCriteria: [],
       fatalBlockers: response.fatalBlockers,
@@ -234,7 +237,7 @@ export function decideReviewGate(
       .filter(Boolean),
   )];
   if (options.requiresExplicitAcceptanceCriteria && explicitCriteria.length === 0) {
-    return abstain(["host가 인식한 명시적 인수조건이 없어 테스트 Gate를 자동 통과시킬 수 없습니다."]);
+    return abstain(["명시적인 인수조건을 찾지 못해 자동 판정을 생략했습니다."]);
   }
 
   if (response.criteria.length === 0) {
@@ -245,7 +248,7 @@ export function decideReviewGate(
     normalizeAcceptanceCriterion(criterion.sourceQuote),
   );
   if (new Set(normalizedSourceQuotes).size !== normalizedSourceQuotes.length) {
-    return abstain(["서로 다른 인수조건이 동일한 원문 근거를 중복 사용해 수동 확인이 필요합니다."]);
+    return abstain(["서로 다른 인수조건이 같은 원문을 중복 인용해 자동 판정을 확정할 수 없습니다."]);
   }
 
   const missingExplicitCriteria = explicitCriteria.filter(
@@ -256,40 +259,50 @@ export function decideReviewGate(
     (options.requiresExplicitAcceptanceCriteria && normalizedSourceQuotes.length !== explicitCriteria.length)
   ) {
     return abstain([
-      "host가 추출한 명시적 인수조건과 모델 결과가 정확히 1:1로 대응되지 않아 수동 확인이 필요합니다.",
+      "명시적 인수조건과 모델 결과가 정확히 대응하지 않아 자동 판정을 확정할 수 없습니다.",
     ]);
   }
 
   const minimumAcceptanceCriteria = Math.max(0, options.minimumAcceptanceCriteria || 0);
   if (response.criteria.length < minimumAcceptanceCriteria) {
     return abstain([
-      `명시된 인수조건 ${minimumAcceptanceCriteria}개 중 ${response.criteria.length}개만 추출되어 수동 확인이 필요합니다.`,
+      `명시된 인수조건 ${minimumAcceptanceCriteria}개 중 ${response.criteria.length}개만 추출돼 자동 판정을 확정할 수 없습니다.`,
     ]);
   }
 
-  if (options.requiresAutomatedEvidence && automated.length !== response.criteria.length) {
-    return abstain(["제품 로직 변경의 모든 인수조건에 자동화 테스트 근거가 필요합니다."]);
+  if (options.requiresAutomatedEvidence) {
+    const unsupportedNonAutomated = response.criteria.filter(
+      (criterion) =>
+        criterion.testability !== "automated" &&
+        !isExplicitNonAutomatedCriterion(criterion.sourceQuote),
+    );
+    if (unsupportedNonAutomated.length > 0) {
+      return abstain([
+        "제품 동작 인수조건이 자동화 대상이 아닌 것으로 분류됐지만 원문에서 수동 검증 근거를 찾지 못했습니다.",
+      ]);
+    }
   }
 
-  const uncertainReasons: string[] = [];
   if (missing.length > 0) {
-    uncertainReasons.push(
-      inventoryComplete
-        ? "현재 HEAD 전체 테스트에서 인수조건을 증명하는 근거를 찾지 못했지만, 부재 판단은 수동 확인이 필요합니다."
-        : "완전한 현재 HEAD 테스트 목록이 없어 테스트 누락을 확정할 수 없습니다.",
-    );
+    if (inventoryComplete) {
+      return {
+        verdict: "FAIL",
+        failureKind: "missing_tests",
+        reasons: ["현재 HEAD의 전체 테스트를 확인했지만 자동화 가능한 인수조건을 검증하는 테스트가 없습니다."],
+        missingCriteria: missing,
+        fatalBlockers: [],
+      };
+    }
+    return abstain(["현재 HEAD 테스트 목록이 일부만 제공돼 테스트 누락 여부를 확정할 수 없습니다."]);
   }
+
   if (unknown.length > 0) {
-    uncertainReasons.push(
-      ...unknown.map((criterion) => `${criterion.id}: 자동화된 인수조건의 테스트 커버리지를 확인할 수 없습니다.`),
-    );
-  }
-  if (uncertainReasons.length > 0) {
-    return abstain(uncertainReasons);
+    return abstain(["자동화 가능한 인수조건의 테스트 근거를 현재 HEAD에서 확인할 수 없습니다."]);
   }
 
   return {
     verdict: "PASS",
+    failureKind: null,
     reasons: ["모든 자동화 대상 인수조건이 테스트로 확인되었고 명백한 치명 결함이 없습니다."],
     missingCriteria: [],
     fatalBlockers: [],
@@ -302,7 +315,7 @@ export function evaluateReviewGate(text: string, options: ReviewGateEvaluationOp
     return {
       response: null,
       parseErrors: parsed.errors,
-      decision: abstain(parsed.errors.map((error) => `모델 응답 스키마 오류: ${error}`)),
+      decision: abstain(["모델 응답 형식이 올바르지 않아 자동 판정을 확정할 수 없습니다."]),
     };
   }
 
@@ -552,11 +565,28 @@ function normalizeAcceptanceCriterion(value: string): string {
   return value.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase();
 }
 
+function isExplicitNonAutomatedCriterion(value: string): boolean {
+  return /(?:수동|실제\s*기기|실기기|직접[^.!?\n]{0,30}(?:확인|검증)|육안|시각|스크린샷|문서|릴리스\s*(?:문구|노트)|메타데이터|이미지|아이콘|\bmanual(?:ly)?\b|\breal[ -]?device\b|\bvisual(?:ly)?\b|\bscreenshot\b|\bdocs?\b|\bdocumentation\b|\brelease notes?\b|\bmetadata\b|\bassets?\b|\bicons?\b|\breadme\b)/iu.test(
+    value,
+  );
+}
+
 function abstain(reasons: string[]): ReviewGateDecision {
   return {
     verdict: "ABSTAIN",
+    failureKind: null,
     reasons,
     missingCriteria: [],
     fatalBlockers: [],
   };
+}
+
+function fatalOutcomeLabel(outcome: ReviewGateFatalOutcome): string {
+  const labels: Record<ReviewGateFatalOutcome, string> = {
+    deterministic_crash: "일반 경로의 확정적 크래시",
+    permanent_data_loss_or_corruption: "영구 데이터 손실 또는 손상",
+    exploitable_security_or_privacy_exposure: "악용 가능한 보안 또는 개인정보 노출",
+    primary_flow_unusable: "핵심 사용자 흐름 사용 불가",
+  };
+  return labels[outcome];
 }

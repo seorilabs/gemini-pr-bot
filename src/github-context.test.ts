@@ -31,3 +31,44 @@ test("requirements headings and wrapped constraints remain explicit acceptance c
   ]);
   assert.equal(countExplicitAcceptanceCriteria("## Requirements\n- Data persists.\n- Sessions expire."), 2);
 });
+
+test("behavior sections are acceptance criteria while validation results are not", () => {
+  const body = [
+    "## 동작",
+    "```mermaid",
+    "flowchart TD",
+    "  A --> B",
+    "```",
+    "- 일시정지 메뉴에서 홈으로 돌아갈 수 있다.",
+    "- 종료 전에 사용자에게 확인한다.",
+    "## 검증",
+    "- Godot compile/smoke PASSED",
+    "  실기기 확인은 별도로 필요하다.",
+    "## 참고",
+    "- 로컬에서 재현할 수 없는 제약이 있다.",
+  ].join("\n");
+
+  assert.deepEqual(listExplicitAcceptanceCriteria(body), [
+    "일시정지 메뉴에서 홈으로 돌아갈 수 있다.",
+    "종료 전에 사용자에게 확인한다.",
+  ]);
+});
+
+test("English behavior headings accept bullets and numbered items but Testing does not", () => {
+  const body = [
+    "## Behavior",
+    "- Back closes the open modal.",
+    "## Expected behavior",
+    "1. Back pauses an active level.",
+    "2) Back asks before closing the app.",
+    "## Testing",
+    "- Unit tests passed.",
+    "- Device testing is pending.",
+  ].join("\n");
+
+  assert.deepEqual(listExplicitAcceptanceCriteria(body), [
+    "Back closes the open modal.",
+    "Back pauses an active level.",
+    "Back asks before closing the app.",
+  ]);
+});

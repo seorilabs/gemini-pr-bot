@@ -10,6 +10,7 @@ import {
   closePullRequest,
   commentAndCloseIssue,
   completeCheck,
+  completeLatestOwnReviewCheckAsSuccess,
   createFollowupIssue,
   createInProgressCheck,
   ensureLabelExists,
@@ -58,8 +59,8 @@ import {
   buildChangedLineEvidence,
   isGroundedFatalBlocker,
   isGroundedTestEvidence,
-  sameFatalBlockerSet,
 } from "./review-grounding.js";
+import { resolveReviewGateSecondOpinion } from "./review-resolution.js";
 import {
   BOT_GITHUB_LOGIN,
   bodyIncludesBotActionMarker,
@@ -77,7 +78,7 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
-const REVIEW_GATE_PROMPT_VERSION = "conservative-merge-gate-v1";
+const REVIEW_GATE_PROMPT_VERSION = "conservative-merge-gate-v2";
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
@@ -1620,23 +1621,27 @@ export class PrBot {
         },
       });
     let evaluation = evaluateOutput(aiResult.text);
+    await this.recordReviewGateRun(workflow, check, repo, prNumber, context, prompt, aiResult, evaluation);
 
-    if (evaluation.decision.verdict === "FAIL") {
-      const tiebreaker = this.config.aiReviewTiebreakerProvider;
-      const canConfirmFatal =
+    if (evaluation.decision.verdict !== "PASS") {
+      const secondOpinionProvider = this.config.aiReviewTiebreakerProvider;
+      const canRunSecondOpinion =
         this.config.aiReviewTiebreakerEnabled &&
-        tiebreaker !== aiResult.provider &&
-        this.gemini.canUseProvider(tiebreaker);
+        secondOpinionProvider !== aiResult.provider &&
+        this.gemini.canUseProviderAsSecondOpinion(secondOpinionProvider);
 
-      if (!canConfirmFatal) {
+      if (!canRunSecondOpinion) {
         evaluation = this.abstainReviewGate(
           evaluation,
-          "치명 결함 후보를 독립된 2차 모델로 확인할 수 없어 수동 확인이 필요합니다.",
+          "독립된 2차 모델을 사용할 수 없어 이번 자동 판정을 확정하지 않았습니다.",
         );
       } else {
         try {
-          const confirmationResult = await this.gemini.reviewStructuredWithMetadata(prompt, tiebreaker);
-          const confirmationEvaluation = evaluateOutput(confirmationResult.text);
+          const secondOpinionResult = await this.gemini.reviewStructuredWithProvider(
+            prompt,
+            secondOpinionProvider,
+          );
+          const secondOpinionEvaluation = evaluateOutput(secondOpinionResult.text);
           await this.recordReviewGateRun(
             workflow,
             check,
@@ -1644,37 +1649,47 @@ export class PrBot {
             prNumber,
             context,
             prompt,
-            confirmationResult,
-            confirmationEvaluation,
+            secondOpinionResult,
+            secondOpinionEvaluation,
           );
-          const independentlyConfirmed =
-            confirmationResult.provider === tiebreaker &&
-            confirmationResult.provider !== aiResult.provider &&
-            confirmationEvaluation.decision.verdict === "FAIL" &&
-            sameFatalBlockerSet(
-              evaluation.decision.fatalBlockers,
-              confirmationEvaluation.decision.fatalBlockers,
-            );
-          if (!independentlyConfirmed) {
-            evaluation = this.abstainReviewGate(
-              evaluation,
-              "독립된 2차 모델이 동일한 치명 결함 근거를 확인하지 않아 수동 확인으로 보류합니다.",
-            );
-          }
+          evaluation = resolveReviewGateSecondOpinion(evaluation, secondOpinionEvaluation);
         } catch (error) {
           this.logger.warn(
-            { error, repo: repo.fullName, prNumber, headSha: context.headSha, provider: tiebreaker },
-            "fatal review gate confirmation failed",
+            {
+              error,
+              repo: repo.fullName,
+              prNumber,
+              headSha: context.headSha,
+              provider: secondOpinionProvider,
+            },
+            "review gate second opinion failed",
           );
           evaluation = this.abstainReviewGate(
             evaluation,
-            "치명 결함 후보의 독립된 2차 검증에 실패해 수동 확인으로 보류합니다.",
+            "독립된 2차 검증을 완료하지 못해 이번 자동 판정을 확정하지 않았습니다.",
           );
         }
       }
     }
 
-    await this.recordReviewGateRun(workflow, check, repo, prNumber, context, prompt, aiResult, evaluation);
+    await this.recordReviewGateRun(
+      workflow,
+      check,
+      repo,
+      prNumber,
+      context,
+      prompt,
+      {
+        provider: "host",
+        model: "review-gate-consensus-v2",
+        text: JSON.stringify({
+          verdict: evaluation.decision.verdict,
+          failure_kind: evaluation.decision.failureKind,
+          reasons: evaluation.decision.reasons,
+        }),
+      },
+      evaluation,
+    );
 
     if (await this.cancelTrackedCheckIfShuttingDown(check, "리뷰 취소", "리뷰 결과를 게시하기 전에 봇이 중지되었습니다.")) {
       return;
@@ -1697,7 +1712,12 @@ export class PrBot {
         line: blocker.line,
         body: this.fatalBlockerInlineBody(blocker),
       }));
-      const reviewBody = this.actionRequiredText("review", context.headSha, summary);
+      const missingTests = evaluation.decision.failureKind === "missing_tests";
+      const reviewBody = this.actionRequiredText(
+        missingTests ? "review-test" : "review-fatal",
+        context.headSha,
+        summary,
+      );
       await this.safeSubmitReview(
         octokit,
         repo,
@@ -1707,14 +1727,19 @@ export class PrBot {
         reviewBody,
         inlineComments,
       );
-      await this.completeTrackedCheck(check, "action_required", "보수적 Gate 실패", reviewBody);
+      await this.completeTrackedCheck(
+        check,
+        "action_required",
+        missingTests ? "인수조건 테스트 누락" : "치명 결함 확인",
+        reviewBody,
+      );
       return;
     }
 
     if (evaluation.decision.verdict === "ABSTAIN") {
-      const holdBody = this.actionRequiredText("review", context.headSha, summary);
-      await postPrComment(octokit, repo, prNumber, holdBody);
-      await this.completeTrackedCheck(check, "action_required", "수동 확인 필요", holdBody);
+      const noteBody = [`<!-- ${NO_ACTION_REQUIRED_MARKER} head=${context.headSha} -->`, summary].join("\n");
+      await postPrComment(octokit, repo, prNumber, noteBody);
+      await this.completeTrackedCheck(check, "neutral", "자동 판정 제한 · 병합 비차단", noteBody);
       return;
     }
 
@@ -1763,7 +1788,7 @@ export class PrBot {
         reason: "명시적 인수조건 테스트가 확인됐고 증명된 치명 결함이 없습니다.",
       },
     );
-    await this.completeTrackedCheck(check, "success", "보수적 Gate 통과", summary);
+    await this.completeTrackedCheck(check, "success", "보수적 게이트 통과", summary);
     await this.maybeSquashMergeApprovedPullRequest(octokit, repo, prNumber, latest.headSha, "review_gate");
   }
 
@@ -1795,6 +1820,7 @@ export class PrBot {
       ...evaluation,
       decision: {
         verdict: "ABSTAIN",
+        failureKind: null,
         reasons: [reason],
         missingCriteria: [],
         fatalBlockers: [],
@@ -1860,12 +1886,27 @@ export class PrBot {
     hostInventoryComplete: boolean,
   ): string {
     const response = evaluation.response;
+    const verdictLabels = {
+      PASS: "통과",
+      FAIL: "차단",
+      ABSTAIN: "자동 판정 제한",
+    } as const;
+    const testabilityLabels = {
+      automated: "자동화",
+      manual: "수동",
+      not_applicable: "해당 없음",
+    } as const;
+    const coverageLabels = {
+      covered: "확인됨",
+      missing: "테스트 없음",
+      unknown: "확인 불가",
+    } as const;
     const lines = [
-      "## Seori 보수적 Merge Gate",
+      "## Seori 보수적 병합 게이트",
       "",
       `HEAD: \`${headSha}\``,
-      `판정: **${evaluation.decision.verdict}**`,
-      `현재 HEAD 테스트 목록 완전성: **${hostInventoryComplete ? "complete" : "partial"}**`,
+      `판정: **${verdictLabels[evaluation.decision.verdict]}**`,
+      `현재 HEAD 테스트 목록: **${hostInventoryComplete ? "전체 확인" : "일부 확인"}**`,
     ];
 
     if (response?.criteria.length) {
@@ -1877,13 +1918,13 @@ export class PrBot {
             : criterion.coverage === "covered"
               ? "✅"
               : criterion.coverage === "missing"
-                ? "❓"
+                ? "❌"
                 : "❓";
         const evidence = criterion.testEvidence
           ? ` — \`${criterion.testEvidence.file}\` / ${criterion.testEvidence.testName}`
           : "";
         lines.push(
-          `- ${marker} **${criterion.id}** [${criterion.testability}/${criterion.coverage}] ${truncate(criterion.sourceQuote, 220)}${evidence}`,
+          `- ${marker} **${criterion.id}** [${testabilityLabels[criterion.testability]}/${coverageLabels[criterion.coverage]}] ${truncate(criterion.sourceQuote, 220)}${evidence}`,
         );
       }
     }
@@ -1912,13 +1953,15 @@ export class PrBot {
     if (evaluation.decision.verdict === "ABSTAIN") {
       lines.push(
         "",
-        "_불확실성을 코드 결함으로 단정하지 않았습니다. 수동 확인 후 `/approve` 또는 보강 커밋을 선택하세요._",
+        "_모델 불확실성은 작성자 조치로 전환하지 않았으며 이 판정은 병합을 차단하지 않습니다._",
       );
     } else if (evaluation.decision.verdict === "PASS") {
       lines.push(
         "",
-        "_PASS는 제공된 현재 HEAD 증거에서 인수조건 테스트가 확인되고 치명 결함이 증명되지 않았다는 뜻입니다. 일반 품질 리뷰를 대체하지 않습니다._",
+        "_통과는 현재 HEAD에서 인수조건 테스트가 확인되고 치명 결함이 증명되지 않았다는 뜻이며, 일반 품질 리뷰를 대체하지 않습니다._",
       );
+    } else if (evaluation.decision.failureKind === "missing_tests") {
+      lines.push("", "_PR 작성자가 누락된 인수조건 테스트를 추가하면 다시 자동 검토합니다._");
     }
 
     return lines.join("\n");
@@ -2461,6 +2504,13 @@ export class PrBot {
         source: options.skipValidation ? "force_approve_command" : "approve_command",
         reason,
       },
+    );
+    await completeLatestOwnReviewCheckAsSuccess(
+      octokit,
+      repo,
+      status.headSha,
+      "수동 승인 완료",
+      `@${sender}의 명시적 승인으로 현재 HEAD의 Seori Review 체크를 통과 처리했습니다.`,
     );
     await this.maybeSquashMergeApprovedPullRequest(
       octokit,
