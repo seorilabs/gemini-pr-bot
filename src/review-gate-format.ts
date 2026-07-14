@@ -48,6 +48,11 @@ export type ReviewGateCoveredCriterion = {
   testName: string;
 };
 
+export type ReviewGateAbstainItem = {
+  label: string;
+  reason: string;
+};
+
 export type ReviewGateFormatInput = {
   headSha: string;
   verdict: ReviewGatePublicVerdict;
@@ -57,6 +62,8 @@ export type ReviewGateFormatInput = {
   passSummaryKo?: string;
   abstainSummaryKo?: string;
   coveredCriteria?: readonly ReviewGateCoveredCriterion[];
+  fatalCheckPassed?: boolean;
+  abstainItems?: readonly ReviewGateAbstainItem[];
 };
 
 export type ReviewGateCheckOutput = {
@@ -146,6 +153,7 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
   const summary = input.abstainSummaryKo
     ? requiredKoreanProse(input.abstainSummaryKo, "abstainSummaryKo")
     : "현재 HEAD에서 차단할 만큼 확실한 근거가 없어 병합을 차단하지 않습니다.";
+  const abstainItems = input.abstainItems || [];
   return {
     conclusion: "neutral",
     title: "자동 판정 보류 · 병합 비차단",
@@ -160,20 +168,62 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
         "",
         summary,
         "",
+        formatPassedChecks(input.coveredCriteria || [], input.fatalCheckPassed === true),
+        "",
+        formatAbstainItems(abstainItems),
+        "",
         "_작성자에게 추가 확인이나 수정을 요구하지 않습니다._",
       ].join("\n"),
     ]),
   };
 }
 
+function formatPassedChecks(
+  criteria: readonly ReviewGateCoveredCriterion[],
+  fatalCheckPassed: boolean,
+): string {
+  const lines = ["### 확인 완료 (PASS)"];
+  if (fatalCheckPassed) {
+    lines.push("- **치명 결함 검사** — 현재 변경 전체에서 확정된 치명 결함이 없습니다.");
+  }
+  lines.push(...formatCoveredCriterionLines(criteria));
+  if (lines.length === 1) {
+    lines.push("- 확정적으로 통과한 세부 항목이 없습니다.");
+  }
+  return lines.join("\n");
+}
+
+function formatAbstainItems(items: readonly ReviewGateAbstainItem[]): string {
+  if (items.length > 32) {
+    throw new TypeError("공개할 판정 보류 항목은 최대 32개입니다.");
+  }
+  const lines = ["### 판정 보류 항목"];
+  if (items.length === 0) {
+    lines.push("- **자동 판정 근거** — 현재 HEAD 근거가 충분하지 않아 세부 판정을 확정하지 못했습니다.");
+    return lines.join("\n");
+  }
+  for (const item of items) {
+    const label = requiredText(item.label, "abstainItem.label", 500, false);
+    const reason = requiredKoreanProse(item.reason, "abstainItem.reason");
+    lines.push(`- **${publicProse(label, MAX_PROSE_LENGTH)}** — ${publicProse(reason, MAX_PROSE_LENGTH)}`);
+  }
+  return lines.join("\n");
+}
+
 function formatCoveredCriteria(criteria: readonly ReviewGateCoveredCriterion[]): string {
   if (criteria.length === 0) {
     return "";
   }
+  return ["### 확인한 인수조건 테스트", ...formatCoveredCriterionLines(criteria)].join("\n");
+}
+
+function formatCoveredCriterionLines(
+  criteria: readonly ReviewGateCoveredCriterion[],
+): string[] {
   if (criteria.length > 32) {
     throw new TypeError("공개할 인수조건 테스트 근거는 최대 32개입니다.");
   }
-  const lines = ["### 확인한 인수조건 테스트"];
+  const lines: string[] = [];
   for (const criterion of criteria) {
     const criterionId = requiredText(criterion.criterionId, "coveredCriterion.criterionId", 80, false);
     const source = requiredText(
@@ -191,7 +241,7 @@ function formatCoveredCriteria(criteria: readonly ReviewGateCoveredCriterion[]):
       `- **${publicProse(criterionId, 80)}** ${publicProse(source, MAX_PROSE_LENGTH)} — ${inlineCode(`${file}:${criterion.line}`)} · ${inlineCode(testName)}`,
     );
   }
-  return lines.join("\n");
+  return lines;
 }
 
 export function formatReviewGateFinding(

@@ -149,13 +149,45 @@ test("자동 판정 보류는 모델 사유나 작성자 행동 요구 없이 �
   const output = formatReviewGateCheckOutput({
     headSha: "abc1234",
     verdict: "ABSTAIN",
+    fatalCheckPassed: true,
+    coveredCriteria: [
+      {
+        criterionId: "AC-1",
+        acceptanceCriterion: "앱을 다시 열어도 기존 세션이 유지된다.",
+        file: "src/session.test.ts",
+        line: 27,
+        testName: "재실행 후 기존 세션을 복원한다",
+      },
+    ],
+    abstainItems: [{
+      label: "AC-2 · 네트워크가 끊겨도 작성 중인 내용이 보존된다.",
+      reason: "현재 HEAD에서 이 인수조건의 자동화 테스트 커버리지를 확정하지 못했습니다.",
+    }],
   });
 
   assert.equal(output.conclusion, "neutral");
   assert.equal(output.title, "자동 판정 보류 · 병합 비차단");
   assert.match(output.summary, /병합을 차단하지 않습니다/);
+  assert.match(output.text, /### 확인 완료 \(PASS\)/);
+  assert.match(output.text, /치명 결함 검사/);
+  assert.match(output.text, /AC-1/);
+  assert.match(output.text, /`src\/session\.test\.ts:27`/);
+  assert.match(output.text, /### 판정 보류 항목/);
+  assert.match(output.text, /AC-2/);
+  assert.match(output.text, /커버리지를 확정하지 못했습니다/);
   assert.match(output.text, /추가 확인이나 수정을 요구하지 않습니다/);
   assert.doesNotMatch(output.text, /\bABSTAIN\b|해주세요|추가하세요|확인하세요|수정하세요/);
+});
+
+test("세부 정보가 없는 예외 보류도 공개용 기본 사유를 표시한다", () => {
+  const output = formatReviewGateCheckOutput({
+    headSha: "abc1234",
+    verdict: "ABSTAIN",
+  });
+
+  assert.match(output.text, /확정적으로 통과한 세부 항목이 없습니다/);
+  assert.match(output.text, /자동 판정 근거/);
+  assert.match(output.text, /세부 판정을 확정하지 못했습니다/);
 });
 
 test("차단 지적의 핵심 설명이 없거나 한글이 아니면 게시하지 않는다", () => {

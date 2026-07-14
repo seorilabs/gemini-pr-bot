@@ -72,10 +72,8 @@ import {
   type ReviewGatePublicFinding,
   type ReviewGatePublicVerdict,
 } from "./review-gate-format.js";
-import {
-  evaluateReviewAcceptanceCoverage,
-  normalizeReviewAcceptanceEvidence,
-} from "./review-acceptance-coverage.js";
+import { buildReviewGateDisclosure } from "./review-gate-disclosure.js";
+import { evaluateReviewAcceptanceCoverage } from "./review-acceptance-coverage.js";
 import {
   REVIEW_GATE_CACHE_SCHEMA_VERSION,
   decodeReviewGateCache,
@@ -1752,6 +1750,10 @@ export class PrBot {
         verdict: "ABSTAIN",
         htmlMarkers: [`${NO_ACTION_REQUIRED_MARKER} head=${context.headSha}`],
         abstainSummaryKo: "자동 검증을 완료하지 못했지만 작성자에게 확인을 떠넘기지 않고 병합을 차단하지 않습니다.",
+        abstainItems: [{
+          label: "자동 검증 실행",
+          reason: "모델 응답 또는 검증 처리에 실패해 현재 HEAD의 세부 판정을 완료하지 못했습니다.",
+        }],
       });
       await this.recordMiniMaxReviewGateRun(
         workflow,
@@ -1825,6 +1827,9 @@ export class PrBot {
     const blockingOpenFindings = openFindings.filter((finding) =>
       currentConfirmedFingerprints.has(finding.semanticFingerprint),
     );
+    const unconfirmedOpenFindings = openFindings.filter((finding) =>
+      !currentConfirmedFingerprints.has(finding.semanticFingerprint),
+    );
     const hasUnresolvedValidation =
       !pipeline.inputValid ||
       !context.fatalContextComplete ||
@@ -1842,6 +1847,17 @@ export class PrBot {
     const publicFindings = verdict === "FAIL"
       ? this.reviewGatePublicFindings(blockingOpenFindings, publicByFingerprint, context)
       : [];
+    const disclosure = buildReviewGateDisclosure({
+      explicitAcceptanceCriteria,
+      acceptanceCoverage: envelope.acceptanceCoverage,
+      groundedAcceptanceCriteria: coverage.groundedAcceptanceCriteria,
+      coverageValidationErrors: coverage.validationErrors,
+      fatalContextComplete: context.fatalContextComplete,
+      pipeline,
+      candidates: envelope.candidates,
+      verifications: envelope.verifications,
+      unconfirmedOpenFindings,
+    });
     const output = formatReviewGateCheckOutput({
       headSha: context.headSha,
       verdict,
@@ -1855,20 +1871,9 @@ export class PrBot {
         ? "명시적 인수조건이 없어 현재 변경 전체에서 치명 결함만 검사했으며, 증명된 치명 결함이 없습니다."
         : "모든 자동 검증 대상 인수조건의 현재 HEAD 테스트 근거와 변경 전체의 치명 결함 검사를 확인했습니다.",
       abstainSummaryKo: "현재 근거만으로 확정할 수 없지만 작성자에게 추가 확인을 요구하지 않고 병합을 차단하지 않습니다.",
-      coveredCriteria: verdict === "PASS"
-        ? envelope.acceptanceCoverage.flatMap((item) =>
-            item.testEvidence && coverage.groundedAcceptanceCriteria.has(
-              normalizeReviewAcceptanceEvidence(item.acceptanceCriterion),
-            )
-              ? [{
-                  criterionId: item.criterionId,
-                  acceptanceCriterion: item.acceptanceCriterion,
-                  file: item.testEvidence.file,
-                  line: item.testEvidence.line,
-                  testName: item.testEvidence.testName,
-                }]
-              : [])
-        : [],
+      coveredCriteria: disclosure.coveredCriteria,
+      fatalCheckPassed: disclosure.fatalCheckPassed,
+      abstainItems: disclosure.abstainItems,
     });
 
     await this.recordMiniMaxReviewGateRun(
