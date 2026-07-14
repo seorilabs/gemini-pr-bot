@@ -34,7 +34,7 @@ flowchart LR
 - Creates a `Seori Review` check run for review and agent jobs.
 - Marks `Seori Review` as `success` after a gate pass or explicit current-HEAD approval. Confirmed blockers complete as `action_required`; unresolved model uncertainty completes as nonblocking `neutral`.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
-- Can route AI jobs across MiniMax, Gemini API, GitHub Copilot CLI, and Cursor; production uses MiniMax for primary traffic and the paid Gemini API for second opinions.
+- Can route AI jobs across MiniMax, Gemini, GitHub Copilot CLI, and Cursor; production currently uses MiniMax only and does not call a paid second-opinion API.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
@@ -187,7 +187,6 @@ export GITHUB_APP_ID="..."
 export GITHUB_PRIVATE_KEY_FILE="/path/to/seorilabs-seori-pr-bot.private-key.pem"
 export GITHUB_WEBHOOK_SECRET="..."
 export MINIMAX_API_KEY="..."
-export GEMINI_API_KEY="..."
 
 ./scripts/create-k8s-secret.sh
 ./scripts/create-gemini-cli-oauth-secret.sh
@@ -209,21 +208,19 @@ The production routing is:
 AI_REVIEW_PROVIDERS=minimax
 AI_REVIEW_PROVIDER_WEIGHTS=minimax:100
 AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax
-AI_REVIEW_TIEBREAKER_ENABLED=true
-AI_REVIEW_TIEBREAKER_PROVIDER=gemini
+AI_REVIEW_TIEBREAKER_ENABLED=false
+AI_REVIEW_TIEBREAKER_PROVIDER=copilot
 MINIMAX_MODEL=MiniMax-M3
 MINIMAX_API_BASE_URL=https://api.minimax.io/v1
-GEMINI_PROVIDER=api
-GEMINI_MODEL=gemini-3-flash-preview
 COPILOT_MODEL=auto
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
 PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
-The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMAX_API_BASE_URL}/chat/completions` and disables M3 thinking so the response contains only the review text. The paid Gemini API is reserved for one automatic second opinion when the primary gate is uncertain or blocking; it does not receive normal production traffic. Copilot CLI, Gemini CLI, and Cursor remain optional integrations, but are not part of the production route.
+The bot talks to the MiniMax OpenAI-compatible Chat Completions API at `${MINIMAX_API_BASE_URL}/chat/completions` and disables M3 thinking so the response contains only the review text. Second-opinion support remains implemented, but production keeps it disabled until a no-additional-cost provider is available. Copilot CLI, Gemini, and Cursor are not part of the production route.
 
-Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions use the configured provider router. The structured gate additionally uses the direct second-opinion provider when required.
+Explicit review jobs, automatic PR reviews, PR Q&A, and agent approval decisions use the configured provider router. When second opinion is disabled, every primary non-PASS result becomes a nonblocking neutral decision unless a future no-cost provider is explicitly enabled.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
 When `AUTO_SQUASH_MERGE_ENABLED=true`, eligible non-gate approvals are followed by a GitHub Squash Merge attempt only for PRs targeting `main`; conservative gate approvals deliberately stop before merge. There is no repo allowlist and no branch allowlist beyond exact `main`.

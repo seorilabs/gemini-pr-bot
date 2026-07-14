@@ -87,7 +87,7 @@ spec:
             - name: MYSQL_DATABASE
               value: base
             - name: GEMINI_PROVIDER
-              value: api
+              value: cli
             - name: GEMINI_MODEL
               value: gemini-3-flash-preview
             - name: GEMINI_CLI_COMMAND
@@ -107,9 +107,9 @@ spec:
             - name: AI_REVIEW_PROVIDER_COOLDOWN_MS
               value: "300000"
             - name: AI_REVIEW_TIEBREAKER_ENABLED
-              value: "true"
+              value: "false"
             - name: AI_REVIEW_TIEBREAKER_PROVIDER
-              value: gemini
+              value: copilot
             - name: COPILOT_CLI_COMMAND
               value: /app/node_modules/.bin/copilot
             - name: COPILOT_CLI_TIMEOUT_MS
@@ -205,11 +205,6 @@ spec:
                 secretKeyRef:
                   name: seori-pr-bot-secrets
                   key: GITHUB_WEBHOOK_SECRET
-            - name: GEMINI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: seori-pr-bot-provider-secrets
-                  key: GEMINI_API_KEY
             - name: COPILOT_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
