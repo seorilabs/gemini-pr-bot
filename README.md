@@ -34,7 +34,7 @@ flowchart LR
 - Creates a `Seori Review` check run for review and agent jobs.
 - Marks `Seori Review` as `success` after a gate pass or explicit current-HEAD approval. Confirmed blockers complete as `action_required`; unresolved model uncertainty completes as nonblocking `neutral`.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
-- Can route AI jobs across MiniMax, Gemini, GitHub Copilot CLI, and Cursor; production currently uses MiniMax only and does not call a paid second-opinion API.
+- Can route AI jobs across MiniMax, Gemini, and Cursor; production currently uses MiniMax only and does not call a paid second-opinion API. GitHub Copilot is not a bot review provider — use GitHub's native Copilot review separately.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
@@ -210,16 +210,15 @@ AI_REVIEW_PROVIDERS=minimax
 AI_REVIEW_PROVIDER_WEIGHTS=minimax:100
 AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax
 AI_REVIEW_TIEBREAKER_ENABLED=false
-AI_REVIEW_TIEBREAKER_PROVIDER=copilot
+AI_REVIEW_TIEBREAKER_PROVIDER=gemini
 MINIMAX_MODEL=MiniMax-M3
 MINIMAX_API_BASE_URL=https://api.minimax.io/v1
-COPILOT_MODEL=auto
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
 PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
-The conservative gate uses MiniMax-M3's Anthropic-compatible Messages API at `https://api.minimax.io/anthropic/v1/messages`. It runs adaptive thinking in two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. No paid Gemini API call participates in the production review route. Copilot CLI, Gemini, and Cursor are not part of the production route.
+The conservative gate uses MiniMax-M3's Anthropic-compatible Messages API at `https://api.minimax.io/anthropic/v1/messages`. It runs adaptive thinking in two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. No paid Gemini API call participates in the production review route. Gemini and Cursor are not part of the production route. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
 
 Structured PR reviews use the bounded MiniMax candidate/verifier gate above. PR Q&A and agent commands still use the configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable; incomplete or ambiguous evidence becomes a nonblocking neutral decision without posting a task back to the author. Neutral output still itemizes grounded `PASS` criteria with their current-HEAD test locations and names each unresolved criterion or validation scope with a host-owned reason.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
@@ -239,7 +238,7 @@ APPROVAL_TELEGRAM_BOT=seori_review_bot
 APPROVAL_TELEGRAM_CHANNEL=syous
 ```
 
-Quota summaries and Grafana provider health are based on provider error text, credential presence, routing config, and cooldown state. The Gemini/Copilot/Cursor CLI paths do not expose exact remaining quota, so the bot reports detected quota-like failures, provider routing, weights, fallback order, and cooldown release time instead of exact remaining credits.
+Quota summaries and Grafana provider health are based on provider error text, credential presence, routing config, and cooldown state. The Gemini/Cursor CLI paths do not expose exact remaining quota, so the bot reports detected quota-like failures, provider routing, weights, fallback order, and cooldown release time instead of exact remaining credits.
 
 Optional stale review closing:
 

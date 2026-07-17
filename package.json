@@ -15,7 +15,6 @@
     "node": ">=24"
   },
   "dependencies": {
-    "@github/copilot": "1.0.61",
     "@google/gemini-cli": "0.46.0",
     "@google/genai": "2.8.0",
     "@nats-io/transport-node": "^3.4.0",

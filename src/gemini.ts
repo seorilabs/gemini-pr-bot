@@ -560,9 +560,6 @@ export class GeminiClient {
     if (provider === "gemini") {
       return this.config.geminiModel || "gemini-2.5-flash";
     }
-    if (provider === "copilot") {
-      return this.config.copilotModel || "auto";
-    }
     return this.config.cursorModel || "default";
   }
 
@@ -580,10 +577,6 @@ export class GeminiClient {
       return Boolean(home) &&
         existsSync(`${home}/.gemini/oauth_creds.json`) &&
         existsSync(`${home}/.gemini/google_accounts.json`);
-    }
-
-    if (provider === "copilot") {
-      return Boolean(process.env.COPILOT_GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_TOKEN);
     }
 
     return Boolean(process.env.CURSOR_API_KEY);
@@ -620,10 +613,6 @@ export class GeminiClient {
 
     if (provider === "gemini") {
       return this.runGemini(kind, prompt, options);
-    }
-
-    if (provider === "copilot") {
-      return this.runCopilotCli(prompt);
     }
 
     return this.runCursorCli(prompt);
@@ -861,42 +850,6 @@ export class GeminiClient {
           throw new Error(`Gemini CLI returned non-JSON output: ${stdout || stderr}`);
         }
       },
-    });
-  }
-
-  private runCopilotCli(prompt: string): Promise<string> {
-    if (!process.env.COPILOT_GITHUB_TOKEN && !process.env.GH_TOKEN && !process.env.GITHUB_TOKEN) {
-      throw new Error("Copilot CLI token is not configured");
-    }
-
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      CI: "true",
-      COPILOT_AUTO_UPDATE: "false",
-      NO_COLOR: "1",
-      TERM: process.env.TERM || "xterm-256color",
-    };
-
-    const args = [
-      "-s",
-      "--no-auto-update",
-      "--no-custom-instructions",
-      "--output-format",
-      "text",
-      "-p",
-      truncate(prompt, this.config.maxContextChars),
-    ];
-    if (this.config.copilotModel) {
-      args.splice(1, 0, "--model", this.config.copilotModel);
-    }
-
-    return this.runCommand({
-      label: "Copilot CLI",
-      command: this.config.copilotCliCommand,
-      args,
-      env,
-      timeoutMs: this.config.copilotCliTimeoutMs,
-      parseOutput: (stdout, stderr) => stdout.trim() || stderr.trim() || "응답을 생성하지 못했습니다.",
     });
   }
 

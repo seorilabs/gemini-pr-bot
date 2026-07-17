@@ -270,7 +270,6 @@ server.listen(config.port, () => {
       reviewProviders: config.aiReviewProviders,
       reviewProviderWeights: config.aiReviewProviderWeights,
       reviewProviderFallbackOrder: config.aiReviewProviderFallbackOrder,
-      copilotModel: config.copilotModel || "default",
       cursorModel: config.cursorModel || "default",
       workflowStore: config.workflowStore,
       allowPublicRepos: config.allowPublicRepos,
