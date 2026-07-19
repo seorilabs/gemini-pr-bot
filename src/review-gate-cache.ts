@@ -104,6 +104,12 @@ export function decodeReviewGateCache(
   ) {
     return null;
   }
+  if (
+    !cachedCoverageMatchesHost(raw.acceptance_coverage, expectedAcceptanceCriteria) ||
+    !cachedCandidateCriteriaMatchHost(raw.candidates, expectedAcceptanceCriteria)
+  ) {
+    return null;
+  }
 
   const review = parseMiniMaxReviewPayload(
     {
@@ -135,6 +141,40 @@ export function decodeReviewGateCache(
     candidates: review.value.candidates,
     verifications: verification.value.verifications,
   };
+}
+
+function cachedCoverageMatchesHost(
+  coverage: readonly unknown[],
+  expectedAcceptanceCriteria: readonly string[],
+): boolean {
+  return (
+    coverage.length === expectedAcceptanceCriteria.length &&
+    coverage.every((entry, index) =>
+      isRecord(entry) &&
+      entry.criterion_id === `AC-${index + 1}` &&
+      entry.acceptance_criterion === expectedAcceptanceCriteria[index]
+    )
+  );
+}
+
+function cachedCandidateCriteriaMatchHost(
+  candidates: readonly unknown[],
+  expectedAcceptanceCriteria: readonly string[],
+): boolean {
+  return candidates.every((candidate) => {
+    if (!isRecord(candidate) || candidate.kind !== "missing_acceptance_test") {
+      return true;
+    }
+    if (typeof candidate.criterion_id !== "string") {
+      return false;
+    }
+    const match = /^AC-([1-9]\d*)$/u.exec(candidate.criterion_id);
+    if (!match) {
+      return false;
+    }
+    const criterionIndex = Number(match[1]) - 1;
+    return candidate.acceptance_criterion === expectedAcceptanceCriteria[criterionIndex];
+  });
 }
 
 function decodeJson(input: unknown): unknown {

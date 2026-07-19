@@ -127,7 +127,8 @@ export type MiniMaxReviewRequestOptions = {
 export type MiniMaxReviewParseOptions = {
   /**
    * Host-extracted acceptance criteria in source order. The model must return
-   * exactly one AC-1..N coverage row per source string, without paraphrasing.
+   * exactly one ordered AC-1..N coverage row per source string. Model-echoed
+   * criterion prose is untrusted and rebound to these host-owned strings.
    */
   expectedAcceptanceCriteria?: readonly string[];
 };
@@ -567,10 +568,18 @@ function validateCandidateResult(
         );
         continue;
       }
-      if (coverage.acceptanceCriterion !== candidate.acceptanceCriterion) {
+      if (
+        options.expectedAcceptanceCriteria === undefined &&
+        coverage.acceptanceCriterion !== candidate.acceptanceCriterion
+      ) {
         errors.push(
           `$.candidates[${index}].acceptance_criterion: must match acceptance_coverage`,
         );
+      } else if (options.expectedAcceptanceCriteria !== undefined) {
+        candidates[index] = {
+          ...candidate,
+          acceptanceCriterion: coverage.acceptanceCriterion,
+        };
       }
       if (coverage.status !== "missing") {
         errors.push(
@@ -634,16 +643,18 @@ function validateAcceptanceCoverage(
     if (criterionId && (!CRITERION_ID_PATTERN.test(criterionId) || criterionId !== expectedId)) {
       errors.push(`${entryPath}.criterion_id: expected ${JSON.stringify(expectedId)}`);
     }
-    const acceptanceCriterion = readString(
+    const echoedAcceptanceCriterion = readString(
       entry.acceptance_criterion,
       `${entryPath}.acceptance_criterion`,
       errors,
       2_000,
     );
     const expectedSource = expectedAcceptanceCriteria?.[index];
-    if (acceptanceCriterion && expectedSource !== undefined && acceptanceCriterion !== expectedSource) {
-      errors.push(`${entryPath}.acceptance_criterion: must exactly match the host source`);
-    }
+    // The model only classifies the ordered AC ID. Never trust duplicated
+    // prose from the wire: when host criteria exist, bind the result back to
+    // the exact host source instead of paying for a repair over harmless echo
+    // differences (quotes, whitespace, or paraphrasing).
+    const acceptanceCriterion = expectedSource ?? echoedAcceptanceCriterion;
     const status = readEnum(entry.status, COVERAGE_STATUS_SET, `${entryPath}.status`, errors);
     const testEvidence = readAcceptanceTestEvidence(
       entry.test_evidence,

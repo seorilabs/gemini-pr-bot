@@ -116,6 +116,10 @@ flowchart TD
   Agent -->|New commit or stale approval| Review
 ```
 
+`acceptance_coverage`의 개수와 `AC-1..N` 순서는 host가 엄격히 검증합니다. 모델이
+반복 출력한 인수조건 문장은 신뢰하지 않고 같은 ID의 host 원문으로 다시 결합하므로,
+따옴표·공백·의역 차이만으로 재호출하거나 승인을 보류하지 않습니다.
+
 Normal mentions use agent mode. The bot asks the configured AI provider chain to choose one action:
 
 ```mermaid

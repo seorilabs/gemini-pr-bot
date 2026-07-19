@@ -292,7 +292,7 @@ test("empty host acceptance criteria require empty coverage", () => {
   }
 });
 
-test("coverage rejects omitted, reordered, renumbered, or paraphrased host criteria", () => {
+test("coverage rejects omitted or renumbered rows and host-binds echoed prose", () => {
   const expected = [
     "저장 후 다시 열어도 값이 유지된다.",
     "로그아웃하면 세션이 폐기된다.",
@@ -307,16 +307,19 @@ test("coverage rejects omitted, reordered, renumbered, or paraphrased host crite
     assert.ok(omitted.errors.some((error) => error.includes("one result per host")));
   }
 
-  const wrongOrder = parseMiniMaxReviewPayload(
+  const untrustedEcho = parseMiniMaxReviewPayload(
     reviewPayload([], [
       acceptanceCoverage("covered", "AC-1", expected[1]),
       acceptanceCoverage("covered", "AC-2", expected[0]),
     ]),
     { expectedAcceptanceCriteria: expected },
   );
-  assert.equal(wrongOrder.ok, false);
-  if (!wrongOrder.ok) {
-    assert.ok(wrongOrder.errors.filter((error) => error.includes("exactly match")).length >= 2);
+  assert.equal(untrustedEcho.ok, true);
+  if (untrustedEcho.ok) {
+    assert.deepEqual(
+      untrustedEcho.value.acceptanceCoverage.map((entry) => entry.acceptanceCriterion),
+      expected,
+    );
   }
 
   const wrongId = parseMiniMaxReviewPayload(
@@ -338,10 +341,26 @@ test("coverage rejects omitted, reordered, renumbered, or paraphrased host crite
     ]),
     { expectedAcceptanceCriteria: expected },
   );
-  assert.equal(paraphrased.ok, false);
-  if (!paraphrased.ok) {
-    assert.ok(paraphrased.errors.some((error) => error.includes("exactly match")));
+  assert.equal(paraphrased.ok, true);
+  if (paraphrased.ok) {
+    assert.equal(paraphrased.value.acceptanceCoverage[0]?.acceptanceCriterion, expected[0]);
   }
+});
+
+test("host criteria rebind both coverage and missing-test candidate prose", () => {
+  const expected = ["저장 후 다시 열어도 값이 유지된다."];
+  const coverage = acceptanceCoverage("missing", "AC-1", "모델이 바꿔 쓴 문장");
+  const candidate = missingTestCandidate();
+  candidate.acceptance_criterion = "무시해야 하는 또 다른 문장";
+
+  const parsed = parseMiniMaxReviewPayload(reviewPayload([candidate], [coverage]), {
+    expectedAcceptanceCriteria: expected,
+  });
+
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.acceptanceCoverage[0]?.acceptanceCriterion, expected[0]);
+  assert.equal(parsed.value.candidates[0]?.acceptanceCriterion, expected[0]);
 });
 
 test("covered requires exact test evidence while missing and unknown require null", () => {

@@ -122,6 +122,14 @@ test("cache acceptance coverage is revalidated against the current host criteria
 
   assert.equal(decodeReviewGateCache(encoded, ["다른 인수조건"]), null);
   assert.equal(decodeReviewGateCache(encoded, []), null);
+
+  const corruptedCandidate = structuredClone(encoded);
+  (corruptedCandidate.candidates as Array<Record<string, unknown>>)[0]!.acceptance_criterion =
+    "다른 인수조건";
+  assert.equal(
+    decodeReviewGateCache(corruptedCandidate, [ACCEPTANCE_CRITERION]),
+    null,
+  );
 });
 
 test("malformed candidates and verifications are rejected on cache hits", () => {
