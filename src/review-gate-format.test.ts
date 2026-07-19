@@ -145,7 +145,7 @@ test("통과 결과는 확인한 인수조건과 현재 HEAD 테스트 근거를
   assert.match(output.text, /`재실행 후 기존 세션을 복원한다`/);
 });
 
-test("자동 판정 보류는 모델 사유나 작성자 행동 요구 없이 병합 비차단을 알린다", () => {
+test("자동 판정 보류는 approval 부재와 사람 handoff를 명확히 알린다", () => {
   const output = formatReviewGateCheckOutput({
     headSha: "abc1234",
     verdict: "ABSTAIN",
@@ -166,8 +166,8 @@ test("자동 판정 보류는 모델 사유나 작성자 행동 요구 없이 �
   });
 
   assert.equal(output.conclusion, "neutral");
-  assert.equal(output.title, "자동 판정 보류 · 병합 비차단");
-  assert.match(output.summary, /병합을 차단하지 않습니다/);
+  assert.equal(output.title, "자동 판정 보류 · 승인 없음");
+  assert.match(output.summary, /approval을 제출하지 않습니다/);
   assert.match(output.text, /### 확인 완료 \(PASS\)/);
   assert.match(output.text, /치명 결함 검사/);
   assert.match(output.text, /AC-1/);
@@ -175,7 +175,8 @@ test("자동 판정 보류는 모델 사유나 작성자 행동 요구 없이 �
   assert.match(output.text, /### 판정 보류 항목/);
   assert.match(output.text, /AC-2/);
   assert.match(output.text, /커버리지를 확정하지 못했습니다/);
-  assert.match(output.text, /추가 확인이나 수정을 요구하지 않습니다/);
+  assert.match(output.text, /current-HEAD 사람 검토·승인/);
+  assert.doesNotMatch(output.text, /병합 비차단|병합을 차단하지 않습니다|no-action-required/);
   assert.doesNotMatch(output.text, /\bABSTAIN\b|해주세요|추가하세요|확인하세요|수정하세요/);
 });
 

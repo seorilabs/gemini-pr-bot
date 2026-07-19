@@ -45,7 +45,7 @@ const PRODUCT_SOURCE_EXTENSIONS = new Set([
 const TEST_BASENAME_PATTERN =
   /(?:^|[._-])(?:test|spec|probe|smoke|check|validate|verify|acceptance|regression|assert|gate)(?:[._-]|$)|(?:tests?|specs?)\.[^.]+$/iu;
 const ASSERTION_PATTERN =
-  /(?:\b(?:assert\w*|xctassert\w*)\s*(?:[.(]|!\s*\()|\bassert\s+\S|\bexpect\s*\([^)]*\)\s*(?:\.|\bto\b)|\b(?:should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\s*(?:[.(]|!\s*\()|\.to(?:be|equal|match|throw|contain|have)\w*\s*\()/iu;
+  /(?:(?:\b|_)(?:assert\w*|xctassert\w*)\s*(?:[.(]|!\s*\()|\bassert\s+\S|\bexpect\s*\([^)]*\)\s*(?:\.|\bto\b)|(?:\b|_)(?:should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\s*(?:[.(]|!\s*\()|\.to(?:be|equal|match|throw|contain|have)\w*\s*\()/iu;
 const GENERIC_TEST_NAMES = new Set([
   "check",
   "describe",
@@ -96,25 +96,40 @@ export function isGroundedTestEvidence(
   }
 
   const lines = stripCommentsFromLines(rawContent.split(/\r?\n/u));
+  const godotExecutableHarness = isGodotExecutableHarness(evidence.file, lines);
+  const supportingContext = supportingTestContext(evidence.file, lines);
   for (let index = 0; index < lines.length; index += 1) {
     if (
-      !isNamedTestDeclaration(evidence.file, lines, index, testName) ||
+      !isNamedTestDeclaration(evidence.file, lines, index, testName, godotExecutableHarness) ||
       isSkippedTestDeclaration(evidence.file, lines, index)
     ) {
       continue;
     }
     let end = Math.min(lines.length, index + 400);
     for (let candidate = index + 1; candidate < end; candidate += 1) {
-      if (isTestBoundary(evidence.file, lines, candidate)) {
+      if (isTestBoundary(evidence.file, lines, candidate, godotExecutableHarness)) {
         end = candidate;
         break;
       }
     }
     const blockLines = lines.slice(index, end);
     const block = normalizedEvidence(blockLines.join("\n"));
+    const directCallContext = godotDirectCallContext(
+      evidence.file,
+      evidence.assertionQuote,
+      blockLines,
+      supportingContext,
+      context.currentHeadFileContents,
+    );
     if (
       hasExecutableAssertionLine(blockLines, assertion) &&
-      criterionAnchorsMatch(criterion.sourceQuote, evidence, block)
+      criterionAnchorsMatch(
+        criterion.sourceQuote,
+        evidence,
+        block,
+        supportingContext,
+        directCallContext,
+      )
     ) {
       return true;
     }
@@ -251,24 +266,35 @@ function isNamedTestDeclaration(
   lines: string[],
   index: number,
   testName: string,
+  godotExecutableHarness: boolean,
 ): boolean {
   const line = lines[index] || "";
   const normalizedLine = normalizedEvidence(line);
   if (!normalizedLine.includes(testName)) {
     return false;
   }
-  return isRegisteredTestDeclaration(file, lines, index);
+  return isRegisteredTestDeclaration(file, lines, index, godotExecutableHarness);
 }
 
-function isTestBoundary(file: string, lines: string[], index: number): boolean {
+function isTestBoundary(
+  file: string,
+  lines: string[],
+  index: number,
+  godotExecutableHarness: boolean,
+): boolean {
   const line = lines[index] || "";
   return (
     /^\s*(?:@Test\b|\[(?:Test|TestCase|Fact|Theory)\b|#\[test\])/u.test(line) ||
-    isRegisteredTestDeclaration(file, lines, index)
+    isRegisteredTestDeclaration(file, lines, index, godotExecutableHarness)
   );
 }
 
-function isRegisteredTestDeclaration(file: string, lines: string[], index: number): boolean {
+function isRegisteredTestDeclaration(
+  file: string,
+  lines: string[],
+  index: number,
+  godotExecutableHarness = false,
+): boolean {
   const line = lines[index] || "";
   const extension = file.toLowerCase().match(/\.[^.\/]+$/u)?.[0] || "";
   const annotations = lines.slice(Math.max(0, index - 4), index).join("\n");
@@ -293,10 +319,119 @@ function isRegisteredTestDeclaration(file: string, lines: string[], index: numbe
   if (extension === ".go") {
     return /^\s*func\s+Test\w*\s*\(/u.test(line);
   }
-  if ([".rb", ".gd", ".php"].includes(extension)) {
+  if (extension === ".gd") {
+    return (
+      /^\s*func\s+test[_A-Z]\w*\s*\(/iu.test(line) ||
+      (godotExecutableHarness && /^\s*func\s+_run\s*\(/u.test(line))
+    );
+  }
+  if ([".rb", ".php"].includes(extension)) {
     return /^\s*(?:(?:async\s+)?(?:def|func|function)\s+test[_A-Z]\w*|(?:test|it)\s*[('"`])/iu.test(line);
   }
   return false;
+}
+
+function isGodotExecutableHarness(file: string, lines: string[]): boolean {
+  const lower = file.toLowerCase();
+  const basename = lower.split("/").at(-1) || "";
+  if (!lower.endsWith(".gd") || !TEST_BASENAME_PATTERN.test(basename)) {
+    return false;
+  }
+  if (!lines.some((line) => /^\s*extends\s+SceneTree\b/u.test(line))) {
+    return false;
+  }
+  if (!godotLifecycleCallsRunner(lines)) {
+    return false;
+  }
+  return lines.some((line) =>
+    /\b(?:quit|get_tree\(\)\.quit)\s*\(\s*[1-9]\d*\s*\)|\bOS\.exit_code\s*=\s*[1-9]\d*/u.test(line),
+  );
+}
+
+function godotLifecycleCallsRunner(lines: string[]): boolean {
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/^\s*func\s+_(?:initialize|ready)\s*\(/u.test(lines[index] || "")) {
+      continue;
+    }
+    for (let candidate = index + 1; candidate < lines.length; candidate += 1) {
+      const line = lines[candidate] || "";
+      if (/^\s*func\s+\w+\s*\(/u.test(line)) {
+        break;
+      }
+      if (/\b_run\s*\(/u.test(line)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function supportingTestContext(file: string, lines: string[]): string {
+  if (!file.toLowerCase().endsWith(".gd")) {
+    return "";
+  }
+  return lines
+    .filter((line) =>
+      /^\s*(?:const|var)\s+\w+\s*(?::=|=)\s*(?:preload|load)\s*\(/u.test(line),
+    )
+    .join("\n");
+}
+
+function godotDirectCallContext(
+  file: string,
+  assertion: string,
+  testBlockLines: string[],
+  supportingContext: string,
+  currentHeadFileContents: Readonly<Record<string, string>>,
+): string {
+  if (!file.toLowerCase().endsWith(".gd")) {
+    return "";
+  }
+  const aliases = new Map<string, string>();
+  for (const match of supportingContext.matchAll(
+    /(?:^|\n)\s*(?:const|var)\s+([A-Za-z_]\w*)\s*(?::=|=)\s*(?:preload|load)\s*\(\s*["']res:\/\/([^"']+)["']\s*\)/gu,
+  )) {
+    aliases.set(match[1]!, match[2]!);
+  }
+
+  const blocks: string[] = [];
+  const seen = new Set<string>();
+  const normalizedAssertion = normalizedEvidence(assertion);
+  const assertionIndex = testBlockLines.findIndex((line) =>
+    normalizedEvidence(line).includes(normalizedAssertion),
+  );
+  const callWindow = assertionIndex < 0
+    ? assertion
+    : testBlockLines.slice(Math.max(0, assertionIndex - 8), assertionIndex + 1).join("\n");
+  for (const match of callWindow.matchAll(/\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(/gu)) {
+    const sourcePath = aliases.get(match[1]!);
+    const functionName = match[2]!;
+    const key = `${sourcePath || ""}:${functionName}`;
+    if (!sourcePath || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const source = currentHeadFileContents[sourcePath];
+    if (!source) {
+      continue;
+    }
+    const lines = stripCommentsFromLines(source.split(/\r?\n/u));
+    const start = lines.findIndex((line) =>
+      line.match(/^\s*(?:static\s+)?func\s+([A-Za-z_]\w*)\s*\(/u)?.[1] === functionName,
+    );
+    if (start < 0) {
+      continue;
+    }
+    let end = lines.length;
+    for (let index = start + 1; index < lines.length; index += 1) {
+      if (/^\s*(?:static\s+)?func\s+[A-Za-z_]\w*\s*\(/u.test(lines[index] || "")) {
+        end = index;
+        break;
+      }
+    }
+    blocks.push(lines.slice(start, end).join("\n"));
+  }
+  return blocks.join("\n");
 }
 
 function isSkippedTestDeclaration(file: string, lines: string[], index: number): boolean {
@@ -311,7 +446,9 @@ function isSkippedTestDeclaration(file: string, lines: string[], index: number):
 }
 
 function hasExecutableAssertionLine(lines: string[], assertion: string): boolean {
-  const lead = assertion.match(/\b(?:assert\w*|xctassert\w*|expect|should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\b/iu)?.[0];
+  const lead = assertion.match(
+    /(?:\b|_)(assert\w*|xctassert\w*|expect|should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\b/iu,
+  )?.[1];
   if (!lead) {
     return false;
   }
@@ -458,6 +595,9 @@ function isVacuousAssertion(assertion: string): boolean {
   if (/\b(?:assert(?:\.ok)?|asserttrue|xctasserttrue)\s*\(\s*true\s*\)$/iu.test(compact)) {
     return true;
   }
+  if (/(?:^|\b|_)check\w*\s*\(\s*true\s*(?:,|\))/iu.test(compact)) {
+    return true;
+  }
   const equality = compact.match(
     /\b(?:assert(?:\.\w+)?|xctassert\w*|assert\.equal)\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)$/iu,
   );
@@ -480,15 +620,18 @@ function criterionAnchorsMatch(
   sourceQuote: string,
   evidence: ReviewGateTestEvidence,
   testBlock: string,
+  supportingContext: string,
+  directCallContext: string,
 ): boolean {
   const evidenceText = normalizedEvidence(
-    `${evidence.file} ${evidence.testName} ${evidence.assertionQuote} ${testBlock}`,
+    `${evidence.file} ${evidence.testName} ${evidence.assertionQuote} ${testBlock} ${supportingContext} ${directCallContext}`,
   ).toLowerCase();
   const explicitIdentifiers = [...sourceQuote.matchAll(/`([^`]{2,80})`/gu)]
-    .map((match) => normalizedEvidence(match[1] || "").toLowerCase())
+    .map((match) => canonicalExplicitIdentifier(match[1] || ""))
     .filter(Boolean);
   if (explicitIdentifiers.length > 0) {
-    return explicitIdentifiers.every((token) => evidenceText.includes(token));
+    const canonicalEvidence = canonicalExplicitIdentifier(evidenceText);
+    return explicitIdentifiers.every((token) => canonicalEvidence.includes(token));
   }
 
   const sourceKorean = koreanTokens(sourceQuote);
@@ -511,6 +654,10 @@ function criterionAnchorsMatch(
     return matchedAnchors.length === 1 && sourceAnchors[0]!.token.length >= 4;
   }
   return matchedAnchors.length >= Math.max(2, Math.floor(sourceAnchors.length / 2) + 1);
+}
+
+function canonicalExplicitIdentifier(value: string): string {
+  return normalizedEvidence(value).toLowerCase().replace(/[\s'"`]+/gu, "");
 }
 
 function koreanTokens(value: string): Set<string> {

@@ -12,7 +12,7 @@ export type ReviewAcceptanceCoverageEvaluation = {
 };
 
 const MANUAL_ACCEPTANCE_CRITERION_PATTERN =
-  /수동|직접\s*확인|육안|실(?:제\s*)?기기|manual|visual|real\s+device/iu;
+  /수동|시각\s*(?:검증|확인)|직접\s*확인|육안|실(?:제\s*)?기기|manual|visual|real\s+device/iu;
 
 /**
  * Evaluates MiniMax's acceptance-test coverage only against host-owned inputs.
