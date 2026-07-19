@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildLargeFileDigest,
+  buildPullRequestContext,
   countExplicitAcceptanceCriteria,
+  isDeepContextFileFullyVisible,
   isFatalContextComplete,
   listExplicitAcceptanceCriteria,
+  prioritizeChangedFilesForContext,
 } from "./github.js";
+import type { Config } from "./config.js";
 
 test("only acceptance-section checkboxes and explicit AC labels form a deterministic floor", () => {
   const body = [
@@ -90,7 +95,7 @@ test("English behavior headings accept bullets and numbered items but Testing do
   ]);
 });
 
-test("product fatal context is complete only when every current product file has full source and a usable patch", () => {
+test("product fatal context is complete only when every current product file has reviewable source evidence and a usable patch", () => {
   const files = [
     { filename: "src/save.ts", status: "modified" },
     { filename: "src/session.ts", status: "added" },
@@ -164,5 +169,191 @@ test("tests/docs-only context is complete while deletion-only or mismatched prod
       {},
     ),
     false,
+  );
+});
+
+test("deep context visibility ignores duplicate changed-file headings in earlier sections", () => {
+  const content = "export function save() { return true; }\n";
+  const markdown = [
+    "## Changed Files",
+    "### src/save.ts",
+    "```diff",
+    "@@ -1 +1 @@",
+    "-export function save() { return false; }",
+    "+export function save() { return true; }",
+    "```",
+    "",
+    "## Current Changed File Contents",
+    "### src/save.ts",
+    "status=modified",
+    "````typescript",
+    content.trimEnd(),
+    "````",
+    "",
+    "## Deep Repository Context",
+    "### src/save.ts",
+    "````typescript",
+    content.trimEnd(),
+    "````",
+  ].join("\n");
+
+  assert.equal(isDeepContextFileFullyVisible(markdown, "src/save.ts", content), true);
+  assert.equal(
+    isDeepContextFileFullyVisible(markdown.replace(/\n````$/u, ""), "src/save.ts", content),
+    false,
+  );
+});
+
+test("changed product files are prioritized ahead of tests and assets", () => {
+  const files = [
+    { filename: "tests/save.test.ts", status: "modified" },
+    { filename: "assets/save.png", status: "modified" },
+    { filename: "src/save.ts", status: "modified" },
+    { filename: "src/session.ts", status: "added" },
+  ];
+
+  assert.deepEqual(
+    prioritizeChangedFilesForContext(files).map((file) => file.filename),
+    ["src/save.ts", "src/session.ts", "tests/save.test.ts", "assets/save.png"],
+  );
+});
+
+test("large-file digest covers deletion-only hunks before spending budget on the outline", () => {
+  const content = Array.from({ length: 120 }, (_, index) =>
+    index === 47
+      ? "export function renderPlot() { return true; }"
+      : `const line${index + 1} = ${index + 1};`
+  ).join("\n");
+  const digest = buildLargeFileDigest(
+    content,
+    "@@ -48,2 +48 @@\n-export function oldSoil() {}\n export function renderPlot() { return true; }",
+  );
+
+  assert.ok(digest);
+  assert.equal(digest.changedRegionsComplete, true);
+  assert.match(digest.markdown, /^# changed-region windows/mu);
+  assert.match(digest.markdown, /L48: export function renderPlot/);
+});
+
+test("large-file digest remains incomplete when all changed-hunk windows do not fit", () => {
+  const content = Array.from({ length: 2_000 }, (_, index) =>
+    `const line${index + 1} = "${"x".repeat(160)}";`
+  ).join("\n");
+  const patch = Array.from(
+    { length: 20 },
+    (_, index) => `@@ -${index * 100 + 1},1 +${index * 100 + 1},1 @@\n-old\n+new`,
+  ).join("\n");
+  const digest = buildLargeFileDigest(content, patch);
+
+  assert.ok(digest);
+  assert.equal(digest.changedRegionsComplete, false);
+  assert.match(digest.markdown, /changed-region windows truncated/);
+});
+
+test("review context prioritizes a large changed product file and can complete fatal review without deep clone", async () => {
+  const headSha = "a".repeat(40);
+  const testContent = Array.from({ length: 2_000 }, (_, index) =>
+    `test("case ${index + 1}", () => expect(${index + 1}).toBe(${index + 1}));`
+  ).join("\n");
+  const productContent = Array.from({ length: 2_000 }, (_, index) =>
+    index === 99
+      ? "export function save() { return true; }"
+      : `const value${index + 1} = ${index + 1};`
+  ).join("\n");
+  const files = [
+    {
+      filename: "tests/large.test.ts",
+      status: "modified",
+      additions: 1,
+      deletions: 1,
+      patch: "@@ -100 +100 @@\n-test(\"old\", () => expect(false).toBe(true));\n+test(\"new\", () => expect(true).toBe(true));",
+    },
+    {
+      filename: "src/large.ts",
+      status: "modified",
+      additions: 1,
+      deletions: 1,
+      patch: "@@ -100 +100 @@\n-export function save() { return false; }\n+export function save() { return true; }",
+    },
+  ];
+  const contentByPath = new Map([
+    ["tests/large.test.ts", testContent],
+    ["src/large.ts", productContent],
+  ]);
+  const paged = (data: any[]) => async () => ({ data });
+  const octokit = {
+    paginate: async (method: (params: any) => Promise<{ data: any[] }>, params: any) =>
+      (await method(params)).data,
+    rest: {
+      checks: {
+        listForRef: async () => ({ data: { check_runs: [] } }),
+      },
+      issues: {
+        listComments: paged([]),
+      },
+      pulls: {
+        get: async () => ({
+          data: {
+            state: "open",
+            merged: false,
+            title: "large product change",
+            body: "",
+            draft: false,
+            mergeable: true,
+            mergeable_state: "clean",
+            user: { login: "author" },
+            head: { sha: headSha, ref: "feature", repo: { full_name: "seorilabs/example" } },
+            base: { ref: "main", repo: { full_name: "seorilabs/example" } },
+          },
+        }),
+        listFiles: paged(files),
+        listCommits: paged([]),
+        listReviewComments: paged([]),
+        listReviews: paged([]),
+      },
+      repos: {
+        getContent: async ({ path: file }: { path: string }) => {
+          const content = contentByPath.get(file);
+          assert.ok(content);
+          return {
+            data: {
+              type: "file",
+              size: Buffer.byteLength(content),
+              content: Buffer.from(content).toString("base64"),
+            },
+          };
+        },
+        listCommitStatusesForRef: async () => ({ data: [] }),
+      },
+    },
+  };
+  const config = {
+    allowPublicRepos: false,
+    deepRepoContextMode: "off",
+    deepRepoContextTimeoutMs: 10_000,
+    deepRepoContextMaxFiles: 40,
+    deepRepoContextMaxBytes: 80_000,
+    maxPatchChars: 120_000,
+    maxContextChars: 160_000,
+    trustedAssociations: new Set(["OWNER", "MEMBER", "COLLABORATOR"]),
+  } as Config;
+
+  const context = await buildPullRequestContext(
+    octokit,
+    { owner: "seorilabs", repo: "example", fullName: "seorilabs/example", isPrivate: true },
+    1,
+    config,
+  );
+  const changedContents = context.reviewGateMarkdown.slice(
+    context.reviewGateMarkdown.indexOf("## Current Changed File Contents"),
+    context.reviewGateMarkdown.indexOf("## Deep Repository Context"),
+  );
+
+  assert.equal(context.fatalContextComplete, true);
+  assert.ok(context.currentHeadFileContents["src/large.ts"]);
+  assert.ok(context.visibleChangedPatches["src/large.ts"]);
+  assert.ok(
+    changedContents.indexOf("### src/large.ts") <
+      changedContents.indexOf("### tests/large.test.ts"),
   );
 });
