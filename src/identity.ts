@@ -6,6 +6,7 @@ export type BotStatusMarker =
   | "action-required"
   | "merge-conflict"
   | "no-action-required"
+  | "review-deferred"
   | "stale-closed";
 
 export function botStatusMarker(status: BotStatusMarker): string {

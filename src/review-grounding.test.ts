@@ -91,6 +91,113 @@ test("test evidence supports XCTest and .NET test naming conventions", () => {
   );
 });
 
+test("Godot SceneTree probe의 _run과 _check는 실패 exit가 있을 때만 실행 테스트 근거다", () => {
+  const file = "tools/core_probe.gd";
+  const geneticsFile = "packages/product-core/src/domain/genetics.gd";
+  const source = [
+    "extends SceneTree",
+    'const Genetics := preload("res://packages/product-core/src/domain/genetics.gd")',
+    'const Collections := preload("res://packages/product-core/src/domain/collections.gd")',
+    "var _failures: Array = []",
+    "func _initialize() -> void:",
+    "\t_run()",
+    "func _check(cond: bool, msg: String) -> void:",
+    "\tif not cond:",
+    "\t\t_failures.append(msg)",
+    "func _run() -> void:",
+    '\t_check(Genetics.morph_phenotype(["hypo", "hypo"]) == "super_hypo" and Genetics.morph_phenotype(["hypo", "normal"]) == "hypo", "super hypo homo vs het")',
+    '\t_check(Collections.morph_total() == 9, "collection morph total")',
+    "\tGenetics.normalize_lizard_morph(super_legacy)",
+    '\t_check(super_legacy.genotype == ["snow", "snow"], "legacy normalize")',
+    "\tif not _failures.is_empty():",
+    "\t\tquit(1)",
+    "\tquit(0)",
+  ].join("\n");
+  const geneticsSource = [
+    "static func normalize_lizard_morph(visual: Dictionary) -> int:",
+    '\tvisual["genotype"] = normalize_genotype(visual.get("genotype", null), String(visual.get("morph_id", "normal")))',
+    "\treturn OK",
+    "static func unrelated_helper() -> void:",
+    "\thidden_unrelated_identifier()",
+  ].join("\n");
+  const reviewContext = context({ [file]: source, [geneticsFile]: geneticsSource });
+
+  assert.equal(
+    isGroundedTestEvidence(
+      reviewContext,
+      criterion('`morph_phenotype([hypo,hypo])` → `super_hypo`, `[hypo,normal]` → `hypo`'),
+      {
+        file,
+        testName: "_run",
+        assertionQuote: '_check(Genetics.morph_phenotype(["hypo", "hypo"]) == "super_hypo" and Genetics.morph_phenotype(["hypo", "normal"]) == "hypo", "super hypo homo vs het")',
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    isGroundedTestEvidence(
+      reviewContext,
+      criterion('`collections.gd`의 `morph_total`이 9를 반환한다.'),
+      {
+        file,
+        testName: "_run",
+        assertionQuote: '_check(Collections.morph_total() == 9, "collection morph total")',
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    isGroundedTestEvidence(
+      reviewContext,
+      criterion('`normalize_genotype`이 기존 세이브를 복원한다.'),
+      {
+        file,
+        testName: "_run",
+        assertionQuote: '_check(super_legacy.genotype == ["snow", "snow"], "legacy normalize")',
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    isGroundedTestEvidence(
+      reviewContext,
+      criterion('`hidden_unrelated_identifier`가 호출된다.'),
+      {
+        file,
+        testName: "_run",
+        assertionQuote: '_check(super_legacy.genotype == ["snow", "snow"], "legacy normalize")',
+      },
+    ),
+    false,
+  );
+
+  const noFailureExit = source.replace("\t\tquit(1)", "\t\tquit(0)");
+  assert.equal(
+    isGroundedTestEvidence(
+      context({ [file]: noFailureExit }),
+      criterion('`collections.gd`의 `morph_total`이 9를 반환한다.'),
+      {
+        file,
+        testName: "_run",
+        assertionQuote: '_check(Collections.morph_total() == 9, "collection morph total")',
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    isGroundedTestEvidence(
+      context({ "src/player.gd": source }),
+      criterion('`collections.gd`의 `morph_total`이 9를 반환한다.'),
+      {
+        file: "src/player.gd",
+        testName: "_run",
+        assertionQuote: '_check(Collections.morph_total() == 9, "collection morph total")',
+      },
+    ),
+    false,
+  );
+});
+
 test("generic declarations and cross-language semantic guesses cannot ground a criterion", () => {
   const file = "src/account.test.ts";
   const source = [
@@ -165,6 +272,23 @@ test("vacuous assertions and assertion-shaped strings are not test evidence", ()
       file: stringFile,
       testName: "저장 후 다시 열어도 값이 유지된다",
       assertionQuote: "assert.equal(loadValue(), savedValue);",
+    }),
+    false,
+  );
+  const godotFile = "tools/vacuous_probe.gd";
+  const godotSource = [
+    "extends SceneTree",
+    "func _initialize() -> void:",
+    "\t_run()",
+    "func _run() -> void:",
+    '\t_check(true, "always passes")',
+    "\tquit(1)",
+  ].join("\n");
+  assert.equal(
+    isGroundedTestEvidence(context({ [godotFile]: godotSource }), criterion("항상 참이다."), {
+      file: godotFile,
+      testName: "_run",
+      assertionQuote: '_check(true, "always passes")',
     }),
     false,
   );

@@ -20,12 +20,13 @@ flowchart LR
 - Maps only host-recognized checklist items or bullets under acceptance/requirements/definition-of-done/behavior headings (`동작`, `기대 동작` 포함) to visible current-HEAD test evidence; unchanged tests count when their test body and assertion are present in context. Validation-result sections such as `검증` are not acceptance criteria.
 - Explicit acceptance criteria are preserved across wrapped lines and must map one-to-one to distinct model criteria. Automated criteria need grounded test evidence; explicitly manual, visual, or real-device criteria are nonblocking notes.
 - Test evidence must come from a registered, active current-HEAD test with a real non-vacuous assertion. Commented code, skipped/disabled tests or suites, ordinary helper functions, comparison-only expressions, and assertion-shaped strings are rejected by the host.
+- Godot `probe`/`smoke` scripts count as executable tests only when a `SceneTree` lifecycle calls `_run()` and the harness has a non-zero failure exit. `_check(...)` evidence may resolve a backticked identifier through its `preload(...)` alias and one directly called GDScript function body; unrelated functions are excluded.
 - Reports at most two fatal blockers, limited to a deterministic common-path crash, permanent data loss/corruption, exploitable security/privacy exposure, or a certainly unusable primary flow. The added root line must itself directly perform the fatal outcome and end a 2-6-line ordered causal chain; normal false/null returns, UI flags, and deny-by-default security rules are rejected.
 - Uses Gemini structured output plus host-side strict schema and evidence validation. Gemini does not assign severity or decide approval itself.
-- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. A missing acceptance test blocks only after exhaustive current-HEAD inventory search; a fatal defect blocks only when Gemini's separate verifier confirms the same host-grounded added root. Uncertainty completes as nonblocking `neutral`, with separate `확인 완료 (PASS)` and `판정 보류 항목` sections that identify grounded test evidence and the exact unresolved scope without exposing raw model reasoning.
+- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. A missing acceptance test blocks only after exhaustive current-HEAD inventory search; a fatal defect blocks only when Gemini's separate verifier confirms the same host-grounded added root. Uncertainty completes as check-level `neutral` without a GitHub approval, with separate `확인 완료 (PASS)` and `판정 보류 항목` sections. It is not merge authorization: selected org-ruleset repositories still require a current-HEAD approval and autonomous agents hand off unresolved scope to a human.
 - Omits Medium/Low findings, style/refactor suggestions, speculative risks, and automatic follow-up issue creation from the merge-gate path.
 - Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
-- Runs explicit review on `@gemini-cli /review`; a gate pass submits approval, confirmed blockers request changes, and inconclusive results do not assign manual verification or block merge.
+- Runs explicit review on `@gemini-cli /review`; a gate pass submits approval, confirmed blockers request changes, and inconclusive results submit no approval and require human handoff without inventing a code change request.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]` and changes the latest `Seori Review` check for the same HEAD to `success` (or creates a successful check when none exists).
 - Allows trusted maintainers to bypass bot-side merge conflict and status-check approval blockers with `@gemini-cli /approve --skip-validation [reason]` or `@gemini-cli /force-approve [reason]`.
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
@@ -79,6 +80,12 @@ flowchart LR
 
 Other review agents should treat the latest non-stale approval marker as "no further agent action required". A new commit makes the marker stale when the repository's branch protection dismisses stale approvals.
 
+An inconclusive `ABSTAIN` never emits that approval marker. It emits a separate handoff marker and submits no GitHub approval:
+
+```html
+<!-- seorilabs-seori-pr-bot:status=review-deferred head=<head-sha> -->
+```
+
 `/approve --skip-validation` and `/force-approve` skip the bot-side merge conflict and status-check blockers and submit approval immediately for the current PR HEAD. The review body records that validation was skipped. Repository branch protection can still block the merge independently. Validation-skipped approvals never trigger automatic Squash Merge.
 
 ```mermaid
@@ -91,7 +98,7 @@ flowchart TD
   Verifier --> Host["Host: AC 원문·전체 테스트·현재 HEAD exact 근거 검증"]
   Host --> Ledger["finding 원장: open / resolved / refuted"]
   Ledger -->|"확정 치명 결함 또는 테스트 누락"| Output["한글 REQUEST_CHANGES + action_required"]
-  Ledger -->|"근거 불완전"| Neutral["PR 댓글 없이 neutral; 병합 비차단"]
+  Ledger -->|"근거 불완전"| Neutral["PR 댓글 없이 neutral; approval 없음; 사람 handoff"]
   Ledger -->|통과| GateApproval["GitHub APPROVE 후 check success; bot 자동 병합 없음"]
   Output --> Approve["Maintainer or trusted agent runs /approve"]
   Approve --> Validation{"Bot-side validation passes?"}
@@ -217,7 +224,7 @@ AUTO_SQUASH_MERGE_ENABLED=true
 
 The conservative gate uses the Gemini API with low thinking and JSON-schema-constrained output. It runs two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
 
-Structured PR reviews use the bounded Gemini candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable; incomplete or ambiguous evidence becomes a nonblocking neutral decision without posting a task back to the author. Neutral output still itemizes grounded `PASS` criteria with their current-HEAD test locations and names each unresolved criterion or validation scope with a host-owned reason.
+Structured PR reviews use the bounded Gemini candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable; incomplete or ambiguous evidence becomes a check-level neutral decision without posting a fabricated task back to the author. Neutral submits no approval, names each unresolved criterion or validation scope with a host-owned reason, and hands merge authorization to a current-HEAD human review.
 
 Changed-file context is product-code-first. Small changed product files are supplied in full; large files use the complete set of changed-hunk windows plus a bounded symbol outline. The host records full current-HEAD content separately for exact grounding and allows a fatal-defect PASS only when every changed product file has a visible usable patch and complete changed-region evidence. Related tests and repository context use the remaining prompt budget.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.

@@ -77,6 +77,7 @@ test("전체 테스트 인벤토리가 불완전하거나 파일 수가 유효�
 test("수동·육안·실기기 확인을 명시한 인수조건은 자동화 테스트 누락으로 차단하지 않는다", () => {
   for (const criterion of [
     "실제 기기에서 직접 확인한다.",
+    "시각 검증은 리뷰에 위임한다.",
     "Visual verification is required on a real device.",
   ]) {
     const result = evaluateMiniMaxReviewGateCandidates(input({

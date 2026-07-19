@@ -152,11 +152,11 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
 
   const summary = input.abstainSummaryKo
     ? requiredKoreanProse(input.abstainSummaryKo, "abstainSummaryKo")
-    : "현재 HEAD에서 차단할 만큼 확실한 근거가 없어 병합을 차단하지 않습니다.";
+    : "현재 HEAD를 자동 승인할 근거가 충분하지 않아 GitHub approval을 제출하지 않습니다.";
   const abstainItems = input.abstainItems || [];
   return {
     conclusion: "neutral",
-    title: "자동 판정 보류 · 병합 비차단",
+    title: "자동 판정 보류 · 승인 없음",
     summary,
     text: joinSections([
       markers,
@@ -164,7 +164,7 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
         "## Seori 보수적 병합 게이트",
         "",
         `HEAD: ${inlineCode(headSha)}`,
-        "판정: **자동 판정 보류 · 병합 비차단**",
+        "판정: **자동 판정 보류 · 승인 없음**",
         "",
         summary,
         "",
@@ -172,7 +172,7 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
         "",
         formatAbstainItems(abstainItems),
         "",
-        "_작성자에게 추가 확인이나 수정을 요구하지 않습니다._",
+        "_코드 수정을 자동 요구하지 않으며, 병합 여부는 current-HEAD 사람 검토·승인으로 결정합니다._",
       ].join("\n"),
     ]),
   };

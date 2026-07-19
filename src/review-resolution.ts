@@ -11,7 +11,7 @@ export function resolveReviewGateSecondOpinion(
     }
     return inconclusive(
       primary,
-      "2차 모델만 차단 근거를 제시했거나 판정을 확정하지 못해 병합을 차단하지 않습니다.",
+      "2차 모델만 차단 근거를 제시했거나 판정을 확정하지 못해 자동 approval을 제출하지 않습니다.",
     );
   }
 
@@ -37,7 +37,7 @@ export function resolveReviewGateSecondOpinion(
 
   return inconclusive(
     primary,
-    "1차와 2차 모델의 판정이 일치하지 않아 병합을 차단하지 않습니다.",
+    "1차와 2차 모델의 판정이 일치하지 않아 자동 approval을 제출하지 않습니다.",
   );
 }
 

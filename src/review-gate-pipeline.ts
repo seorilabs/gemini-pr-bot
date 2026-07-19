@@ -79,7 +79,7 @@ type CandidateValidationResult =
 const SIMPLE_IDENTIFIER_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 const SYMBOL_MAX_DISTANCE = 200;
 const MANUAL_ACCEPTANCE_CRITERION_PATTERN =
-  /수동|직접 확인|육안|실기기|실제 기기|manual|visual|real device/iu;
+  /수동|시각\s*(?:검증|확인)|직접 확인|육안|실기기|실제 기기|manual|visual|real device/iu;
 
 /**
  * Turns parsed MiniMax candidate/verifier results into host-grounded findings.

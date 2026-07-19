@@ -30,10 +30,10 @@ test("the same exhaustive missing-test result from both models remains blocking"
   assert.equal(result.decision.failureKind, "missing_tests");
 });
 
-test("model disagreement becomes a nonblocking internal abstention", () => {
+test("model disagreement becomes an approval-free internal abstention", () => {
   const result = resolveReviewGateSecondOpinion(missingTestsEvaluation(), passEvaluation());
   assert.equal(result.decision.verdict, "ABSTAIN");
-  assert.match(result.decision.reasons[0] || "", /병합을 차단하지 않습니다/u);
+  assert.match(result.decision.reasons[0] || "", /approval을 제출하지 않습니다/u);
 });
 
 test("host-confirmed missing tests remain blocking when second opinion is disabled", () => {
