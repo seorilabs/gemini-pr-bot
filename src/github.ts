@@ -14,7 +14,6 @@ const FAILING_CHECK_CONCLUSIONS = new Set(["action_required", "cancelled", "fail
 const MAX_CHANGED_FILE_CONTENT_CHARS = 20_000;
 const MAX_CHANGED_FILE_CONTENT_CONTEXT_CHARS = 50_000;
 const MAX_REVIEW_GATE_PATCH_CHARS = 60_000;
-const MAX_REVIEW_GATE_CHANGED_CONTENT_CHARS = 15_000;
 const BINARY_FILE_EXTENSIONS = new Set([
   ".7z",
   ".avif",
@@ -84,7 +83,7 @@ export type PullRequestContext = PullRequestStatus & {
   testInventoryFileCount: number;
   currentHeadFileContents: Readonly<Record<string, string>>;
   visibleChangedPatches: Readonly<Record<string, string>>;
-  /** True when every changed product path needed for fatal review is fully host-visible. */
+  /** True when every changed product path has a visible patch and complete review evidence. */
   fatalContextComplete: boolean;
   changeClass: ChangeClass;
   minimumAcceptanceCriteria: number;
@@ -95,6 +94,24 @@ export type PullRequestContextOptions = {
   installationToken?: string;
   deepContextRequested?: boolean;
   reviewGatePromptReserveChars?: number;
+};
+
+type ChangedFileContentEvidence = {
+  filename: string;
+  content: string | null;
+  section: string;
+  /** True when the model sees the full file or every changed-hunk window. */
+  contextComplete: boolean;
+};
+
+type ChangedFileContentResult = {
+  markdown: string;
+  evidence: ChangedFileContentEvidence[];
+};
+
+type LargeFileDigest = {
+  markdown: string;
+  changedRegionsComplete: boolean;
 };
 
 export type StatusCheckSummary = {
@@ -281,7 +298,8 @@ export async function buildPullRequestContext(
     patchChars += section.length;
   }
 
-  const changedFileContents = await buildChangedFileContents(octokit, repo, pr.head.sha, files);
+  const changedFileContentResult = await buildChangedFileContents(octokit, repo, pr.head.sha, files);
+  const changedFileContents = changedFileContentResult.markdown;
   const deepRepoContextResult = await buildDeepRepoContext({
     repo,
     prNumber,
@@ -332,10 +350,7 @@ export async function buildPullRequestContext(
     fileSections.join("\n\n") || "(none)",
     Math.min(config.maxPatchChars, MAX_REVIEW_GATE_PATCH_CHARS),
   );
-  const gateChangedFileContents = truncate(
-    changedFileContents || "(none)",
-    MAX_REVIEW_GATE_CHANGED_CONTENT_CHARS,
-  );
+  const gateChangedFileContents = changedFileContents || "(none)";
 
   const markdown = [
     "# Pull Request Context",
@@ -420,13 +435,13 @@ export async function buildPullRequestContext(
     "## Changed Files",
     gateChangedFilePatches,
     "",
+    "## Current Changed File Contents",
+    "Product files are prioritized. Large files contain every changed-hunk window plus a bounded symbol outline instead of the full body.",
+    gateChangedFileContents,
+    "",
     "## Deep Repository Context",
     "This is selected current-HEAD evidence, not necessarily the whole repository.",
     deepRepoContext || "(none)",
-    "",
-    "## Current Changed File Contents",
-    "These are supplementary post-change HEAD contents; this section may be partial.",
-    gateChangedFileContents,
   ].join("\n");
   const reviewGateContextBudget = Math.max(
     0,
@@ -435,11 +450,21 @@ export async function buildPullRequestContext(
   const truncatedReviewGateMarkdown = truncate(reviewGateMarkdown, reviewGateContextBudget);
   const deepContextFullyVisible =
     !deepRepoContext || truncatedReviewGateMarkdown.includes(deepRepoContext);
-  const visibleCurrentHeadFileContents = Object.fromEntries(
+  const visibleDeepContextFileContents = Object.fromEntries(
     Object.entries(deepRepoContextResult.fileContents).filter(([file, content]) =>
       isDeepContextFileFullyVisible(truncatedReviewGateMarkdown, file, content),
     ),
   );
+  const visibleChangedFileContents = Object.fromEntries(
+    changedFileContentResult.evidence
+      .filter(({ content, section, contextComplete }) =>
+        Boolean(content) && contextComplete && truncatedReviewGateMarkdown.includes(section))
+      .map(({ filename, content }) => [filename, content as string]),
+  );
+  const visibleCurrentHeadFileContents = {
+    ...visibleDeepContextFileContents,
+    ...visibleChangedFileContents,
+  };
   const visibleChangedPatches = Object.fromEntries(
     completeFilePatchSections
       .filter(({ section }) => truncatedReviewGateMarkdown.includes(section))
@@ -480,10 +505,11 @@ export async function buildPullRequestContext(
 }
 
 /**
- * Fatal review is safe only when the host, model, and later grounding checks
- * all see the same current product source and its diff. Deleted product files
- * have no current-HEAD line to ground, so a deletion-only product change stays
- * conservative instead of being treated as complete by vacuous truth.
+ * Fatal review is safe only when the host has the current product source and
+ * the model sees both its diff and either the full file or every changed-hunk
+ * window. Deleted product files have no current-HEAD line to ground, so a
+ * deletion-only product change stays conservative instead of being treated as
+ * complete by vacuous truth.
  */
 export function isFatalContextComplete(
   changeClass: ChangeClass,
@@ -645,22 +671,31 @@ function normalizedAcceptanceCriterion(value: string): string {
   return value.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase();
 }
 
-function isDeepContextFileFullyVisible(markdown: string, file: string, content: string): boolean {
+export function isDeepContextFileFullyVisible(markdown: string, file: string, content: string): boolean {
   const body = content.trimEnd();
   if (!body) {
     return false;
   }
+  const deepContextStart = markdown.indexOf("## Deep Repository Context");
+  if (deepContextStart < 0) {
+    return false;
+  }
+  const nextTopLevelSection = markdown.indexOf("\n## ", deepContextStart + 1);
+  const deepContext = markdown.slice(
+    deepContextStart,
+    nextTopLevelSection >= 0 ? nextTopLevelSection : markdown.length,
+  );
   const header = `### ${file}\n`;
-  const sectionStart = markdown.indexOf(header);
+  const sectionStart = deepContext.indexOf(header);
   if (sectionStart < 0) {
     return false;
   }
-  const bodyStart = markdown.indexOf(body, sectionStart + header.length);
+  const bodyStart = deepContext.indexOf(body, sectionStart + header.length);
   if (bodyStart < 0) {
     return false;
   }
-  const sectionEnd = markdown.indexOf("\n````", bodyStart + body.length);
-  const nextSection = markdown.indexOf("\n\n### ", sectionStart + header.length);
+  const sectionEnd = deepContext.indexOf("\n````", bodyStart + body.length);
+  const nextSection = deepContext.indexOf("\n\n### ", sectionStart + header.length);
   return sectionEnd >= 0 && (nextSection < 0 || sectionEnd < nextSection);
 }
 
@@ -669,30 +704,66 @@ async function buildChangedFileContents(
   repo: RepoRef,
   headSha: string,
   files: any[],
-): Promise<string> {
+): Promise<ChangedFileContentResult> {
   const sections: string[] = [];
+  const evidence: ChangedFileContentEvidence[] = [];
   let contextChars = 0;
+  let omittedCount = 0;
 
-  for (const file of files) {
+  for (const file of prioritizeChangedFilesForContext(files)) {
     if (!shouldFetchChangedFileContent(file)) {
       continue;
     }
 
-    const section = await buildChangedFileContentSection(octokit, repo, headSha, file);
-    if (!section) {
+    const item = await buildChangedFileContentSection(octokit, repo, headSha, file);
+    if (!item) {
       continue;
     }
 
-    if (contextChars + section.length > MAX_CHANGED_FILE_CONTENT_CONTEXT_CHARS) {
-      sections.push("...additional current file contents omitted...");
-      break;
+    const separatorChars = sections.length > 0 ? 2 : 0;
+    if (contextChars + separatorChars + item.section.length > MAX_CHANGED_FILE_CONTENT_CONTEXT_CHARS) {
+      omittedCount += 1;
+      continue;
     }
 
-    sections.push(section);
-    contextChars += section.length;
+    sections.push(item.section);
+    evidence.push(item);
+    contextChars += separatorChars + item.section.length;
   }
 
-  return sections.join("\n\n");
+  if (omittedCount > 0) {
+    sections.push(`...${omittedCount} additional current file content sections omitted...`);
+  }
+
+  return {
+    markdown: sections.join("\n\n"),
+    evidence,
+  };
+}
+
+export function prioritizeChangedFilesForContext(files: any[]): any[] {
+  return files
+    .map((file, index) => ({ file, index }))
+    .sort((left, right) => {
+      const leftProduct = isChangedProductFile(left.file);
+      const rightProduct = isChangedProductFile(right.file);
+      if (leftProduct !== rightProduct) {
+        return leftProduct ? -1 : 1;
+      }
+      return left.index - right.index;
+    })
+    .map(({ file }) => file);
+}
+
+function isChangedProductFile(file: any): boolean {
+  const filename = String(file?.filename || "");
+  const status = String(file?.status || "").toLowerCase();
+  return Boolean(
+    filename &&
+    status !== "removed" &&
+    status !== "deleted" &&
+    !isNonProductFatalPath(filename),
+  );
 }
 
 function shouldFetchChangedFileContent(file: any): boolean {
@@ -713,7 +784,7 @@ async function buildChangedFileContentSection(
   repo: RepoRef,
   headSha: string,
   file: any,
-): Promise<string | null> {
+): Promise<ChangedFileContentEvidence | null> {
   const filename = String(file.filename || "");
   try {
     const { data } = await octokit.rest.repos.getContent({
@@ -738,38 +809,58 @@ async function buildChangedFileContentSection(
       const digest =
         content && !looksBinary(content) ? buildLargeFileDigest(content, file.patch) : null;
       if (digest) {
-        return [
-          `### ${filename}`,
-          `${header} (full body omitted >${MAX_CHANGED_FILE_CONTENT_CHARS} chars; showing symbol outline + changed-region windows)`,
-          `\`\`\`\`${codeFenceLanguage(filename)}`,
-          digest,
-          "````",
-        ].join("\n");
+        return {
+          filename,
+          content,
+          contextComplete: digest.changedRegionsComplete,
+          section: [
+            `### ${filename}`,
+            `${header} (full body omitted >${MAX_CHANGED_FILE_CONTENT_CHARS} chars; showing changed-region windows + symbol outline)`,
+            `\`\`\`\`${codeFenceLanguage(filename)}`,
+            digest.markdown,
+            "````",
+          ].join("\n"),
+        };
       }
-      return [
-        `### ${filename}`,
-        header,
-        `current HEAD content omitted because it exceeds ${MAX_CHANGED_FILE_CONTENT_CHARS} characters`,
-      ].join("\n");
+      return {
+        filename,
+        content: content || null,
+        contextComplete: false,
+        section: [
+          `### ${filename}`,
+          header,
+          `current HEAD content omitted because it exceeds ${MAX_CHANGED_FILE_CONTENT_CHARS} characters`,
+        ].join("\n"),
+      };
     }
 
     if (!content || looksBinary(content)) {
       return null;
     }
 
-    return [
-      `### ${filename}`,
-      header,
-      `\`\`\`\`${codeFenceLanguage(filename)}`,
-      content.trimEnd(),
-      "````",
-    ].join("\n");
+    return {
+      filename,
+      content,
+      contextComplete: true,
+      section: [
+        `### ${filename}`,
+        header,
+        `\`\`\`\`${codeFenceLanguage(filename)}`,
+        content.trimEnd(),
+        "````",
+      ].join("\n"),
+    };
   } catch (error) {
-    return [
-      `### ${filename}`,
-      `status=${file.status}`,
-      `current HEAD content unavailable: ${truncate(errorMessage(error), 300)}`,
-    ].join("\n");
+    return {
+      filename,
+      content: null,
+      contextComplete: false,
+      section: [
+        `### ${filename}`,
+        `status=${file.status}`,
+        `current HEAD content unavailable: ${truncate(errorMessage(error), 300)}`,
+      ].join("\n"),
+    };
   }
 }
 
@@ -786,7 +877,10 @@ const LARGE_FILE_WINDOW_RADIUS = 18;
 // For an oversized changed file, produce a compact digest: a symbol outline plus
 // the changed-region windows (with line numbers) so cross-symbol reasoning stays
 // grounded without inlining the whole body.
-function buildLargeFileDigest(content: string, patch: string | null | undefined): string | null {
+export function buildLargeFileDigest(
+  content: string,
+  patch: string | null | undefined,
+): LargeFileDigest | null {
   const lines = content.split("\n");
   if (lines.length === 0) {
     return null;
@@ -799,21 +893,29 @@ function buildLargeFileDigest(content: string, patch: string | null | undefined)
     }
   }
 
-  const windows = renderChangedWindows(lines, changedNewLines(patch));
+  const windows = renderChangedWindows(lines, changedContextLines(patch));
 
   const sections: string[] = [];
   let budget = LARGE_FILE_DIGEST_BUDGET;
-  if (outline.length > 0) {
-    const outlineText = clampLines(outline, budget - 200);
-    sections.push(`# symbol outline (line: declaration)\n${outlineText}`);
-    budget -= outlineText.length;
-  }
+  let changedRegionsComplete = false;
   if (windows && budget > 200) {
-    const windowText = windows.length > budget ? `${windows.slice(0, budget)}\n...changed-region windows truncated...` : windows;
+    const windowBudget = budget - 100;
+    const changedRegionsTruncated = windows.length > windowBudget;
+    const windowText = changedRegionsTruncated
+      ? `${windows.slice(0, windowBudget)}\n...changed-region windows truncated...`
+      : windows;
     sections.push(`# changed-region windows (line: source)\n${windowText}`);
+    budget -= windowText.length;
+    changedRegionsComplete = !changedRegionsTruncated;
+  }
+  if (outline.length > 0 && budget > 200) {
+    const outlineText = clampLines(outline, budget - 100);
+    sections.push(`# symbol outline (line: declaration)\n${outlineText}`);
   }
 
-  return sections.length > 0 ? sections.join("\n\n") : null;
+  return sections.length > 0
+    ? { markdown: sections.join("\n\n"), changedRegionsComplete }
+    : null;
 }
 
 function clampLines(items: string[], budget: number): string {
@@ -830,8 +932,9 @@ function clampLines(items: string[], budget: number): string {
   return out.join("\n");
 }
 
-// New-file line numbers that were added in the patch (used to center windows).
-function changedNewLines(patch: string | null | undefined): number[] {
+// New-file line numbers that anchor every hunk plus added lines. Hunk anchors
+// keep deletion-only edits reviewable in the post-change source.
+function changedContextLines(patch: string | null | undefined): number[] {
   const changed: number[] = [];
   if (!patch) {
     return changed;
@@ -843,6 +946,9 @@ function changedNewLines(patch: string | null | undefined): number[] {
     const header = row.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
     if (header) {
       newLine = Number(header[1]);
+      if (newLine > 0) {
+        changed.push(newLine);
+      }
       inHunk = true;
       continue;
     }
