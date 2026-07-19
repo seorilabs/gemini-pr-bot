@@ -32,6 +32,7 @@ test("명시적 인수조건이 없으면 테스트 근거 없이 완료된다",
 
   assert.equal(result.complete, true);
   assert.deepEqual([...result.groundedAcceptanceCriteria], []);
+  assert.deepEqual([...result.groundedTestEvidence], []);
   assert.deepEqual(result.validationErrors, []);
 });
 
@@ -143,7 +144,88 @@ test("이름 있는 실행 테스트의 실제 assertion은 인수조건을 충�
     [...result.groundedAcceptanceCriteria],
     [normalizeReviewAcceptanceEvidence(criterion)],
   );
+  assert.deepEqual(
+    result.groundedTestEvidence.get(normalizeReviewAcceptanceEvidence(criterion)),
+    { file, line: 3, testName: "restartLoad keeps savedValue" },
+  );
   assert.deepEqual(result.validationErrors, []);
+});
+
+test("모델 줄 번호가 어긋나도 현재 HEAD의 유일한 exact assertion으로 재결속한다", () => {
+  const criterion = "Calling `restartLoad` keeps `savedValue`.";
+  const file = "src/save.test.ts";
+  const assertionQuote = "assert.equal(restored, savedValue);";
+  const source = [
+    'test("restartLoad keeps savedValue", () => {',
+    "  const restored = restartLoad();",
+    `  ${assertionQuote}`,
+    "});",
+  ].join("\n");
+  const evidence = {
+    file,
+    line: 2,
+    testName: "restartLoad keeps savedValue",
+    assertionQuote,
+    explanationKo: "재실행 결과와 저장값을 직접 비교합니다.",
+  };
+
+  const rebound = evaluateReviewAcceptanceCoverage(
+    context({ [file]: source }),
+    [criterion],
+    [coverage(criterion, { testEvidence: evidence })],
+  );
+  const ambiguous = evaluateReviewAcceptanceCoverage(
+    context({ [file]: `${source}\n${assertionQuote}` }),
+    [criterion],
+    [coverage(criterion, { testEvidence: evidence })],
+  );
+
+  assert.equal(rebound.complete, true);
+  assert.equal(
+    rebound.groundedTestEvidence.get(normalizeReviewAcceptanceEvidence(criterion))?.line,
+    3,
+  );
+  assert.equal(ambiguous.complete, false);
+  assert.deepEqual(ambiguous.validationErrors, ["AC-1: test_evidence_line_not_grounded"]);
+});
+
+test("테스트 추가 인수조건은 실행 manifest와 실제 executable test를 함께 결속한다", () => {
+  const criterion = "레벨별 순수 함수 유닛 테스트를 추가한다.";
+  const manifest = "package.json";
+  const testFile = "godot/tests/dirt_progression_test.gd";
+  const result = evaluateReviewAcceptanceCoverage(
+    context({
+      [manifest]: [
+        "{",
+        '  "scripts": {',
+        '    "test:core": "CORE_TEST_SCENE=res://tests/dirt_progression_test.gd bash scripts/test_core.sh",',
+        "  }",
+        "}",
+      ].join("\n"),
+      [testFile]: [
+        "extends SceneTree",
+        "func test_unlock_curve() -> bool:",
+        "\treturn true",
+      ].join("\n"),
+    }),
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: {
+        file: manifest,
+        line: 2,
+        testName: "test:core",
+        assertionQuote: '"test:core": "CORE_TEST_SCENE=res://tests/dirt_progression_test.gd bash scripts/test_core.sh"',
+        explanationKo: "순수 로직 테스트인 dirt_progression_test.gd가 test:core 스크립트에 통합되어 실행됨을 확인합니다.",
+      },
+    })],
+  );
+
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.validationErrors, []);
+  assert.equal(
+    result.groundedTestEvidence.get(normalizeReviewAcceptanceEvidence(criterion))?.line,
+    3,
+  );
 });
 
 test("skip된 테스트와 무의미한 assertion은 근거가 아니다", () => {

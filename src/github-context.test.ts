@@ -95,7 +95,7 @@ test("English behavior headings accept bullets and numbered items but Testing do
   ]);
 });
 
-test("product fatal context is complete only when every current product file has reviewable source evidence and a usable patch", () => {
+test("product fatal context is complete when every current product file has a visible usable patch", () => {
   const files = [
     { filename: "src/save.ts", status: "modified" },
     { filename: "src/session.ts", status: "added" },
@@ -122,7 +122,7 @@ test("product fatal context is complete only when every current product file has
   );
   assert.equal(
     isFatalContextComplete("product_logic", files, { "src/save.ts": contents["src/save.ts"] }, patches),
-    false,
+    true,
   );
   assert.equal(
     isFatalContextComplete("product_logic", files, contents, {
@@ -348,6 +348,10 @@ test("review context prioritizes a large changed product file and can complete f
     context.reviewGateMarkdown.indexOf("## Current Changed File Contents"),
     context.reviewGateMarkdown.indexOf("## Deep Repository Context"),
   );
+  const changedPatches = context.reviewGateMarkdown.slice(
+    context.reviewGateMarkdown.indexOf("## Changed Files"),
+    context.reviewGateMarkdown.indexOf("## Current Changed File Contents"),
+  );
 
   assert.equal(context.fatalContextComplete, true);
   assert.ok(context.currentHeadFileContents["src/large.ts"]);
@@ -355,5 +359,9 @@ test("review context prioritizes a large changed product file and can complete f
   assert.ok(
     changedContents.indexOf("### src/large.ts") <
       changedContents.indexOf("### tests/large.test.ts"),
+  );
+  assert.ok(
+    changedPatches.indexOf("### src/large.ts") <
+      changedPatches.indexOf("### tests/large.test.ts"),
   );
 });

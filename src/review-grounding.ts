@@ -45,7 +45,7 @@ const PRODUCT_SOURCE_EXTENSIONS = new Set([
 const TEST_BASENAME_PATTERN =
   /(?:^|[._-])(?:test|spec|probe|smoke|check|validate|verify|acceptance|regression|assert|gate)(?:[._-]|$)|(?:tests?|specs?)\.[^.]+$/iu;
 const ASSERTION_PATTERN =
-  /(?:(?:\b|_)(?:assert\w*|xctassert\w*)\s*(?:[.(]|!\s*\()|\bassert\s+\S|\bexpect\s*\([^)]*\)\s*(?:\.|\bto\b)|(?:\b|_)(?:should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\s*(?:[.(]|!\s*\()|\.to(?:be|equal|match|throw|contain|have)\w*\s*\()/iu;
+  /(?:(?:\b|_)(?:assert\w*|xctassert\w*)\s*(?:[.(]|!\s*\()|\bassert\s+\S|(?:\b|_)expect\s*\([^)]*\)\s*(?:\.|\bto\b)|(?:\b|_)(?:expect|should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\s*(?:[.(]|!\s*\()|\.to(?:be|equal|match|throw|contain|have)\w*\s*\()/iu;
 const GENERIC_TEST_NAMES = new Set([
   "check",
   "describe",
@@ -84,7 +84,7 @@ export function isGroundedTestEvidence(
     GENERIC_TEST_NAMES.has(testName.toLowerCase()) ||
     assertion.length < 8 ||
     !/[\p{L}\p{N}_]/u.test(testName) ||
-    !ASSERTION_PATTERN.test(assertion) ||
+    (!ASSERTION_PATTERN.test(assertion) && !isGuardAssertionSyntax(evidence.file, assertion)) ||
     isVacuousAssertion(assertion)
   ) {
     return false;
@@ -135,6 +135,103 @@ export function isGroundedTestEvidence(
     }
   }
   return false;
+}
+
+/**
+ * Some acceptance criteria require adding or wiring a test suite rather than
+ * asserting product behavior directly. In that narrow case, an exact runner
+ * configuration line may ground the criterion when it names a current-HEAD
+ * executable test file.
+ */
+export function isGroundedTestExecutionEvidence(
+  context: ReviewGroundingContext,
+  criterion: ReviewGateCriterion,
+  evidence: ReviewGateTestEvidence,
+): boolean {
+  if (
+    !isTestExecutionCriterion(criterion.sourceQuote) ||
+    !isTestRunnerConfigPath(evidence.file) ||
+    !testExecutionSubjectMatches(criterion.sourceQuote, evidence)
+  ) {
+    return false;
+  }
+
+  const runnerContent = context.currentHeadFileContents[evidence.file] || "";
+  if (!runnerContent || !runnerContent.includes(evidence.assertionQuote)) {
+    return false;
+  }
+  const referencedBasenames = new Set(
+    [...evidence.assertionQuote.matchAll(
+      /(?:^|[\\/])([^\\/"'\s]*(?:test|spec|smoke|probe|check|verify)[^\\/"'\s]*\.[A-Za-z0-9]+)(?=$|["'\s])/giu,
+    )].map((match) => (match[1] || "").toLowerCase()),
+  );
+  if (referencedBasenames.size === 0) {
+    return false;
+  }
+
+  return Object.entries(context.currentHeadFileContents).some(([file, content]) => {
+    const basename = file.split("/").at(-1)?.toLowerCase() || "";
+    return referencedBasenames.has(basename) && isExecutableTestFile(file, content);
+  });
+}
+
+function testExecutionSubjectMatches(
+  sourceQuote: string,
+  evidence: ReviewGateTestEvidence,
+): boolean {
+  const evidenceText = normalizedEvidence(
+    `${evidence.file} ${evidence.testName} ${evidence.assertionQuote} ${evidence.explanationKo || ""}`,
+  ).toLowerCase();
+  const explicitIdentifiers = [...sourceQuote.matchAll(/`([^`]{2,80})`/gu)]
+    .map((match) => canonicalExplicitIdentifier(match[1] || ""))
+    .filter(Boolean);
+  if (explicitIdentifiers.length > 0) {
+    const canonicalEvidence = canonicalExplicitIdentifier(evidenceText);
+    return explicitIdentifiers.every((token) => canonicalEvidence.includes(token));
+  }
+
+  const genericKorean = /^(?:테스트|추가|실행|연결|포함|통합|검증)/u;
+  const sourceKorean = [...koreanTokens(sourceQuote)].filter((token) => !genericKorean.test(token));
+  const evidenceKorean = [...koreanTokens(evidenceText)];
+  if (sourceKorean.some((token) =>
+    evidenceKorean.some((candidate) =>
+      token === candidate || commonPrefixLength(token, candidate) >= 3))) {
+    return true;
+  }
+
+  const sourceAscii = asciiAnchorTokens(sourceQuote);
+  const evidenceAscii = asciiAnchorTokens(evidenceText);
+  return [...sourceAscii].some((token) => evidenceAscii.has(token));
+}
+
+function isTestExecutionCriterion(sourceQuote: string): boolean {
+  return (
+    /테스트.{0,30}(?:추가|실행|연결|포함|통합)|(?:추가|실행|연결|포함|통합).{0,30}테스트/iu.test(sourceQuote) ||
+    /\btests?\b.{0,40}\b(?:add|execute|include|run|wire)\w*\b|\b(?:add|execute|include|run|wire)\w*\b.{0,40}\btests?\b/iu.test(sourceQuote)
+  );
+}
+
+function isTestRunnerConfigPath(file: string): boolean {
+  const lower = file.toLowerCase();
+  const basename = lower.split("/").at(-1) || "";
+  return (
+    ["package.json", "makefile"].includes(basename) ||
+    /(?:^|\/)(?:scripts?|tools?)\/[^/]+\.(?:sh|bash|zsh|mjs|cjs|js|ts)$/u.test(lower)
+  );
+}
+
+function isExecutableTestFile(file: string, content: string): boolean {
+  if (!isTestEvidencePath(file) || !content) {
+    return false;
+  }
+  const lines = stripCommentsFromLines(content.split(/\r?\n/u));
+  if (file.toLowerCase().endsWith(".gd")) {
+    return (
+      isGodotExecutableHarness(file, lines) ||
+      lines.some((line) => /^\s*func\s+_?test[_A-Z]\w*\s*\(/iu.test(line))
+    );
+  }
+  return lines.some((line, index) => isRegisteredTestDeclaration(file, lines, index));
 }
 
 export function isGroundedFatalBlocker(
@@ -321,8 +418,8 @@ function isRegisteredTestDeclaration(
   }
   if (extension === ".gd") {
     return (
-      /^\s*func\s+test[_A-Z]\w*\s*\(/iu.test(line) ||
-      (godotExecutableHarness && /^\s*func\s+_run\s*\(/u.test(line))
+      /^\s*func\s+_?test[_A-Z]\w*\s*\(/iu.test(line) ||
+      (godotExecutableHarness && /^\s*func\s+_(?:run|test)\w*\s*\(/iu.test(line))
     );
   }
   if ([".rb", ".php"].includes(extension)) {
@@ -343,14 +440,12 @@ function isGodotExecutableHarness(file: string, lines: string[]): boolean {
   if (!godotLifecycleCallsRunner(lines)) {
     return false;
   }
-  return lines.some((line) =>
-    /\b(?:quit|get_tree\(\)\.quit)\s*\(\s*[1-9]\d*\s*\)|\bOS\.exit_code\s*=\s*[1-9]\d*/u.test(line),
-  );
+  return lines.some((line) => hasGodotFailureExit(line));
 }
 
 function godotLifecycleCallsRunner(lines: string[]): boolean {
   for (let index = 0; index < lines.length; index += 1) {
-    if (!/^\s*func\s+_(?:initialize|ready)\s*\(/u.test(lines[index] || "")) {
+    if (!/^\s*func\s+_(?:init|initialize|ready)\s*\(/u.test(lines[index] || "")) {
       continue;
     }
     for (let candidate = index + 1; candidate < lines.length; candidate += 1) {
@@ -358,7 +453,7 @@ function godotLifecycleCallsRunner(lines: string[]): boolean {
       if (/^\s*func\s+\w+\s*\(/u.test(line)) {
         break;
       }
-      if (/\b_run\s*\(/u.test(line)) {
+      if (/\b_(?:run|test)\w*\s*(?:\.|\()/iu.test(line)) {
         return true;
       }
     }
@@ -449,18 +544,53 @@ function hasExecutableAssertionLine(lines: string[], assertion: string): boolean
   const lead = assertion.match(
     /(?:\b|_)(assert\w*|xctassert\w*|expect|should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\b/iu,
   )?.[1];
-  if (!lead) {
-    return false;
-  }
-  for (const code of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const code = lines[index] || "";
     if (
       normalizedEvidence(code).includes(assertion) &&
-      hasTokenOutsideString(code, lead)
+      ((lead && hasTokenOutsideString(code, lead)) ||
+        isExecutableFailureGuard(lines, index, assertion))
     ) {
       return true;
     }
   }
   return false;
+}
+
+function isGuardAssertionSyntax(file: string, assertion: string): boolean {
+  return file.toLowerCase().endsWith(".gd") && /^if\b/iu.test(assertion.trim());
+}
+
+function isExecutableFailureGuard(lines: string[], index: number, assertion: string): boolean {
+  const line = lines[index] || "";
+  if (!/^\s*if\b/iu.test(line) || !normalizedEvidence(line).includes(assertion)) {
+    return false;
+  }
+  const baseIndent = leadingWhitespace(line);
+  for (let candidate = index + 1; candidate < Math.min(lines.length, index + 6); candidate += 1) {
+    const nested = lines[candidate] || "";
+    if (!nested.trim()) {
+      continue;
+    }
+    if (leadingWhitespace(nested) <= baseIndent) {
+      break;
+    }
+    if (/(?:\b|_)(?:fail|push_error)\w*\s*\(/iu.test(nested) || hasGodotFailureExit(nested)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasGodotFailureExit(line: string): boolean {
+  return (
+    /\b(?:quit|get_tree\(\)\.quit)\s*\(\s*[1-9]\d*(?:\s+if\b[^)]*)?\s*\)/iu.test(line) ||
+    /\bOS\.exit_code\s*=\s*[1-9]\d*/u.test(line)
+  );
+}
+
+function leadingWhitespace(line: string): number {
+  return line.match(/^\s*/u)?.[0].replace(/\t/gu, "    ").length || 0;
 }
 
 function stripCommentsFromLines(lines: string[]): string[] {
@@ -624,7 +754,7 @@ function criterionAnchorsMatch(
   directCallContext: string,
 ): boolean {
   const evidenceText = normalizedEvidence(
-    `${evidence.file} ${evidence.testName} ${evidence.assertionQuote} ${testBlock} ${supportingContext} ${directCallContext}`,
+    `${evidence.file} ${evidence.testName} ${evidence.assertionQuote} ${evidence.explanationKo || ""} ${testBlock} ${supportingContext} ${directCallContext}`,
   ).toLowerCase();
   const explicitIdentifiers = [...sourceQuote.matchAll(/`([^`]{2,80})`/gu)]
     .map((match) => canonicalExplicitIdentifier(match[1] || ""))
@@ -635,7 +765,9 @@ function criterionAnchorsMatch(
   }
 
   const sourceKorean = koreanTokens(sourceQuote);
-  const evidenceKorean = koreanTokens(`${evidence.testName} ${evidence.assertionQuote}`);
+  const evidenceKorean = koreanTokens(
+    `${evidence.testName} ${evidence.assertionQuote} ${evidence.explanationKo || ""}`,
+  );
   const sourceAscii = asciiAnchorTokens(sourceQuote);
   const evidenceAscii = asciiAnchorTokens(evidenceText);
   const sourceAnchors = [
@@ -644,16 +776,30 @@ function criterionAnchorsMatch(
   ];
   const matchedAnchors = sourceAnchors.filter(({ language, token }) => {
     const candidates = language === "ko" ? evidenceKorean : evidenceAscii;
+    const koreanPrefixThreshold = evidence.explanationKo ? 2 : 3;
     return [...candidates].some((candidate) =>
       token === candidate ||
       (token.length >= 4 && candidate.length >= 4 &&
-        (token.startsWith(candidate) || candidate.startsWith(token))),
+        (token.startsWith(candidate) || candidate.startsWith(token))) ||
+      (language === "ko" && commonPrefixLength(token, candidate) >= koreanPrefixThreshold),
     );
   });
   if (sourceAnchors.length === 1) {
     return matchedAnchors.length === 1 && sourceAnchors[0]!.token.length >= 4;
   }
-  return matchedAnchors.length >= Math.max(2, Math.floor(sourceAnchors.length / 2) + 1);
+  const requiredMatches = evidence.explanationKo
+    ? Math.min(2, sourceAnchors.length)
+    : Math.max(2, Math.floor(sourceAnchors.length / 2) + 1);
+  return matchedAnchors.length >= requiredMatches;
+}
+
+function commonPrefixLength(left: string, right: string): number {
+  const length = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < length && left[index] === right[index]) {
+    index += 1;
+  }
+  return index;
 }
 
 function canonicalExplicitIdentifier(value: string): string {

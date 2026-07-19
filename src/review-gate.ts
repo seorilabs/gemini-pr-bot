@@ -19,6 +19,8 @@ export type ReviewGateTestEvidence = {
   file: string;
   testName: string;
   assertionQuote: string;
+  /** Provider explanation is used only to bind natural-language ACs to grounded code. */
+  explanationKo?: string;
 };
 
 export type ReviewGateCodeEvidence = {
