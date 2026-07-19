@@ -7,7 +7,7 @@ flowchart LR
   GitHub["GitHub App Webhook"] --> Ingress["K8s Ingress"]
   Ingress --> Bot["seori-pr-bot"]
   Bot --> GitHubAPI["GitHub App Installation API"]
-  Bot --> Providers["MiniMax merge gate / optional fallbacks"]
+  Bot --> Providers["Gemini API merge gate / optional Cursor fallback"]
   Bot --> Comment["PR comments / inline replies / check runs"]
   Bot --> NATS["NATS telegram subject"]
   NATS --> Telegram["Telegram"]
@@ -21,8 +21,8 @@ flowchart LR
 - Explicit acceptance criteria are preserved across wrapped lines and must map one-to-one to distinct model criteria. Automated criteria need grounded test evidence; explicitly manual, visual, or real-device criteria are nonblocking notes.
 - Test evidence must come from a registered, active current-HEAD test with a real non-vacuous assertion. Commented code, skipped/disabled tests or suites, ordinary helper functions, comparison-only expressions, and assertion-shaped strings are rejected by the host.
 - Reports at most two fatal blockers, limited to a deterministic common-path crash, permanent data loss/corruption, exploitable security/privacy exposure, or a certainly unusable primary flow. The added root line must itself directly perform the fatal outcome and end a 2-6-line ordered causal chain; normal false/null returns, UI flags, and deny-by-default security rules are rejected.
-- Uses host-side strict schema and evidence validation. MiniMax does not assign severity or decide approval itself.
-- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. A missing acceptance test blocks only after exhaustive current-HEAD inventory search; a fatal defect blocks only when MiniMax's separate verifier confirms the same host-grounded added root. Uncertainty completes as nonblocking `neutral`, with separate `확인 완료 (PASS)` and `판정 보류 항목` sections that identify grounded test evidence and the exact unresolved scope without exposing raw model reasoning.
+- Uses Gemini structured output plus host-side strict schema and evidence validation. Gemini does not assign severity or decide approval itself.
+- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. A missing acceptance test blocks only after exhaustive current-HEAD inventory search; a fatal defect blocks only when Gemini's separate verifier confirms the same host-grounded added root. Uncertainty completes as nonblocking `neutral`, with separate `확인 완료 (PASS)` and `판정 보류 항목` sections that identify grounded test evidence and the exact unresolved scope without exposing raw model reasoning.
 - Omits Medium/Low findings, style/refactor suggestions, speculative risks, and automatic follow-up issue creation from the merge-gate path.
 - Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
 - Runs explicit review on `@gemini-cli /review`; a gate pass submits approval, confirmed blockers request changes, and inconclusive results do not assign manual verification or block merge.
@@ -34,7 +34,7 @@ flowchart LR
 - Creates a `Seori Review` check run for review and agent jobs.
 - Marks `Seori Review` as `success` after a gate pass or explicit current-HEAD approval. Confirmed blockers complete as `action_required`; unresolved model uncertainty completes as nonblocking `neutral`.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
-- Can route AI jobs across MiniMax, Gemini, and Cursor; production currently uses MiniMax only and does not call a paid second-opinion API. GitHub Copilot is not a bot review provider — use GitHub's native Copilot review separately.
+- Routes production AI jobs through the Gemini API. Cursor remains an optional separately configured fallback; paid second-opinion calls are disabled by default. GitHub Copilot is not a bot review provider — use GitHub's native Copilot review separately.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
@@ -86,8 +86,8 @@ flowchart TD
   Review["/review or PR opened"] --> Context["Build PR context"]
   Context --> Conflict{"Merge conflict?"}
   Conflict -->|Yes| RequestChanges["REQUEST_CHANGES review with resolution steps"]
-  Conflict -->|No| Candidate["MiniMax 후보 최대 2건"]
-  Candidate --> Verifier["같은 MiniMax의 반증 우선 검증"]
+  Conflict -->|No| Candidate["Gemini 후보 최대 2건"]
+  Candidate --> Verifier["Gemini 반증 우선 검증"]
   Verifier --> Host["Host: AC 원문·전체 테스트·현재 HEAD exact 근거 검증"]
   Host --> Ledger["finding 원장: open / resolved / refuted"]
   Ledger -->|"확정 치명 결함 또는 테스트 누락"| Output["한글 REQUEST_CHANGES + action_required"]
@@ -187,10 +187,9 @@ Then create the K8s secrets.
 export GITHUB_APP_ID="..."
 export GITHUB_PRIVATE_KEY_FILE="/path/to/seorilabs-seori-pr-bot.private-key.pem"
 export GITHUB_WEBHOOK_SECRET="..."
-export MINIMAX_API_KEY="..."
+export GEMINI_API_KEY="..."
 
 ./scripts/create-k8s-secret.sh
-./scripts/create-gemini-cli-oauth-secret.sh
 ./scripts/create-provider-secrets.sh
 ./scripts/copy-mysql-app-secret.sh
 ```
@@ -206,21 +205,19 @@ Use a dedicated automation account for these credentials. Personal tokens are ac
 The production routing is:
 
 ```text
-AI_REVIEW_PROVIDERS=minimax
-AI_REVIEW_PROVIDER_WEIGHTS=minimax:100
-AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax
+AI_REVIEW_PROVIDERS=gemini
+AI_REVIEW_PROVIDER_WEIGHTS=gemini:100
+AI_REVIEW_PROVIDER_FALLBACK_ORDER=gemini
 AI_REVIEW_TIEBREAKER_ENABLED=false
-AI_REVIEW_TIEBREAKER_PROVIDER=gemini
-MINIMAX_MODEL=MiniMax-M3
-MINIMAX_API_BASE_URL=https://api.minimax.io/v1
+GEMINI_MODEL=gemini-3-flash-preview
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
 PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
-The conservative gate uses MiniMax-M3's Anthropic-compatible Messages API at `https://api.minimax.io/anthropic/v1/messages`. It runs adaptive thinking in two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. No paid Gemini API call participates in the production review route. Gemini and Cursor are not part of the production route. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
+The conservative gate uses the Gemini API with low thinking and JSON-schema-constrained output. It runs two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
 
-Structured PR reviews use the bounded MiniMax candidate/verifier gate above. PR Q&A and agent commands still use the configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable; incomplete or ambiguous evidence becomes a nonblocking neutral decision without posting a task back to the author. Neutral output still itemizes grounded `PASS` criteria with their current-HEAD test locations and names each unresolved criterion or validation scope with a host-owned reason.
+Structured PR reviews use the bounded Gemini candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable; incomplete or ambiguous evidence becomes a nonblocking neutral decision without posting a task back to the author. Neutral output still itemizes grounded `PASS` criteria with their current-HEAD test locations and names each unresolved criterion or validation scope with a host-owned reason.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
 Repositories listed in `AUTO_REVIEW_IGNORED_REPOSITORIES` skip automatic PR opened/reopened/synchronize reviews, while explicit mentions still work.
 When `AUTO_SQUASH_MERGE_ENABLED=true`, eligible non-gate approvals are followed by a GitHub Squash Merge attempt only for PRs targeting `main`; conservative gate approvals deliberately stop before merge. There is no repo allowlist and no branch allowlist beyond exact `main`.
@@ -238,7 +235,7 @@ APPROVAL_TELEGRAM_BOT=seori_review_bot
 APPROVAL_TELEGRAM_CHANNEL=syous
 ```
 
-Quota summaries and Grafana provider health are based on provider error text, credential presence, routing config, and cooldown state. The Gemini/Cursor CLI paths do not expose exact remaining quota, so the bot reports detected quota-like failures, provider routing, weights, fallback order, and cooldown release time instead of exact remaining credits.
+Quota summaries and Grafana provider health are based on provider error text, credential presence, routing config, and cooldown state. The Gemini API and Cursor CLI do not expose exact remaining prepaid credit through this service, so the bot reports detected quota-like failures, provider routing, weights, fallback order, and cooldown release time instead of exact remaining credits.
 
 Optional stale review closing:
 

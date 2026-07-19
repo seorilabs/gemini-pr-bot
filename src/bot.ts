@@ -98,7 +98,7 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
-const REVIEW_GATE_PROMPT_VERSION = "conservative-merge-gate-v4";
+const REVIEW_GATE_PROMPT_VERSION = "conservative-merge-gate-v5-gemini";
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
@@ -1680,7 +1680,7 @@ export class PrBot {
       context,
       workflow?.reviewGateFindingStore,
     );
-    const prompts = this.miniMaxReviewGatePrompts(
+    const prompts = this.reviewGatePrompts(
       context,
       trigger,
       explicitAcceptanceCriteria,
@@ -1715,7 +1715,7 @@ export class PrBot {
         envelope = cacheEnvelope;
         this.logger.info(
           { repo: repo.fullName, prNumber, headSha: context.headSha },
-          "reused completed MiniMax review gate extraction",
+          "reused completed Gemini review gate extraction",
         );
       } else {
         const candidateResult = await this.gemini.reviewGateCandidates(
@@ -1727,7 +1727,7 @@ export class PrBot {
           ? { verifications: [] }
           : (await this.gemini.verifyReviewGateCandidates(
               prompts.verifierSystem,
-              this.miniMaxVerifierPrompt(
+              this.reviewGateVerifierPrompt(
                 prompts.candidateUser,
                 candidateResult.value.candidates,
               ),
@@ -1743,7 +1743,7 @@ export class PrBot {
     } catch (error) {
       this.logger.warn(
         { error, repo: repo.fullName, prNumber, headSha: context.headSha },
-        "MiniMax conservative review gate could not produce validated evidence",
+        "Gemini conservative review gate could not produce validated evidence",
       );
       const output = formatReviewGateCheckOutput({
         headSha: context.headSha,
@@ -1755,7 +1755,7 @@ export class PrBot {
           reason: "모델 응답 또는 검증 처리에 실패해 현재 HEAD의 세부 판정을 완료하지 못했습니다.",
         }],
       });
-      await this.recordMiniMaxReviewGateRun(
+      await this.recordReviewGateRun(
         workflow,
         check,
         repo,
@@ -1876,7 +1876,7 @@ export class PrBot {
       abstainItems: disclosure.abstainItems,
     });
 
-    await this.recordMiniMaxReviewGateRun(
+    await this.recordReviewGateRun(
       workflow,
       check,
       repo,
@@ -2054,7 +2054,7 @@ export class PrBot {
     return [...unique.values()];
   }
 
-  private miniMaxReviewGatePrompts(
+  private reviewGatePrompts(
     context: PullRequestContext,
     trigger: ReviewTrigger,
     explicitAcceptanceCriteria: readonly string[],
@@ -2135,7 +2135,7 @@ export class PrBot {
     return { candidateSystem, candidateUser, verifierSystem };
   }
 
-  private miniMaxVerifierPrompt(
+  private reviewGateVerifierPrompt(
     candidateUser: string,
     candidates: readonly MiniMaxReviewCandidate[],
   ): string {
@@ -2187,7 +2187,7 @@ export class PrBot {
     return decodeReviewGateCache(cached.rawOutput, explicitAcceptanceCriteria);
   }
 
-  private async recordMiniMaxReviewGateRun(
+  private async recordReviewGateRun(
     workflow: WorkflowExecution | undefined,
     check: ActiveCheckRun | null,
     repo: RepoRef,
@@ -2209,8 +2209,8 @@ export class PrBot {
       prNumber,
       headSha: context.headSha,
       checkRunId: check?.checkRunId ?? workflow?.checkRunId ?? null,
-      provider: "host",
-      model: "MiniMax-M3-candidate-verifier",
+      provider: "gemini",
+      model: `${this.config.geminiModel}-candidate-verifier`,
       promptVersion: REVIEW_GATE_PROMPT_VERSION,
       promptSha256: createHash("sha256").update(promptDigestInput).digest("hex"),
       contextSha256: contextHash,

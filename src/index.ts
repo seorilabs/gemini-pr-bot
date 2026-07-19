@@ -115,7 +115,7 @@ async function renderMetrics(): Promise<string> {
   return metrics.render({
     infoLabels: {
       workflow_store: config.workflowStore,
-      gemini_provider: config.geminiProvider,
+      gemini_provider: "api",
     },
     gauges: bot.metricSamples(),
     workflowQueue,
@@ -265,8 +265,8 @@ server.listen(config.port, () => {
     {
       port: config.port,
       org: config.githubOrg,
-      provider: config.geminiProvider,
-      model: config.geminiModel || "default",
+      provider: "api",
+      model: config.geminiModel,
       reviewProviders: config.aiReviewProviders,
       reviewProviderWeights: config.aiReviewProviderWeights,
       reviewProviderFallbackOrder: config.aiReviewProviderFallbackOrder,

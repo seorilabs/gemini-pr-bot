@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# Set the shared seori-pr-bot-provider-secrets Kubernetes secret used by the
-# AI review providers. MiniMax is the primary and required provider.
+# Set the seori-pr-bot-provider-secrets Kubernetes secret used by Gemini.
 #
 # Usage:
-#   export MINIMAX_API_KEY="..."
+#   export GEMINI_API_KEY="..."
 #   ./scripts/create-provider-secrets.sh
 set -euo pipefail
 
-: "${MINIMAX_API_KEY:?Set MINIMAX_API_KEY to the MiniMax platform API key}"
+: "${GEMINI_API_KEY:?Set GEMINI_API_KEY to the company Gemini API key}"
 
 namespace="${NAMESPACE:-apps}"
 secret_name="${SECRET_NAME:-seori-pr-bot-provider-secrets}"
 
 args=(
-  --from-literal=MINIMAX_API_KEY="${MINIMAX_API_KEY}"
+  --from-literal=GEMINI_API_KEY="${GEMINI_API_KEY}"
 )
 
 secret_yaml=$(

@@ -1,6 +1,5 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
 import { AI_REVIEW_PROVIDER_NAMES, type AiReviewProviderName, type Config } from "./config.js";
 import { botActionMarker } from "./identity.js";
 import { metrics, type GaugeSample } from "./metrics.js";
@@ -65,7 +64,7 @@ export function isAiProviderCooldownError(error: unknown): error is AiProviderCo
 }
 
 export class GeminiClient {
-  private readonly ai?: GoogleGenAI;
+  private readonly ai: GoogleGenAI;
   private readonly providerCooldownUntil = new Map<AiReviewProviderName, number>();
   private readonly providerLastSuccessAt = new Map<AiReviewProviderName, number>();
   private readonly providerLastFailureAt = new Map<AiReviewProviderName, number>();
@@ -76,9 +75,10 @@ export class GeminiClient {
     private readonly logger?: Logger,
     private readonly quotaReporter?: (event: AiProviderQuotaEvent) => Promise<void> | void,
   ) {
-    if (config.geminiProvider === "api") {
-      this.ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
-    }
+    this.ai = new GoogleGenAI({
+      apiKey: config.geminiApiKey,
+      httpOptions: { timeout: config.geminiTimeoutMs },
+    });
   }
 
   async review(prompt: string): Promise<string> {
@@ -119,9 +119,9 @@ export class GeminiClient {
     userPrompt: string,
     expectedAcceptanceCriteria: readonly string[],
   ): Promise<MiniMaxGateResult<MiniMaxReviewResult>> {
-    return this.runMiniMaxGateRequest(
+    return this.runGeminiGateRequest(
       () => buildMiniMaxReviewRequest({ systemPrompt, userPrompt }),
-      (response) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria }),
+      (response: unknown) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria }),
       userPrompt,
       "후보 추출",
     );
@@ -133,9 +133,9 @@ export class GeminiClient {
     candidates: readonly MiniMaxReviewCandidate[],
   ): Promise<MiniMaxGateResult<MiniMaxVerificationResult>> {
     const expectedCandidates = candidates.map(({ candidateId, kind }) => ({ candidateId, kind }));
-    return this.runMiniMaxGateRequest(
+    return this.runGeminiGateRequest(
       () => buildMiniMaxVerificationRequest({ systemPrompt, userPrompt }),
-      (response) => parseMiniMaxVerificationResponse(response, { expectedCandidates }),
+      (response: unknown) => parseMiniMaxVerificationResponse(response, { expectedCandidates }),
       userPrompt,
       "후보 반증",
     );
@@ -554,29 +554,15 @@ export class GeminiClient {
   }
 
   private providerModel(provider: AiReviewProviderName): string {
-    if (provider === "minimax") {
-      return this.config.minimaxModel || "MiniMax-M3";
-    }
     if (provider === "gemini") {
-      return this.config.geminiModel || "gemini-2.5-flash";
+      return this.config.geminiModel;
     }
     return this.config.cursorModel || "default";
   }
 
   private hasProviderCredential(provider: AiReviewProviderName): boolean {
-    if (provider === "minimax") {
-      return Boolean(this.config.minimaxApiKey);
-    }
-
     if (provider === "gemini") {
-      if (this.config.geminiProvider === "api") {
-        return Boolean(this.config.geminiApiKey);
-      }
-
-      const home = process.env.HOME || "";
-      return Boolean(home) &&
-        existsSync(`${home}/.gemini/oauth_creds.json`) &&
-        existsSync(`${home}/.gemini/google_accounts.json`);
+      return Boolean(this.config.geminiApiKey);
     }
 
     return Boolean(process.env.CURSOR_API_KEY);
@@ -607,10 +593,6 @@ export class GeminiClient {
     prompt: string,
     options: AiRunOptions = {},
   ): Promise<string> {
-    if (provider === "minimax") {
-      return this.runMiniMaxApi(kind, prompt, options);
-    }
-
     if (provider === "gemini") {
       return this.runGemini(kind, prompt, options);
     }
@@ -619,13 +601,9 @@ export class GeminiClient {
   }
 
   private async runGemini(kind: AiTaskKind, prompt: string, options: AiRunOptions = {}): Promise<string> {
-    if (this.config.geminiProvider === "cli") {
-      return this.runGeminiCli(prompt);
-    }
-
     const generationConfig = this.geminiGenerationConfig(kind, options);
-    const response = await this.ai!.models.generateContent({
-      model: this.config.geminiModel || "gemini-2.5-flash",
+    const response = await this.ai.models.generateContent({
+      model: this.config.geminiModel,
       contents: truncate(prompt, this.config.maxContextChars),
       config: generationConfig,
     });
@@ -636,13 +614,28 @@ export class GeminiClient {
   private geminiGenerationConfig(
     kind: AiTaskKind,
     options: AiRunOptions = {},
-  ): { temperature: number; maxOutputTokens: number; responseMimeType?: string } {
+  ): {
+    temperature: number;
+    maxOutputTokens: number;
+    thinkingConfig: { thinkingLevel: ThinkingLevel };
+    responseMimeType?: string;
+  } {
     const jsonConfig = options.jsonOutput ? { responseMimeType: "application/json" } : {};
     if (kind === "answer") {
-      return { temperature: 0.3, maxOutputTokens: 3072, ...jsonConfig };
+      return {
+        temperature: 0.3,
+        maxOutputTokens: 3072,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        ...jsonConfig,
+      };
     }
 
-    return { temperature: 0.2, maxOutputTokens: 4096, ...jsonConfig };
+    return {
+      temperature: 0.2,
+      maxOutputTokens: 4096,
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      ...jsonConfig,
+    };
   }
 
   private emptyResponseText(kind: AiTaskKind): string {
@@ -653,68 +646,7 @@ export class GeminiClient {
     return "응답을 생성하지 못했습니다.";
   }
 
-  private async runMiniMaxApi(kind: AiTaskKind, prompt: string, options: AiRunOptions = {}): Promise<string> {
-    if (!this.config.minimaxApiKey) {
-      throw new Error("MiniMax API key is not configured");
-    }
-
-    const baseUrl = this.config.minimaxApiBaseUrl.replace(/\/+$/, "");
-    const url = `${baseUrl}/chat/completions`;
-    const { temperature, maxCompletionTokens } = this.minimaxGenerationConfig(kind);
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.config.minimaxTimeoutMs);
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.config.minimaxApiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.config.minimaxModel,
-          messages: [{ role: "user", content: truncate(prompt, this.config.maxContextChars) }],
-          temperature,
-          max_completion_tokens: maxCompletionTokens,
-          thinking: { type: "disabled" },
-          // Constrain structured-review output to a parseable JSON object so it
-          // does not regress into prose that fails JSON.parse.
-          ...(options.jsonOutput ? { response_format: { type: "json_object" } } : {}),
-          stream: false,
-        }),
-        signal: controller.signal,
-      });
-
-      const rawText = await response.text();
-      if (!response.ok) {
-        throw new Error(`MiniMax API request failed (${response.status}): ${truncate(rawText, 600)}`);
-      }
-
-      let parsed: any;
-      try {
-        parsed = JSON.parse(rawText);
-      } catch (error) {
-        throw new Error(`MiniMax API returned non-JSON response: ${truncate(rawText, 600)}`);
-      }
-
-      const baseResp = parsed?.base_resp;
-      if (baseResp && typeof baseResp === "object" && Number(baseResp.status_code) !== 0) {
-        const message = String(baseResp.status_msg || `MiniMax API error code ${baseResp.status_code}`);
-        throw new Error(`MiniMax API rejected request: ${message}`);
-      }
-
-      const content = parsed?.choices?.[0]?.message?.content;
-      const text = typeof content === "string" ? content.trim() : "";
-      if (!text) {
-        return this.emptyResponseText(kind);
-      }
-      return text;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  private async runMiniMaxGateRequest<T>(
+  private async runGeminiGateRequest<T>(
     buildRequest: () => MiniMaxMessagesRequest,
     parseResponse: (response: unknown) =>
       | { ok: true; value: T; source: "tool_use" | "text" }
@@ -722,15 +654,8 @@ export class GeminiClient {
     originalUserPrompt: string,
     phaseLabel: string,
   ): Promise<MiniMaxGateResult<T>> {
-    if (!this.config.minimaxApiKey) {
-      throw new Error("MiniMax API key is not configured");
-    }
-    if (this.config.minimaxModel !== "MiniMax-M3") {
-      throw new Error(`MiniMax conservative gate requires MiniMax-M3, got ${this.config.minimaxModel}`);
-    }
-
-    let request = buildRequest();
-    let response = await this.callMiniMaxMessages(request, phaseLabel);
+    const request = buildRequest();
+    const response = await this.callGeminiMessages(request, phaseLabel);
     let parsed = parseResponse(response);
 
     if (!parsed.ok) {
@@ -739,118 +664,91 @@ export class GeminiClient {
         "",
         "이전 출력은 서버 검증을 통과하지 못했습니다.",
         `검증 오류: ${parsed.errors.slice(0, 8).join(" | ")}`,
-        "추론 설명을 본문에 쓰지 말고, 정의된 submit_review 도구를 정확히 한 번 호출해 전체 결과를 다시 제출하세요.",
+        "정의된 submit_review 도구를 호출하는 형식의 JSON을 정확히 다시 제출하세요.",
       ].join("\n");
-      request = {
-        ...buildRequest(),
-        messages: [{ role: "user", content: [{ type: "text", text: repairPrompt }] }],
+      const repairRequest = {
+        ...request,
+        messages: [{ role: "user" as const, content: [{ type: "text" as const, text: repairPrompt }] }],
       };
-      response = await this.callMiniMaxMessages(request, `${phaseLabel} 형식 보정`);
-      parsed = parseResponse(response);
+      const repairResponse = await this.callGeminiMessages(repairRequest, `${phaseLabel} 형식 보정`);
+      parsed = parseResponse(repairResponse);
     }
 
     if (!parsed.ok) {
-      throw new Error(`MiniMax ${phaseLabel} output failed validation: ${parsed.errors.join(" | ")}`);
+      throw new Error(`Gemini ${phaseLabel} output failed validation: ${parsed.errors.join(" | ")}`);
     }
 
     return {
-      selectedProvider: "minimax",
-      provider: "minimax",
-      model: this.config.minimaxModel,
+      selectedProvider: "gemini",
+      provider: "gemini",
+      model: this.config.geminiModel,
       text: JSON.stringify(parsed.value),
       value: parsed.value,
     };
   }
 
-  private async callMiniMaxMessages(
+  private async callGeminiMessages(
     request: MiniMaxMessagesRequest,
     phaseLabel: string,
   ): Promise<unknown> {
-    const configuredBase = this.config.minimaxApiBaseUrl.replace(/\/+$/u, "");
-    const apiRoot = configuredBase.endsWith("/anthropic")
-      ? configuredBase
-      : configuredBase.replace(/\/v1$/u, "");
-    const url = apiRoot.endsWith("/anthropic")
-      ? `${apiRoot}/v1/messages`
-      : `${apiRoot}/anthropic/v1/messages`;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.config.minimaxTimeoutMs);
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Api-Key": this.config.minimaxApiKey,
-        },
-        body: JSON.stringify(request),
-        signal: controller.signal,
-      });
-      const rawText = await response.text();
-      if (!response.ok) {
-        throw new Error(`MiniMax Messages API request failed (${response.status}): ${truncate(rawText, 600)}`);
-      }
-      let parsed: any;
-      try {
-        parsed = JSON.parse(rawText);
-      } catch {
-        throw new Error(`MiniMax Messages API returned non-JSON response: ${truncate(rawText, 600)}`);
-      }
-      this.logger?.info(
-        {
-          phase: phaseLabel,
-          model: parsed?.model || this.config.minimaxModel,
-          inputTokens: Number(parsed?.usage?.input_tokens || 0),
-          outputTokens: Number(parsed?.usage?.output_tokens || 0),
-          cacheReadInputTokens: Number(parsed?.usage?.cache_read_input_tokens || 0),
-          stopReason: parsed?.stop_reason || "unknown",
-        },
-        "MiniMax review gate request completed",
-      );
-      return parsed;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
+    const systemPrompt = request.system;
+    const userPrompt = request.messages[0].content[0].text;
+    const responseJsonSchema = toGeminiResponseJsonSchema(request.tools[0].input_schema);
 
-  private minimaxGenerationConfig(kind: AiTaskKind): { temperature: number; maxCompletionTokens: number } {
-    if (kind === "answer") {
-      return { temperature: 0.3, maxCompletionTokens: 3072 };
-    }
+    const startedAt = Date.now();
+    const model = this.config.geminiModel;
 
-    return { temperature: 0.2, maxCompletionTokens: 4096 };
-  }
-
-  private runGeminiCli(prompt: string): Promise<string> {
-    const args = ["-p", "Use the prompt from stdin.", "--output-format", "json", "--skip-trust"];
-    if (this.config.geminiModel) {
-      args.push("--model", this.config.geminiModel);
-    }
-
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      CI: "true",
-      NO_COLOR: "1",
-      TERM: process.env.TERM || "xterm-256color",
-    };
-    delete env.GEMINI_API_KEY;
-    delete env.GOOGLE_API_KEY;
-
-    return this.runCommand({
-      label: "Gemini CLI",
-      command: this.config.geminiCliCommand,
-      args,
-      env,
-      stdin: prompt,
-      timeoutMs: this.config.geminiCliTimeoutMs,
-      parseOutput: (stdout, stderr) => {
-        try {
-          const parsed = JSON.parse(stdout);
-          return String(parsed.response || "").trim() || "응답을 생성하지 못했습니다.";
-        } catch {
-          throw new Error(`Gemini CLI returned non-JSON output: ${stdout || stderr}`);
-        }
+    const response = await this.ai.models.generateContent({
+      model,
+      contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+      config: {
+        systemInstruction: systemPrompt,
+        temperature: 0.2,
+        maxOutputTokens: request.max_tokens,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: "application/json",
+        responseJsonSchema,
       },
     });
+
+    const text = response.text?.trim() || "{}";
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(text);
+    } catch {
+      throw new Error(`Gemini returned invalid JSON: ${truncate(text, 600)}`);
+    }
+
+    // Keep the existing host-side strict parser as the final trust boundary.
+    const mockedResponse = {
+      type: "message",
+      role: "assistant",
+      stop_reason: "tool_use",
+      content: [
+        {
+          type: "tool_use",
+          name: "submit_review",
+          input: parsedJson,
+        },
+      ],
+      usage: {
+        input_tokens: response.usageMetadata?.promptTokenCount || 0,
+        output_tokens: response.usageMetadata?.candidatesTokenCount || 0,
+      },
+    };
+
+    this.logger?.info(
+      {
+        phase: phaseLabel,
+        model,
+        inputTokens: response.usageMetadata?.promptTokenCount || 0,
+        outputTokens: response.usageMetadata?.candidatesTokenCount || 0,
+        elapsedMs: Date.now() - startedAt,
+      },
+      "Gemini review gate request completed",
+    );
+
+    return mockedResponse;
   }
 
   private runCursorCli(prompt: string): Promise<string> {
@@ -946,6 +844,95 @@ export class GeminiClient {
   }
 }
 
+/**
+ * Gemini 3 Flash accepts the review gate's structural schema and numeric value
+ * bounds, but rejects its nested array bounds and string pattern/length keywords.
+ * The host-side parser still enforces every original constraint after generation.
+ */
+export function toGeminiResponseJsonSchema(schema: unknown): unknown {
+  if (Array.isArray(schema)) {
+    return schema.map((item) => toGeminiResponseJsonSchema(item));
+  }
+  if (!schema || typeof schema !== "object") {
+    return schema;
+  }
+
+  const source = schema as Record<string, unknown>;
+  if (Array.isArray(source.type)) {
+    return {
+      anyOf: source.type.map((type) =>
+        type === "null"
+          ? { type: "null" }
+          : toGeminiResponseJsonSchema({ ...source, type }),
+      ),
+    };
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const key of [
+    "$id",
+    "$anchor",
+    "$ref",
+    "type",
+    "format",
+    "title",
+    "description",
+    "enum",
+    "minimum",
+    "maximum",
+    "required",
+  ]) {
+    if (source[key] !== undefined) {
+      result[key] = source[key];
+    }
+  }
+
+  if (!result.type && Array.isArray(source.enum) && source.enum.length > 0) {
+    const values = source.enum;
+    if (values.every((value) => typeof value === "string")) {
+      result.type = "string";
+    } else if (values.every((value) => typeof value === "number")) {
+      result.type = "number";
+    }
+  }
+
+  if (source.items !== undefined) {
+    result.items = toGeminiResponseJsonSchema(source.items);
+  }
+  if (Array.isArray(source.prefixItems)) {
+    result.prefixItems = source.prefixItems.map((item) => toGeminiResponseJsonSchema(item));
+  }
+  if (Array.isArray(source.anyOf)) {
+    result.anyOf = source.anyOf.map((item) => toGeminiResponseJsonSchema(item));
+  }
+  if (Array.isArray(source.oneOf)) {
+    result.oneOf = source.oneOf.map((item) => toGeminiResponseJsonSchema(item));
+  }
+  if (source.properties && typeof source.properties === "object" && !Array.isArray(source.properties)) {
+    result.properties = Object.fromEntries(
+      Object.entries(source.properties as Record<string, unknown>).map(([key, value]) => [
+        key,
+        toGeminiResponseJsonSchema(value),
+      ]),
+    );
+  }
+  if (source.additionalProperties !== undefined) {
+    result.additionalProperties = typeof source.additionalProperties === "boolean"
+      ? source.additionalProperties
+      : toGeminiResponseJsonSchema(source.additionalProperties);
+  }
+  if (source.$defs && typeof source.$defs === "object" && !Array.isArray(source.$defs)) {
+    result.$defs = Object.fromEntries(
+      Object.entries(source.$defs as Record<string, unknown>).map(([key, value]) => [
+        key,
+        toGeminiResponseJsonSchema(value),
+      ]),
+    );
+  }
+
+  return result;
+}
+
 function isQuotaLikeError(message: string): boolean {
   return [
     /\b429\b/i,
@@ -968,10 +955,6 @@ function providerAlertErrorMessage(message: string): string {
   }
 
   const cleaned = normalized
-    .replace(/^Gemini CLI exited with code \d+:\s*/i, "")
-    .replace(/^MiniMax API request failed \(\d+\):\s*/i, "")
-    .replace(/^MiniMax API rejected request:\s*/i, "")
-    .replace(/^MiniMax API returned non-JSON response:\s*/i, "")
     .replace(/Warning: True color \(24-bit\) support not detected\. Using a terminal with true color enabled will result in a better visual experience\.\s*/gi, "")
     .replace(/Ripgrep is not available\. Falling back to GrepTool\.\s*/gi, "")
     .replace(/Full report available at:\s+\S+\s*/gi, "")
