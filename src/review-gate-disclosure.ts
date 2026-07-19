@@ -16,6 +16,7 @@ import type {
   ReviewGateAbstainItem,
   ReviewGateCoveredCriterion,
 } from "./review-gate-format.js";
+import type { GroundedAcceptanceTestEvidence } from "./review-acceptance-coverage.js";
 
 export type ReviewGateDisclosure = {
   coveredCriteria: ReviewGateCoveredCriterion[];
@@ -27,6 +28,7 @@ export type ReviewGateDisclosureInput = {
   explicitAcceptanceCriteria: readonly string[];
   acceptanceCoverage: readonly MiniMaxAcceptanceCoverage[];
   groundedAcceptanceCriteria: ReadonlySet<string>;
+  groundedTestEvidence?: ReadonlyMap<string, GroundedAcceptanceTestEvidence>;
   coverageValidationErrors: readonly string[];
   fatalContextComplete: boolean;
   pipeline: ReviewGatePipelineResult;
@@ -58,16 +60,15 @@ export function buildReviewGateDisclosure(
     }
     const criterionId = `AC-${index + 1}`;
     const coverage = input.acceptanceCoverage[index];
-    if (
-      input.groundedAcceptanceCriteria.has(normalizeReviewAcceptanceEvidence(criterion)) &&
-      coverage?.testEvidence
-    ) {
+    const normalizedCriterion = normalizeReviewAcceptanceEvidence(criterion);
+    const groundedEvidence = input.groundedTestEvidence?.get(normalizedCriterion);
+    if (input.groundedAcceptanceCriteria.has(normalizedCriterion) && coverage?.testEvidence) {
       coveredCriteria.push({
         criterionId,
         acceptanceCriterion: criterion,
-        file: coverage.testEvidence.file,
-        line: coverage.testEvidence.line,
-        testName: coverage.testEvidence.testName,
+        file: groundedEvidence?.file ?? coverage.testEvidence.file,
+        line: groundedEvidence?.line ?? coverage.testEvidence.line,
+        testName: groundedEvidence?.testName ?? coverage.testEvidence.testName,
       });
       continue;
     }

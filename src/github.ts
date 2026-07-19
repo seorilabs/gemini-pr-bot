@@ -274,7 +274,9 @@ export async function buildPullRequestContext(
   const fileSections: string[] = [];
   const completeFilePatchSections: Array<{ filename: string; patch: string; section: string }> = [];
   let patchChars = 0;
-  for (const file of files) {
+  // Product patches are the fatal-gate source of truth, so keep them ahead of
+  // docs/tests when the bounded patch budget cannot include every file.
+  for (const file of prioritizeChangedFilesForContext(files)) {
     const patch = file.patch || "(binary file or patch unavailable)";
     const section = [
       `### ${file.filename}`,
@@ -505,16 +507,17 @@ export async function buildPullRequestContext(
 }
 
 /**
- * Fatal review is safe only when the host has the current product source and
- * the model sees both its diff and either the full file or every changed-hunk
- * window. Deleted product files have no current-HEAD line to ground, so a
- * deletion-only product change stays conservative instead of being treated as
- * complete by vacuous truth.
+ * Fatal review is scoped to defects introduced on changed product lines. It is
+ * safe when every current product file has a complete visible patch; the model
+ * does not need the full body of a large file merely to prove that no changed
+ * line directly introduces a catastrophic outcome. Deleted product files have
+ * no current-HEAD line to ground, so a deletion-only product change stays
+ * conservative instead of being treated as complete by vacuous truth.
  */
 export function isFatalContextComplete(
   changeClass: ChangeClass,
   files: readonly any[],
-  currentHeadFileContents: Readonly<Record<string, string>>,
+  _currentHeadFileContents: Readonly<Record<string, string>>,
   visibleChangedPatches: Readonly<Record<string, string>>,
 ): boolean {
   const productFiles = files
@@ -537,11 +540,9 @@ export function isFatalContextComplete(
     return false;
   }
 
-  return currentProductFiles.every(({ filename }) => {
-    const content = currentHeadFileContents[filename];
-    const patch = visibleChangedPatches[filename];
-    return typeof content === "string" && content.length > 0 && isUsableReviewPatch(patch);
-  });
+  return currentProductFiles.every(({ filename }) =>
+    isUsableReviewPatch(visibleChangedPatches[filename]),
+  );
 }
 
 function isUsableReviewPatch(value: string | undefined): boolean {

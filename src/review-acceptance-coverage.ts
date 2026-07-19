@@ -1,6 +1,7 @@
 import type { MiniMaxAcceptanceCoverage } from "./minimax-review.js";
 import type { ReviewGateCriterion, ReviewGateTestEvidence } from "./review-gate.js";
 import {
+  isGroundedTestExecutionEvidence,
   isGroundedTestEvidence,
   type ReviewGroundingContext,
 } from "./review-grounding.js";
@@ -8,7 +9,14 @@ import {
 export type ReviewAcceptanceCoverageEvaluation = {
   complete: boolean;
   groundedAcceptanceCriteria: Set<string>;
+  groundedTestEvidence: Map<string, GroundedAcceptanceTestEvidence>;
   validationErrors: string[];
+};
+
+export type GroundedAcceptanceTestEvidence = {
+  file: string;
+  line: number;
+  testName: string;
 };
 
 const MANUAL_ACCEPTANCE_CRITERION_PATTERN =
@@ -25,6 +33,7 @@ export function evaluateReviewAcceptanceCoverage(
   coverage: readonly MiniMaxAcceptanceCoverage[],
 ): ReviewAcceptanceCoverageEvaluation {
   const groundedAcceptanceCriteria = new Set<string>();
+  const groundedTestEvidence = new Map<string, GroundedAcceptanceTestEvidence>();
   const validationErrors: string[] = [];
 
   for (let index = 0; index < explicitAcceptanceCriteria.length; index += 1) {
@@ -52,13 +61,12 @@ export function evaluateReviewAcceptanceCoverage(
       continue;
     }
 
-    const rawLine = context.currentHeadFileContents[item.testEvidence.file]
-      ?.split(/\r?\n/gu)[item.testEvidence.line - 1];
-    if (
-      rawLine === undefined ||
-      normalizeReviewAcceptanceEvidence(rawLine) !==
-        normalizeReviewAcceptanceEvidence(item.testEvidence.assertionQuote)
-    ) {
+    const groundedLine = resolveCurrentHeadEvidenceLine(
+      context.currentHeadFileContents[item.testEvidence.file],
+      item.testEvidence.assertionQuote,
+      item.testEvidence.line,
+    );
+    if (groundedLine === null) {
       validationErrors.push(`${expectedId}: test_evidence_line_not_grounded`);
       continue;
     }
@@ -72,22 +80,66 @@ export function evaluateReviewAcceptanceCoverage(
         file: item.testEvidence.file,
         testName: item.testEvidence.testName,
         assertionQuote: item.testEvidence.assertionQuote,
+        explanationKo: item.testEvidence.explanationKo,
       },
     };
     const evidence: ReviewGateTestEvidence = criterion.testEvidence!;
-    if (!isGroundedTestEvidence(context, criterion, evidence)) {
+    if (
+      !isGroundedTestEvidence(context, criterion, evidence) &&
+      !isGroundedTestExecutionEvidence(context, criterion, evidence)
+    ) {
       validationErrors.push(`${expectedId}: test_evidence_not_grounded`);
       continue;
     }
 
-    groundedAcceptanceCriteria.add(normalizeReviewAcceptanceEvidence(source));
+    const normalizedCriterion = normalizeReviewAcceptanceEvidence(source);
+    groundedAcceptanceCriteria.add(normalizedCriterion);
+    groundedTestEvidence.set(normalizedCriterion, {
+      file: item.testEvidence.file,
+      line: groundedLine,
+      testName: item.testEvidence.testName,
+    });
   }
 
   return {
     complete: validationErrors.length === 0,
     groundedAcceptanceCriteria,
+    groundedTestEvidence,
     validationErrors,
   };
+}
+
+/**
+ * Model line numbers are hints, not identity. Rebind an exact assertion quote
+ * to the current HEAD when it occurs once, while rejecting fabricated or
+ * ambiguous quotes.
+ */
+function resolveCurrentHeadEvidenceLine(
+  content: string | undefined,
+  assertionQuote: string,
+  proposedLine: number,
+): number | null {
+  if (!content) {
+    return null;
+  }
+  const expected = normalizeReviewAcceptanceEvidence(assertionQuote);
+  const lines = content.split(/\r?\n/gu);
+  const proposed = lines[proposedLine - 1];
+  if (proposed !== undefined && normalizedEvidenceLine(proposed) === normalizedEvidenceLine(expected)) {
+    return proposedLine;
+  }
+
+  const matches: number[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (normalizedEvidenceLine(lines[index] || "") === normalizedEvidenceLine(expected)) {
+      matches.push(index + 1);
+    }
+  }
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+function normalizedEvidenceLine(value: string): string {
+  return normalizeReviewAcceptanceEvidence(value).replace(/,$/u, "");
 }
 
 export function isExplicitlyManualAcceptanceCriterion(source: string): boolean {

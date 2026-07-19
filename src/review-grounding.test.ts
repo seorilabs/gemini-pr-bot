@@ -198,6 +198,102 @@ test("Godot SceneTree probe의 _run과 _check는 실패 exit가 있을 때만 �
   );
 });
 
+test("Godot _init 테스트와 조건문 기반 smoke assertion을 실행 근거로 인정한다", () => {
+  const lucidFile = "tests/draw_rules_smoke.gd";
+  const lucidSource = [
+    "extends SceneTree",
+    "var failures := 0",
+    "func _init() -> void:",
+    "\t_test_halfmove_clock_and_undo()",
+    "\t_test_fifty_move_draw()",
+    "\tquit(1 if failures > 0 else 0)",
+    "func _test_halfmove_clock_and_undo() -> void:",
+    "\t_expect(engine.halfmove_clock == 2, \"second quiet piece move increments halfmove clock\")",
+    "func _test_fifty_move_draw() -> void:",
+    "\t_expect(engine.status.get(\"reason\") == \"fifty_move\", \"fifty-move draw exposes canonical reason\")",
+    "func _expect(condition: bool, message: String) -> void:",
+    "\tif not condition:",
+    "\t\tfailures += 1",
+  ].join("\n");
+  assert.equal(
+    isGroundedTestEvidence(
+      context({ [lucidFile]: lucidSource }),
+      criterion("폰 이동과 포획은 하프무브 클록을 0으로, 그 외 수는 1씩 증가시킵니다."),
+      {
+        file: lucidFile,
+        testName: "_test_halfmove_clock_and_undo",
+        assertionQuote: '_expect(engine.halfmove_clock == 2, "second quiet piece move increments halfmove clock")',
+        explanationKo: "조용한 기물 이동 시 클록이 증가하고, 폰 이동이나 포획 시 0으로 초기화됨을 검증합니다.",
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    isGroundedTestEvidence(
+      context({ [lucidFile]: lucidSource }),
+      criterion("100 하프무브에서 fifty_move 무승부로 종료합니다."),
+      {
+        file: lucidFile,
+        testName: "_test_fifty_move_draw",
+        assertionQuote: '_expect(engine.status.get("reason") == "fifty_move", "fifty-move draw exposes canonical reason")',
+        explanationKo: "100 하프무브에서 fifty_move 사유로 무승부가 종료됨을 검증합니다.",
+      },
+    ),
+    true,
+  );
+
+  const foamFile = "godot/tests/smoke_scene.gd";
+  const foamSource = [
+    "extends SceneTree",
+    "func _initialize() -> void:",
+    "\t_run_smoke.call_deferred()",
+    "func _run_smoke() -> void:",
+    "\tif kind not in expected_dirt_by_level[gated_level]:",
+    "\t\t_fail(\"spawned locked dirt\")",
+    "func _fail(message: String) -> void:",
+    "\tquit(1)",
+  ].join("\n");
+  assert.equal(
+    isGroundedTestEvidence(
+      context({ [foamFile]: foamSource }),
+      criterion("`_spawn_dirt`가 초반 레벨에서 허용 종류만으로 type_pool을 구성한다."),
+      {
+        file: foamFile,
+        testName: "_run_smoke",
+        assertionQuote: "if kind not in expected_dirt_by_level[gated_level]:",
+        explanationKo: "실제 _spawn_dirt 결과가 초반 레벨의 허용 type_pool만 사용하는지 검증합니다.",
+      },
+    ),
+    true,
+  );
+});
+
+test("Godot test 함수의 if와 _fail 조합은 자연어 인수조건의 assertion 근거다", () => {
+  const file = "godot/tests/dirt_progression_test.gd";
+  const source = [
+    "extends SceneTree",
+    "func test_unlock_curve(DirtProgression: GDScript) -> bool:",
+    "\tvar actual := DirtProgression.allowed_types_for_level(level)",
+    "\tif actual != expected_dirt_by_level[level]:",
+    "\t\t_fail(\"unexpected dirt unlocks\")",
+    "\t\treturn false",
+    "\treturn true",
+  ].join("\n");
+  assert.equal(
+    isGroundedTestEvidence(
+      context({ [file]: source }),
+      criterion("레벨별 허용 오염 종류 커브를 정의한다."),
+      {
+        file,
+        testName: "test_unlock_curve",
+        assertionQuote: "if actual != expected_dirt_by_level[level]:",
+        explanationKo: "레벨별 허용 오염 종류 커브가 기대 목록과 같은지 검증합니다.",
+      },
+    ),
+    true,
+  );
+});
+
 test("generic declarations and cross-language semantic guesses cannot ground a criterion", () => {
   const file = "src/account.test.ts";
   const source = [

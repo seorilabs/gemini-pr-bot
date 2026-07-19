@@ -1852,6 +1852,7 @@ export class PrBot {
       explicitAcceptanceCriteria,
       acceptanceCoverage: envelope.acceptanceCoverage,
       groundedAcceptanceCriteria: coverage.groundedAcceptanceCriteria,
+      groundedTestEvidence: coverage.groundedTestEvidence,
       coverageValidationErrors: coverage.validationErrors,
       fatalContextComplete: context.fatalContextComplete,
       pipeline,
