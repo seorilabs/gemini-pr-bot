@@ -106,7 +106,7 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
-const REVIEW_GATE_PROMPT_VERSION = "host-evidence-bundles-v9-gemini";
+const REVIEW_GATE_PROMPT_VERSION = "host-evidence-call-ranges-v10-gemini";
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
@@ -2172,8 +2172,9 @@ export class PrBot {
       "review_round가 2 이상이면 Previous Seori Result와 Contributor Responses를 먼저 읽고, Changes Since Previous Seori Result에 포함된 추가 변경 및 직전 요청의 해소 여부만 조사하세요.",
       "후속 턴에서 이전 review 이후 수정되지 않은 누적 PR 코드로 새 범위를 열지 마세요. 현재 HEAD 전체 파일은 추가 변경의 최종 상태와 직전 요청 해소 여부를 확인할 때만 사용하세요.",
       "acceptance_coverage에는 Host가 준 모든 AC를 AC-1부터 순서와 원문 그대로 한 번씩 제출하세요. AC가 없으면 빈 배열입니다.",
-      "covered의 test_evidence는 Host Evidence Candidates에서 정확히 복사하세요. 후보에 없는 file/test_name/assertion_quote를 만들지 마세요.",
-      "단일 assertion이 AC 전체를 증명하면 supporting_test_evidence는 빈 배열입니다. 저장 후 복원처럼 여러 단계가 함께 증명하는 복합 AC는 같은 실행 테스트의 추가 후보를 supporting_test_evidence에 최대 3개 제출하세요.",
+      "covered의 test_evidence는 Host Evidence Candidates에서 line을 포함해 정확히 복사하세요. 멀티라인 후보의 assertion_quote는 opening line만 줄이지 말고 전체 호출을 그대로 복사하며, 후보에 없는 file/test_name/assertion_quote를 만들지 마세요.",
+      "단일 assertion이 AC 전체를 증명하면 supporting_test_evidence는 빈 배열입니다. 저장 후 복원처럼 여러 단계가 함께 증명하는 복합 AC는 같은 실행 테스트의 추가 후보를 supporting_test_evidence에 최대 3개 제출하세요. ko-KR/en-US/나머지 locale처럼 서로 다른 named test가 전체 범위를 나누어 검증하면 각 범위의 assertion 후보를 함께 제출하세요.",
+      "`pnpm check:*`, `npm test`, `actionlint` 같은 실행 명령 자체를 assertion_quote로 만들지 마세요. AC의 동작 assertion을 선택하고 current-HEAD CI 상태는 host가 별도로 검증합니다.",
       "setup 호출만 단독 근거로 내지 말고, 그 직후 동작을 확인하는 assertion 후보를 supporting_test_evidence에 함께 제출하세요.",
       "단, 함수가 특정 테이블·프로필·API를 사용하거나 호출한다는 소스 연결 조건은 그 함수의 현재 HEAD 구현 한 줄로 직접 확인할 수 있습니다. 이때 file은 소스 파일, test_name은 함수명, assertion_quote는 정확한 구현 한 줄을 복사하세요.",
       "전체 테스트 인벤토리가 불완전하거나 테스트 근거를 확정하지 못하면 missing이 아니라 unknown입니다. complete inventory에서 대응 테스트가 없을 때만 missing입니다.",

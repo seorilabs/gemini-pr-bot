@@ -67,7 +67,7 @@ export function evaluateReviewAcceptanceCoverage(
     const evidenceItems = [item.testEvidence, ...(item.supportingTestEvidence || [])];
     const uniqueEvidence = new Set(
       evidenceItems.map((evidence) =>
-        `${evidence.file}:${evidence.testName}:${normalizeReviewAcceptanceEvidence(evidence.assertionQuote)}`),
+        `${evidence.file}:${evidence.line}:${evidence.testName}:${normalizeReviewAcceptanceEvidence(evidence.assertionQuote)}`),
     );
     if (
       evidenceItems.length > 4 ||
@@ -76,13 +76,15 @@ export function evaluateReviewAcceptanceCoverage(
       validationErrors.push(`${expectedId}: test_evidence_bundle_invalid`);
       continue;
     }
-    const hostCandidates = evidenceItems.map((evidence) =>
-      context.evidenceCandidates?.find((candidate) =>
+    const hostCandidates = evidenceItems.map((evidence) => {
+      const matches = context.evidenceCandidates?.filter((candidate) =>
         candidate.file === evidence.file &&
         candidate.testName === evidence.testName &&
         normalizeReviewAcceptanceEvidence(candidate.quote) ===
-          normalizeReviewAcceptanceEvidence(evidence.assertionQuote)),
-    );
+          normalizeReviewAcceptanceEvidence(evidence.assertionQuote));
+      return matches?.find((candidate) => candidate.line === evidence.line) ||
+        (matches?.length === 1 ? matches[0] : undefined);
+    });
     if (context.evidenceCandidates && hostCandidates.some((candidate) => !candidate)) {
       validationErrors.push(`${expectedId}: test_evidence_not_in_host_inventory`);
       continue;
@@ -106,6 +108,7 @@ export function evaluateReviewAcceptanceCoverage(
     };
     const gateEvidence: ReviewGateTestEvidence[] = evidenceItems.map((evidence) => ({
       file: evidence.file,
+      line: evidence.line,
       testName: evidence.testName,
       assertionQuote: evidence.assertionQuote,
       explanationKo: evidence.explanationKo,
@@ -196,8 +199,21 @@ function resolveCurrentHeadEvidenceLine(
     if (normalizedEvidenceLine(lines[index] || "") === normalizedEvidenceLine(expected)) {
       matches.push(index + 1);
     }
+    const collected: string[] = [];
+    for (let end = index; end < Math.min(lines.length, index + 80); end += 1) {
+      collected.push((lines[end] || "").trim());
+      const actual = normalizedEvidenceLine(collected.join("\n"));
+      if (actual === normalizedEvidenceLine(expected)) {
+        matches.push(index + 1);
+        break;
+      }
+      if (actual.length > normalizedEvidenceLine(expected).length || collected.join("\n").length > 2_000) {
+        break;
+      }
+    }
   }
-  return matches.length === 1 ? matches[0]! : null;
+  const uniqueMatches = [...new Set(matches)];
+  return uniqueMatches.length === 1 ? uniqueMatches[0]! : null;
 }
 
 function normalizedEvidenceLine(value: string): string {
@@ -220,6 +236,10 @@ function compositeAcceptanceValidationError(
   evidence: readonly ReviewGateTestEvidence[],
 ): string | null {
   const normalizedSource = normalizeReviewAcceptanceEvidence(source);
+  const localeCoverageError = localeCatalogCoverageValidationError(normalizedSource, evidence);
+  if (localeCoverageError) {
+    return localeCoverageError;
+  }
   const requiresPlanOutputs =
     /\bplan\s*\(/iu.test(normalizedSource) &&
     /\bsim(?:_seconds)?\s*=\s*28800/iu.test(normalizedSource) &&
@@ -240,6 +260,35 @@ function compositeAcceptanceValidationError(
     return "test_evidence_missing_sim_assertion";
   }
   return hasRolloverAssertion ? null : "test_evidence_missing_rollover_assertion";
+}
+
+function localeCatalogCoverageValidationError(
+  normalizedSource: string,
+  evidence: readonly ReviewGateTestEvidence[],
+): string | null {
+  const requiresEightLocaleCatalogs =
+    /ko-kr/iu.test(normalizedSource) &&
+    /en-us/iu.test(normalizedSource) &&
+    /(?:나머지\s*6|6개\s*로케일|8개\s*로케일|remaining\s+6|eight\s+locales?)/iu.test(normalizedSource) &&
+    /(?:catalog|카탈로그|로케일)/iu.test(normalizedSource);
+  if (!requiresEightLocaleCatalogs) {
+    return null;
+  }
+
+  const evidenceText = evidence.map((item) => normalizeReviewAcceptanceEvidence(
+    `${item.testName} ${item.assertionQuote} ${item.explanationKo || ""}`,
+  ));
+  if (!evidenceText.some((text) => /(?:ko-kr|kofarmmessages|한국어)/iu.test(text))) {
+    return "test_evidence_missing_ko_kr_catalog_assertion";
+  }
+  if (!evidenceText.some((text) => /(?:en-us|enfarmmessages|영어)/iu.test(text))) {
+    return "test_evidence_missing_en_us_catalog_assertion";
+  }
+  if (!evidenceText.some((text) =>
+    /(?:나머지\s*6|6개\s*로케일|othercatalogs|ja\/zh|zh-hans|zhhansfarmmessages)/iu.test(text))) {
+    return "test_evidence_missing_remaining_locale_catalog_assertion";
+  }
+  return null;
 }
 
 /**

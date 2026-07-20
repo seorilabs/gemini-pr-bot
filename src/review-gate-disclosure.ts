@@ -171,6 +171,12 @@ function coverageAbstainReason(code: string | undefined): string {
       return "제시된 테스트 묶음에 정산 계획의 sim 결과가 28800인지 확인하는 assertion이 없습니다.";
     case "test_evidence_missing_rollover_assertion":
       return "제시된 테스트 묶음은 sim=28800만 확인하고, 같은 계획의 rollover=0은 assertion하지 않습니다.";
+    case "test_evidence_missing_ko_kr_catalog_assertion":
+      return "제시된 테스트 묶음에 ko-KR 카탈로그의 신규 라벨을 확인하는 assertion이 없습니다.";
+    case "test_evidence_missing_en_us_catalog_assertion":
+      return "제시된 테스트 묶음에 en-US 카탈로그의 신규 라벨을 확인하는 assertion이 없습니다.";
+    case "test_evidence_missing_remaining_locale_catalog_assertion":
+      return "제시된 테스트 묶음에 나머지 로케일 카탈로그의 신규 라벨을 확인하는 assertion이 없습니다.";
     case "acceptance_coverage_identity_mismatch":
       return "자동 검증 결과가 이 인수조건의 ID와 원문에 정확히 대응하지 않았습니다.";
     default:
@@ -190,6 +196,12 @@ function coverageRequiredAction(code: string | undefined, criterionId: string): 
       return `${criterionId}의 같은 plan 결과에서 sim_seconds == 28800을 확인하는 assertion을 추가하거나 정확한 현재 위치를 알려 주세요.`;
     case "test_evidence_missing_rollover_assertion":
       return `${criterionId}의 같은 plan 결과에서 rollover_seconds == 0을 확인하는 assertion을 추가하고 supporting evidence로 함께 제시해 주세요.`;
+    case "test_evidence_missing_ko_kr_catalog_assertion":
+      return `${criterionId}의 ko-KR 카탈로그 라벨 assertion을 supporting evidence로 함께 제시해 주세요.`;
+    case "test_evidence_missing_en_us_catalog_assertion":
+      return `${criterionId}의 en-US 카탈로그 라벨 assertion을 supporting evidence로 함께 제시해 주세요.`;
+    case "test_evidence_missing_remaining_locale_catalog_assertion":
+      return `${criterionId}의 나머지 로케일 카탈로그 라벨 assertion 또는 전체 로케일 반복 검증을 supporting evidence로 함께 제시해 주세요.`;
     case "acceptance_coverage_missing":
     case "acceptance_coverage_unknown":
     case "test_evidence_required":
