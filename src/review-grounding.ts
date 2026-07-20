@@ -69,7 +69,7 @@ const PRODUCT_SOURCE_EXTENSIONS = new Set([
 const TEST_BASENAME_PATTERN =
   /(?:^|[._-])(?:test|spec|probe|smoke|check|validate|verify|acceptance|regression|assert|gate)(?:[._-]|$)|(?:tests?|specs?)\.[^.]+$/iu;
 const ASSERTION_PATTERN =
-  /(?:(?:\b|_)(?:assert\w*|xctassert\w*)\s*(?:[.(]|!\s*\()|\bassert\s+\S|(?:\b|_)expect\s*\([^)]*\)\s*(?:\.|\bto\b)|(?:\b|_)(?:expect|should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\s*(?:[.(]|!\s*\()|\.to(?:be|equal|match|throw|contain|have)\w*\s*\()/iu;
+  /(?:(?:\b|_)(?:assert\w*|xctassert\w*)\s*(?:[.(]|!\s*\()|\bassert\s+\S|(?:\b|_)expect(?:_\w+)*\s*\([^)]*\)\s*(?:\.|\bto\b)|(?:\b|_)(?:expect(?:_\w+)*|should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\s*(?:[.(]|!\s*\()|\.to(?:be|equal|match|throw|contain|have)\w*\s*\()/iu;
 const GENERIC_TEST_NAMES = new Set([
   "check",
   "describe",
@@ -1555,7 +1555,7 @@ function isSkippedTestDeclaration(file: string, lines: string[], index: number):
 
 function hasExecutableAssertionLine(lines: string[], assertion: string): boolean {
   const lead = assertion.match(
-    /(?:\b|_)(assert\w*|xctassert\w*|expect|should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\b/iu,
+    /(?:\b|_)(assert\w*|xctassert\w*|expect(?:_\w+)*|should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\b/iu,
   )?.[1];
   const span = findEvidenceSpan(lines, assertion);
   if (!span) {
