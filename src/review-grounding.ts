@@ -1501,12 +1501,17 @@ function canonicalExplicitIdentifier(value: string): string {
 }
 
 function signatureIdentifierMatches(token: string, canonicalEvidence: string): boolean {
-  const placeholderSignature = token.match(
-    /^([A-Za-z_]\w*)\((?:[A-Za-z_]\w*(?::[A-Za-z_]\w*)?)(?:,[A-Za-z_]\w*(?::[A-Za-z_]\w*)?)*\)$/u,
-  );
-  return Boolean(
-    placeholderSignature && canonicalEvidence.includes(`${placeholderSignature[1]}(`),
-  );
+  const call = token.match(/^(?:([A-Za-z_]\w*)\.)?([A-Za-z_]\w*)\((.*)\)$/u);
+  if (!call || !canonicalEvidence.includes(`${call[2]}(`)) {
+    return false;
+  }
+  const owner = (call[1] || "").replace(/_/gu, "").toLowerCase();
+  const compactEvidence = canonicalEvidence.replace(/[^A-Za-z0-9]/gu, "").toLowerCase();
+  if (owner && !compactEvidence.includes(owner)) {
+    return false;
+  }
+  const numericLiterals = call[3]!.match(/\d+(?:\.\d+)?/gu) || [];
+  return numericLiterals.every((literal) => canonicalEvidence.includes(literal));
 }
 
 function koreanTokens(value: string): Set<string> {

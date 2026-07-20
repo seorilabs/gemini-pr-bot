@@ -110,6 +110,14 @@ export function evaluateReviewAcceptanceCoverage(
       assertionQuote: evidence.assertionQuote,
       explanationKo: evidence.explanationKo,
     }));
+    const compositeValidationError = compositeAcceptanceValidationError(
+      source,
+      gateEvidence,
+    );
+    if (compositeValidationError) {
+      validationErrors.push(`${expectedId}: ${compositeValidationError}`);
+      continue;
+    }
     const groundedKinds = gateEvidence.map((evidence) => {
       const criterion: ReviewGateCriterion = { ...criterionBase, testEvidence: evidence };
       if (
@@ -205,6 +213,33 @@ export function isExplicitlyManualAcceptanceCriterion(source: string): boolean {
 
 export function normalizeReviewAcceptanceEvidence(value: string): string {
   return value.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase();
+}
+
+function compositeAcceptanceValidationError(
+  source: string,
+  evidence: readonly ReviewGateTestEvidence[],
+): string | null {
+  const normalizedSource = normalizeReviewAcceptanceEvidence(source);
+  const requiresPlanOutputs =
+    /\bplan\s*\(/iu.test(normalizedSource) &&
+    /\bsim(?:_seconds)?\s*=\s*28800/iu.test(normalizedSource) &&
+    /\brollover(?:_seconds)?\s*=\s*0/iu.test(normalizedSource);
+  if (!requiresPlanOutputs) {
+    return null;
+  }
+  const assertionLines = evidence
+    .map((item) => normalizeReviewAcceptanceEvidence(item.assertionQuote))
+    .filter((line) => /(?:\b|_)(?:assert\w*|expect|check\w*)\s*\(/iu.test(line));
+  const hasSimAssertion = assertionLines.some((line) =>
+    /\bsim(?:_seconds|_\w*)?\b/iu.test(line) &&
+    /(?:==|equal\w*\s*\().*\b28800(?:\.0)?\b/iu.test(line));
+  const hasRolloverAssertion = assertionLines.some((line) =>
+    /\brollover(?:_seconds|_\w*)?\b/iu.test(line) &&
+    /(?:==|equal\w*\s*\().*\b0(?:\.0)?\b/iu.test(line));
+  if (!hasSimAssertion) {
+    return "test_evidence_missing_sim_assertion";
+  }
+  return hasRolloverAssertion ? null : "test_evidence_missing_rollover_assertion";
 }
 
 /**

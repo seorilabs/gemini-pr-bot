@@ -167,6 +167,10 @@ function coverageAbstainReason(code: string | undefined): string {
       return "제시된 테스트 위치와 코드가 현재 HEAD의 실제 테스트 파일과 일치하지 않았습니다.";
     case "test_evidence_not_grounded":
       return "제시된 테스트가 이 인수조건을 실제로 검증한다고 확인하지 못했습니다.";
+    case "test_evidence_missing_sim_assertion":
+      return "제시된 테스트 묶음에 정산 계획의 sim 결과가 28800인지 확인하는 assertion이 없습니다.";
+    case "test_evidence_missing_rollover_assertion":
+      return "제시된 테스트 묶음은 sim=28800만 확인하고, 같은 계획의 rollover=0은 assertion하지 않습니다.";
     case "acceptance_coverage_identity_mismatch":
       return "자동 검증 결과가 이 인수조건의 ID와 원문에 정확히 대응하지 않았습니다.";
     default:
@@ -182,6 +186,10 @@ function coverageRequiredAction(code: string | undefined, criterionId: string): 
       return `${criterionId}을 검증하는 현재 HEAD의 실제 assertion 위치를 댓글로 알려 주거나 해당 테스트를 보정해 주세요.`;
     case "test_evidence_not_grounded":
       return `${criterionId} 전체를 직접 검증하는 assertion과 실행 경로를 댓글로 알려 주거나, 직접 검증하는 테스트를 추가해 주세요.`;
+    case "test_evidence_missing_sim_assertion":
+      return `${criterionId}의 같은 plan 결과에서 sim_seconds == 28800을 확인하는 assertion을 추가하거나 정확한 현재 위치를 알려 주세요.`;
+    case "test_evidence_missing_rollover_assertion":
+      return `${criterionId}의 같은 plan 결과에서 rollover_seconds == 0을 확인하는 assertion을 추가하고 supporting evidence로 함께 제시해 주세요.`;
     case "acceptance_coverage_missing":
     case "acceptance_coverage_unknown":
     case "test_evidence_required":

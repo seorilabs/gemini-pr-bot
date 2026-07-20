@@ -758,3 +758,70 @@ test("동일 HEAD에서 host가 검증한 AC PASS는 이후 모델의 unknown으
     [current],
   );
 });
+
+test("plan 결과의 sim과 rollover를 모두 요구하는 AC는 두 assertion을 함께 검증한다", () => {
+  const criterion =
+    "`offline_settlement.plan()`이 8시간 이상 부재를 정산 구간으로 반영하는 단위 테스트가 추가된다 (`core_probe.gd` — `plan(28800, cap)` → sim=28800, rollover=0).";
+  const file = "tools/core_probe.gd";
+  const setup =
+    'var plan_8h := OfflineSettlementUseCase.plan(28800.0, Consts.MAX_OFFLINE_SECONDS)';
+  const simAssertion =
+    '_check(float(plan_8h.get("sim_seconds", 0.0)) == 28800.0, "AC-2: sim_seconds == 28800")';
+  const rolloverAssertion =
+    '_check(float(plan_8h.get("rollover_seconds", -1.0)) == 0.0, "AC-2: rollover_seconds == 0")';
+  const source = [
+    "extends SceneTree",
+    'const OfflineSettlementUseCase := preload("res://domain/offline_settlement.gd")',
+    'const Consts := preload("res://domain/constants.gd")',
+    "var failures := 0",
+    "func _init() -> void:",
+    "\t_run()",
+    "func _run() -> void:",
+    `\t${setup}`,
+    `\t${simAssertion}`,
+    `\t${rolloverAssertion}`,
+    "\tquit(1 if failures > 0 else 0)",
+  ].join("\n");
+  const candidates = buildReviewEvidenceCandidates(
+    { [file]: source },
+    { acceptanceCriteria: [criterion] },
+  );
+  const evidence = (quote: string) => {
+    const candidate = candidates.find((item) => item.quote === quote);
+    assert.ok(candidate, quote);
+    return {
+      file: candidate.file,
+      line: candidate.line,
+      testName: candidate.testName,
+      assertionQuote: candidate.quote,
+      explanationKo: "Host가 추출한 current HEAD 근거입니다.",
+    };
+  };
+  const groundedContext: ReviewGroundingContext = {
+    currentHeadFileContents: { [file]: source },
+    visibleChangedPatches: {},
+    evidenceCandidates: candidates,
+  };
+
+  const incomplete = evaluateReviewAcceptanceCoverage(
+    groundedContext,
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: evidence(simAssertion),
+      supportingTestEvidence: [evidence(setup)],
+    })],
+  );
+  const complete = evaluateReviewAcceptanceCoverage(
+    groundedContext,
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: evidence(simAssertion),
+      supportingTestEvidence: [evidence(setup), evidence(rolloverAssertion)],
+    })],
+  );
+
+  assert.deepEqual(incomplete.validationErrors, [
+    "AC-1: test_evidence_missing_rollover_assertion",
+  ]);
+  assert.equal(complete.complete, true, JSON.stringify(complete.validationErrors));
+});
