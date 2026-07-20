@@ -456,7 +456,7 @@ export class MysqlWorkflowStore {
       [repoFullName, prNumber, headSha, promptVersion, contextSha256],
     );
     const row = rows[0];
-    if (!row || !["PASS", "FAIL", "ABSTAIN"].includes(row.verdict)) {
+    if (!row || !["PASS", "FAIL", "FOLLOW_UP", "ABSTAIN"].includes(row.verdict)) {
       return null;
     }
     return {

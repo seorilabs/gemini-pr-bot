@@ -2,7 +2,11 @@ import type { Config } from "./config.js";
 import { buildDeepRepoContext, classifyChange, type ChangeClass } from "./repo-context.js";
 import { isNonProductFatalPath } from "./review-grounding.js";
 import { githubCommentBody, truncate } from "./text.js";
-import { bodyIncludesBotStatusMarker } from "./identity.js";
+import {
+  BOT_GITHUB_LOGIN,
+  LEGACY_BOT_GITHUB_LOGIN,
+  bodyIncludesBotStatusMarker,
+} from "./identity.js";
 
 type Octokit = any;
 
@@ -88,6 +92,18 @@ export type PullRequestContext = PullRequestStatus & {
   changeClass: ChangeClass;
   minimumAcceptanceCriteria: number;
   explicitAcceptanceCriteria: readonly string[];
+  reviewFollowUp: ReviewFollowUpContext;
+};
+
+export type ReviewFollowUpContext = {
+  /** One-based review turn. A PR without a prior published Seori result is turn 1. */
+  reviewRound: number;
+  previousReviewHeadSha: string | null;
+  previousReviewBody: string;
+  previousReviewAt: string | null;
+  contributorResponses: string;
+  changesSincePreviousReview: string;
+  changesSincePreviousReviewComplete: boolean;
 };
 
 export type PullRequestContextOptions = {
@@ -339,6 +355,23 @@ export async function buildPullRequestContext(
     .join("\n");
 
   const conversationState = buildConversationState(pr.head.sha, issueComments, reviewComments, reviews);
+  const reviewFollowUpHistory = buildReviewFollowUpHistory(
+    issueComments,
+    reviewComments,
+    reviews,
+  );
+  const followUpChanges = await buildChangesSincePreviousReview(
+    octokit,
+    repo,
+    pr.head.sha,
+    commits,
+    reviewFollowUpHistory.previousReviewHeadSha,
+  );
+  const reviewFollowUp: ReviewFollowUpContext = {
+    ...reviewFollowUpHistory,
+    changesSincePreviousReview: followUpChanges.markdown,
+    changesSincePreviousReviewComplete: followUpChanges.complete,
+  };
   const trustedAcceptanceSources = buildTrustedAcceptanceSourceText(
     pr,
     issueComments,
@@ -347,12 +380,24 @@ export async function buildPullRequestContext(
     config,
   );
   const acceptanceSourceText = trustedAcceptanceSources.text;
-  const changeClass = classifyChange(files.map((file: any) => String(file.filename || "")));
+  const isFollowUpReview = reviewFollowUp.reviewRound > 1;
+  const reviewFiles = isFollowUpReview ? followUpChanges.files : files;
+  const reviewPatchSections = isFollowUpReview
+    ? followUpChanges.sections
+    : completeFilePatchSections;
+  const reviewFileNames = new Set(reviewFiles.map((file: any) => String(file.filename || "")));
+  const changeClass = classifyChange(reviewFiles.map((file: any) => String(file.filename || "")));
   const gateChangedFilePatches = truncate(
-    fileSections.join("\n\n") || "(none)",
+    reviewPatchSections.map(({ section }) => section).join("\n\n") || "(none)",
     Math.min(config.maxPatchChars, MAX_REVIEW_GATE_PATCH_CHARS),
   );
-  const gateChangedFileContents = changedFileContents || "(none)";
+  const gateChangedFileContents = changedFileContentResult.evidence
+    .filter(({ filename }) => !isFollowUpReview || reviewFileNames.has(filename))
+    .map(({ section }) => section)
+    .join("\n\n") || "(none)";
+  const followUpChangeSummary = isFollowUpReview && followUpChanges.files.length > 0
+    ? `${followUpChanges.files.length} file(s) changed since the previous Seori result. Exact incremental patches are in the Changed Files section below.`
+    : reviewFollowUp.changesSincePreviousReview;
 
   const markdown = [
     "# Pull Request Context",
@@ -410,11 +455,10 @@ export async function buildPullRequestContext(
     fileSections.join("\n\n") || "(none)",
   ].join("\n");
 
-  // The conservative merge gate intentionally excludes prior bot reviews and
-  // bot-generated comments. Feeding Seori's own findings back into the next
-  // round anchored weaker models on earlier false positives and made them recur.
-  // Only explicit PR/maintainer acceptance sources plus current HEAD evidence
-  // are available in this reduced context.
+  // The conservative merge gate includes only the latest published Seori
+  // result, the Contributor responses after it, and the incremental compare
+  // diff. Older bot prose remains excluded so stale findings do not anchor the
+  // next review or reopen already settled scope.
   const reviewGateMarkdown = [
     "# Pull Request Merge Gate Context",
     "",
@@ -433,6 +477,19 @@ export async function buildPullRequestContext(
     "## Trusted Acceptance Sources",
     "Acceptance criteria and source_quote values may be derived ONLY from this section.",
     acceptanceSourceText,
+    "",
+    "## Review Turn Context",
+    `review_round: ${reviewFollowUp.reviewRound}`,
+    `previous_review_head: ${reviewFollowUp.previousReviewHeadSha || "(none - first review turn)"}`,
+    "",
+    "### Previous Seori Result",
+    reviewFollowUp.previousReviewBody || "(none - first review turn)",
+    "",
+    "### Contributor Responses Since Previous Seori Result",
+    reviewFollowUp.contributorResponses || "(none)",
+    "",
+    "### Changes Since Previous Seori Result",
+    followUpChangeSummary,
     "",
     "## Changed Files",
     gateChangedFilePatches,
@@ -459,8 +516,11 @@ export async function buildPullRequestContext(
   );
   const visibleChangedFileContents = Object.fromEntries(
     changedFileContentResult.evidence
-      .filter(({ content, section, contextComplete }) =>
-        Boolean(content) && contextComplete && truncatedReviewGateMarkdown.includes(section))
+      .filter(({ filename, content, section, contextComplete }) =>
+        Boolean(content) &&
+        contextComplete &&
+        (!isFollowUpReview || reviewFileNames.has(filename)) &&
+        truncatedReviewGateMarkdown.includes(section))
       .map(({ filename, content }) => [filename, content as string]),
   );
   const visibleCurrentHeadFileContents = {
@@ -468,16 +528,17 @@ export async function buildPullRequestContext(
     ...visibleChangedFileContents,
   };
   const visibleChangedPatches = Object.fromEntries(
-    completeFilePatchSections
+    reviewPatchSections
       .filter(({ section }) => truncatedReviewGateMarkdown.includes(section))
       .map(({ filename, patch }) => [filename, patch]),
   );
-  const fatalContextComplete = isFatalContextComplete(
-    changeClass,
-    files,
-    visibleCurrentHeadFileContents,
-    visibleChangedPatches,
-  );
+  const fatalContextComplete = reviewFollowUp.changesSincePreviousReviewComplete &&
+    isFatalContextComplete(
+      changeClass,
+      reviewFiles,
+      visibleCurrentHeadFileContents,
+      visibleChangedPatches,
+    );
 
   return {
     state: String(pr.state || "unknown"),
@@ -503,7 +564,184 @@ export async function buildPullRequestContext(
     changeClass,
     minimumAcceptanceCriteria: trustedAcceptanceSources.minimumCriteria,
     explicitAcceptanceCriteria: trustedAcceptanceSources.criteria,
+    reviewFollowUp,
   };
+}
+
+type ReviewConversationEntry = {
+  body: string;
+  authorLogin: string;
+  authorType: string;
+  createdAt: string;
+  location: string;
+};
+
+/**
+ * Keeps only the latest published Seori result and the contributor response
+ * after it. Older bot prose is intentionally excluded so follow-up reviews do
+ * not reopen settled scope or anchor on stale findings.
+ */
+export function buildReviewFollowUpHistory(
+  issueComments: any[],
+  reviewComments: any[],
+  reviews: any[],
+): Omit<ReviewFollowUpContext, "changesSincePreviousReview" | "changesSincePreviousReviewComplete"> {
+  const entries: ReviewConversationEntry[] = [
+    ...issueComments.map((entry: any) => conversationEntry(entry, "PR comment")),
+    ...reviewComments.map((entry: any) =>
+      conversationEntry(entry, `review comment ${entry.path || "unknown"}:${entry.line ?? entry.original_line ?? "?"}`)),
+    ...reviews.map((entry: any) => conversationEntry(entry, "pull request review")),
+  ].sort((left, right) => timestamp(left.createdAt) - timestamp(right.createdAt));
+
+  const priorResults = entries.filter((entry) =>
+    isSeoriAuthor(entry.authorLogin) && isPublishedReviewResult(entry.body),
+  );
+  const previous = priorResults.at(-1);
+  const previousReviewHeadSha = previous ? reviewResultHead(previous.body) : null;
+  const previousAt = previous?.createdAt || null;
+  const contributorEntries = previous
+    ? entries.filter((entry) =>
+        !isSeoriAuthor(entry.authorLogin) &&
+        entry.authorType.toLowerCase() !== "bot" &&
+        timestamp(entry.createdAt) > timestamp(previous.createdAt) &&
+        entry.body.trim().length > 0)
+    : [];
+  const contributorResponses = contributorEntries
+    .slice(-20)
+    .map((entry) =>
+      `- ${entry.authorLogin || "unknown"} (${entry.location}, ${entry.createdAt || "unknown-time"}): ${truncate(entry.body, 1_500)}`)
+    .join("\n");
+
+  return {
+    reviewRound: priorResults.length + 1,
+    previousReviewHeadSha:
+      previousReviewHeadSha && /^[0-9a-f]{7,64}$/iu.test(previousReviewHeadSha)
+        ? previousReviewHeadSha
+        : null,
+    previousReviewBody: previous ? truncate(previous.body, 6_000) : "",
+    previousReviewAt: previousAt,
+    contributorResponses,
+  };
+}
+
+function conversationEntry(entry: any, location: string): ReviewConversationEntry {
+  return {
+    body: String(entry.body || ""),
+    authorLogin: String(entry.user?.login || ""),
+    authorType: String(entry.user?.type || ""),
+    createdAt: String(entry.created_at || entry.submitted_at || entry.updated_at || ""),
+    location,
+  };
+}
+
+function isSeoriAuthor(login: string): boolean {
+  const normalized = login.toLowerCase().replace(/\[bot\]$/u, "");
+  return normalized === BOT_GITHUB_LOGIN || normalized === LEGACY_BOT_GITHUB_LOGIN;
+}
+
+function isPublishedReviewResult(body: string): boolean {
+  return (["action-required", "review-deferred", "no-action-required"] as const).some((status) =>
+    bodyIncludesBotStatusMarker(body, status),
+  );
+}
+
+function reviewResultHead(body: string): string | null {
+  for (const line of body.split(/\r?\n/gu)) {
+    if (!isPublishedReviewResult(line)) {
+      continue;
+    }
+    return line.match(/\bhead=([0-9a-f]{7,64})\b/iu)?.[1] || null;
+  }
+  return null;
+}
+
+function timestamp(value: string): number {
+  return Date.parse(value) || 0;
+}
+
+async function buildChangesSincePreviousReview(
+  octokit: Octokit,
+  repo: RepoRef,
+  currentHeadSha: string,
+  commits: any[],
+  previousReviewHeadSha: string | null,
+): Promise<{
+  markdown: string;
+  complete: boolean;
+  files: any[];
+  sections: Array<{ filename: string; patch: string; section: string }>;
+}> {
+  if (!previousReviewHeadSha) {
+    return {
+      markdown: "(first review turn - inspect the PR diff against the base branch)",
+      complete: true,
+      files: [],
+      sections: [],
+    };
+  }
+  if (previousReviewHeadSha === currentHeadSha) {
+    return {
+      markdown: "(no new commit - inspect only the contributor response against the previous Seori result)",
+      complete: true,
+      files: [],
+      sections: [],
+    };
+  }
+  const commitShas = new Set(commits.map((commit: any) => String(commit.sha || "")));
+  if (!commitShas.has(previousReviewHeadSha)) {
+    return {
+      markdown: "(previous reviewed HEAD is no longer in the PR commit history; use the current diff and contributor response without reopening settled scope)",
+      complete: false,
+      files: [],
+      sections: [],
+    };
+  }
+
+  try {
+    const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
+      owner: repo.owner,
+      repo: repo.repo,
+      basehead: `${previousReviewHeadSha}...${currentHeadSha}`,
+      per_page: 100,
+    });
+    const files = Array.isArray(data.files) ? prioritizeChangedFilesForContext(data.files) : [];
+    if (files.length === 0) {
+      return {
+        markdown: "(no changed files since the previous Seori result)",
+        complete: true,
+        files: [],
+        sections: [],
+      };
+    }
+    const sections = files.map((file: any) => {
+      const filename = String(file.filename || "unknown");
+      const patch = String(file.patch || "(binary file or patch unavailable)");
+      return {
+        filename,
+        patch,
+        section: [
+          `### ${filename}`,
+          `status=${String(file.status || "unknown")} additions=${Number(file.additions || 0)} deletions=${Number(file.deletions || 0)}`,
+          "```diff",
+          patch,
+          "```",
+        ].join("\n"),
+      };
+    });
+    return {
+      markdown: truncate(sections.map(({ section }) => section).join("\n\n"), 50_000),
+      complete: true,
+      files,
+      sections,
+    };
+  } catch {
+    return {
+      markdown: "(GitHub compare context unavailable; use the contributor response and current HEAD only, and do not reopen unrelated settled scope)",
+      complete: false,
+      files: [],
+      sections: [],
+    };
+  }
 }
 
 /**

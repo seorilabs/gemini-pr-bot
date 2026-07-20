@@ -73,6 +73,7 @@ import {
   type ReviewGatePublicVerdict,
 } from "./review-gate-format.js";
 import { buildReviewGateDisclosure } from "./review-gate-disclosure.js";
+import { resolveReviewTurnVerdict } from "./review-turn.js";
 import { evaluateReviewAcceptanceCoverage } from "./review-acceptance-coverage.js";
 import {
   REVIEW_GATE_CACHE_SCHEMA_VERSION,
@@ -99,7 +100,7 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
-const REVIEW_GATE_PROMPT_VERSION = "conservative-merge-gate-v6-gemini";
+const REVIEW_GATE_PROMPT_VERSION = "active-follow-up-gate-v7-gemini";
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
@@ -1659,7 +1660,7 @@ export class PrBot {
   }
 
   // Conservative merge gate. The model extracts evidence; strict parsing,
-  // grounding and the final PASS/FAIL/ABSTAIN decision remain host-controlled.
+  // grounding and the final PASS/FAIL/FOLLOW_UP/ABSTAIN decision remain host-controlled.
   private async runStructuredReview(
     octokit: Octokit,
     repo: RepoRef,
@@ -1748,12 +1749,16 @@ export class PrBot {
       );
       const output = formatReviewGateCheckOutput({
         headSha: context.headSha,
-        verdict: "ABSTAIN",
-        htmlMarkers: [`${REVIEW_DEFERRED_MARKER} head=${context.headSha}`],
-        abstainSummaryKo: "자동 검증을 완료하지 못해 GitHub approval을 제출하지 않습니다. 판정 보류 범위는 사람에게 handoff합니다.",
+        verdict: "FOLLOW_UP",
+        htmlMarkers: [
+          `${ACTION_REQUIRED_MARKER} kind=review-follow-up head=${context.headSha} round=${context.reviewFollowUp.reviewRound}`,
+        ],
+        followUpSummaryKo: "자동 검증을 완료하지 못했습니다. 코드 변경이 필요하지 않더라도 댓글의 재검토 방법으로 후속 대응해 주세요.",
         abstainItems: [{
           label: "자동 검증 실행",
           reason: "모델 응답 또는 검증 처리에 실패해 현재 HEAD의 세부 판정을 완료하지 못했습니다.",
+          requiredAction: "코드 수정은 필요하지 않습니다. 이 댓글에 `@seori /review`로 현재 HEAD 재검토를 한 번 요청해 주세요.",
+          peripheral: false,
         }],
       });
       await this.recordReviewGateRun(
@@ -1765,10 +1770,14 @@ export class PrBot {
         contextHash,
         prompts,
         null,
-        "ABSTAIN",
+        "FOLLOW_UP",
         [error instanceof Error ? error.message : String(error)],
       );
-      await this.completeTrackedCheck(check, output.conclusion, output.title, output.text);
+      const latest = await this.currentStatusForPublish(octokit, repo, prNumber, context.headSha, check);
+      if (latest) {
+        await postPrComment(octokit, repo, prNumber, output.text);
+        await this.completeTrackedCheck(check, output.conclusion, output.title, output.text);
+      }
       return;
     }
 
@@ -1840,12 +1849,12 @@ export class PrBot {
         const verification = envelope.verifications.find((item) => item.candidateId === rejected.candidateId);
         return verification?.verdict === "uncertain";
       });
-    const verdict: ReviewGatePublicVerdict = blockingOpenFindings.length > 0
+    const baseVerdict: Exclude<ReviewGatePublicVerdict, "FOLLOW_UP"> = blockingOpenFindings.length > 0
       ? "FAIL"
       : hasUnresolvedValidation
         ? "ABSTAIN"
         : "PASS";
-    const publicFindings = verdict === "FAIL"
+    const publicFindings = baseVerdict === "FAIL"
       ? this.reviewGatePublicFindings(blockingOpenFindings, publicByFingerprint, context)
       : [];
     const disclosure = buildReviewGateDisclosure({
@@ -1860,6 +1869,11 @@ export class PrBot {
       verifications: envelope.verifications,
       unconfirmedOpenFindings,
     });
+    const verdict = resolveReviewTurnVerdict(
+      baseVerdict,
+      context.reviewFollowUp.reviewRound,
+      disclosure.abstainItems,
+    );
     const output = formatReviewGateCheckOutput({
       headSha: context.headSha,
       verdict,
@@ -1869,12 +1883,15 @@ export class PrBot {
           ? `${ACTION_REQUIRED_MARKER} kind=review-gate head=${context.headSha}`
           : verdict === "PASS"
             ? `${NO_ACTION_REQUIRED_MARKER} head=${context.headSha}`
-            : `${REVIEW_DEFERRED_MARKER} head=${context.headSha}`,
+            : verdict === "FOLLOW_UP"
+              ? `${ACTION_REQUIRED_MARKER} kind=review-follow-up head=${context.headSha} round=${context.reviewFollowUp.reviewRound}`
+              : `${REVIEW_DEFERRED_MARKER} head=${context.headSha} round=${context.reviewFollowUp.reviewRound}`,
       ],
       passSummaryKo: explicitAcceptanceCriteria.length === 0
         ? "명시적 인수조건이 없어 현재 변경 전체에서 치명 결함만 검사했으며, 증명된 치명 결함이 없습니다."
-        : "모든 자동 검증 대상 인수조건의 현재 HEAD 테스트 근거와 변경 전체의 치명 결함 검사를 확인했습니다.",
+        : "모든 자동 검증 대상 인수조건의 현재 HEAD 테스트 또는 소스 근거와 변경 전체의 치명 결함 검사를 확인했습니다.",
       abstainSummaryKo: "현재 근거만으로 자동 승인할 수 없어 GitHub approval을 제출하지 않습니다. 판정 보류 범위는 사람에게 handoff합니다.",
+      followUpSummaryKo: "첫 검토에서 판정을 미루지 않습니다. 아래 항목에 답하거나 보정 커밋을 올리면 직전 요청 이후 변경만 좁혀서 다시 검토합니다.",
       coveredCriteria: disclosure.coveredCriteria,
       fatalCheckPassed: disclosure.fatalCheckPassed,
       abstainItems: disclosure.abstainItems,
@@ -1980,19 +1997,24 @@ export class PrBot {
           ledger.findings,
           workflow?.reviewGateFindingStore,
         );
+      } else {
+        // A review turn must still be visible and actionable even when the same
+        // fingerprint remains open. Avoid silently updating only the check-run.
+        await postPrComment(octokit, repo, prNumber, output.text);
       }
       await this.completeTrackedCheck(check, output.conclusion, output.title, output.text);
       return;
     }
 
-    if (verdict === "ABSTAIN") {
+    if (verdict === "FOLLOW_UP" || verdict === "ABSTAIN") {
+      await postPrComment(octokit, repo, prNumber, output.text);
       await this.completeTrackedCheck(check, output.conclusion, output.title, output.text);
       return;
     }
 
     const passReason = explicitAcceptanceCriteria.length === 0
       ? "명시적 인수조건이 없어 치명 결함만 검사했고 증명된 결함이 없습니다."
-      : "명시적 인수조건 테스트가 확인됐고 증명된 치명 결함이 없습니다.";
+      : "명시적 인수조건의 테스트 또는 소스 근거가 확인됐고 증명된 치명 결함이 없습니다.";
 
     if (this.hasFailingStatusChecks(latest)) {
       const blockerText = this.actionRequiredText("status-check", latest.headSha, this.statusCheckBlockerText(latest));
@@ -2074,8 +2096,11 @@ export class PrBot {
       "허용 후보는 최대 2개이며 fatal_defect 또는 missing_acceptance_test뿐입니다.",
       "모든 공개 설명 필드는 한글로 쓰고 경로, symbol, code_quote, 인수조건 원문은 입력 그대로 복사하세요.",
       "현재 HEAD의 제공된 코드와 테스트 인벤토리만 근거로 사용하고, 이전 Seori 지적은 증거로 사용하지 마세요.",
+      "review_round가 2 이상이면 Previous Seori Result와 Contributor Responses를 먼저 읽고, Changes Since Previous Seori Result에 포함된 추가 변경 및 직전 요청의 해소 여부만 조사하세요.",
+      "후속 턴에서 이전 review 이후 수정되지 않은 누적 PR 코드로 새 범위를 열지 마세요. 현재 HEAD 전체 파일은 추가 변경의 최종 상태와 직전 요청 해소 여부를 확인할 때만 사용하세요.",
       "acceptance_coverage에는 Host가 준 모든 AC를 AC-1부터 순서와 원문 그대로 한 번씩 제출하세요. AC가 없으면 빈 배열입니다.",
-      "covered는 실행되는 현재 HEAD 테스트 안의 정확한 assertion 한 줄이 해당 AC 전체를 직접 증명할 때만 사용하고, file/line/test_name/assertion_quote를 정확히 복사하세요.",
+      "covered는 실행되는 현재 HEAD 테스트의 정확한 assertion 한 줄이 AC 전체를 직접 증명할 때 사용하고, file/line/test_name/assertion_quote를 정확히 복사하세요.",
+      "단, 함수가 특정 테이블·프로필·API를 사용하거나 호출한다는 소스 연결 조건은 그 함수의 현재 HEAD 구현 한 줄로 직접 확인할 수 있습니다. 이때 file은 소스 파일, test_name은 함수명, assertion_quote는 정확한 구현 한 줄을 복사하세요.",
       "전체 테스트 인벤토리가 불완전하거나 테스트 근거를 확정하지 못하면 missing이 아니라 unknown입니다. complete inventory에서 대응 테스트가 없을 때만 missing입니다.",
       "missing_acceptance_test는 host가 test_inventory_complete=true라고 명시했고 AC-N 원문에 대응하는 테스트가 전체 인벤토리에 없을 때만 제출하세요.",
       "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
@@ -2185,7 +2210,7 @@ export class PrBot {
     cached: CachedReviewRun,
     explicitAcceptanceCriteria: readonly string[],
   ): MiniMaxReviewGateCacheEnvelope | null {
-    if (cached.verdict === "ABSTAIN") {
+    if (cached.verdict !== "PASS" && cached.verdict !== "FAIL") {
       return null;
     }
     return decodeReviewGateCache(cached.rawOutput, explicitAcceptanceCriteria);

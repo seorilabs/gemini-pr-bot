@@ -30,11 +30,13 @@ test("부분 보류 결과는 통과한 인수조건과 애매한 인수조건�
     file: "src/session.test.ts",
     line: 27,
     testName: "재실행 후 기존 세션을 복원한다",
+    evidenceKind: "test",
   }]);
   assert.equal(disclosure.fatalCheckPassed, true);
   assert.equal(disclosure.abstainItems.length, 1);
   assert.match(disclosure.abstainItems[0]?.label || "", /AC-2/);
   assert.match(disclosure.abstainItems[0]?.reason || "", /커버리지를 확정하지 못했습니다/);
+  assert.match(disclosure.abstainItems[0]?.requiredAction || "", /테스트의 파일/);
 });
 
 test("독립 검증이 불확실한 후보는 후보 제목과 불확실 범위를 공개한다", () => {

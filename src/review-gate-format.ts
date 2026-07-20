@@ -1,4 +1,4 @@
-export type ReviewGatePublicVerdict = "PASS" | "FAIL" | "ABSTAIN";
+export type ReviewGatePublicVerdict = "PASS" | "FAIL" | "FOLLOW_UP" | "ABSTAIN";
 
 export type ReviewGatePublicFindingKind = "fatal_defect" | "missing_acceptance_test";
 
@@ -46,11 +46,15 @@ export type ReviewGateCoveredCriterion = {
   file: string;
   line: number;
   testName: string;
+  evidenceKind?: "test" | "source";
 };
 
 export type ReviewGateAbstainItem = {
   label: string;
   reason: string;
+  requiredAction: string;
+  /** Host-owned signal; only later turns with exclusively peripheral items may abstain. */
+  peripheral?: boolean;
 };
 
 export type ReviewGateFormatInput = {
@@ -61,6 +65,7 @@ export type ReviewGateFormatInput = {
   htmlMarkers?: readonly string[];
   passSummaryKo?: string;
   abstainSummaryKo?: string;
+  followUpSummaryKo?: string;
   coveredCriteria?: readonly ReviewGateCoveredCriterion[];
   fatalCheckPassed?: boolean;
   abstainItems?: readonly ReviewGateAbstainItem[];
@@ -150,10 +155,45 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
     };
   }
 
+  if (input.verdict === "FOLLOW_UP") {
+    const summary = input.followUpSummaryKo
+      ? requiredKoreanProse(input.followUpSummaryKo, "followUpSummaryKo")
+      : "현재 HEAD를 판정하려면 Contributor의 추가 근거 또는 수정이 필요합니다.";
+    const followUpItems = input.abstainItems || [];
+    if (followUpItems.length === 0) {
+      throw new TypeError("후속 대응 요청에는 Contributor가 처리할 구체적인 항목이 필요합니다.");
+    }
+    return {
+      conclusion: "action_required",
+      title: "Contributor 후속 대응 필요",
+      summary,
+      text: joinSections([
+        markers,
+        [
+          "## Seori 보수적 병합 게이트",
+          "",
+          `HEAD: ${inlineCode(headSha)}`,
+          "판정: **후속 대응 필요**",
+          "",
+          summary,
+          "",
+          formatPassedChecks(input.coveredCriteria || [], input.fatalCheckPassed === true),
+          "",
+          formatFollowUpItems(followUpItems, "### Contributor 후속 대응"),
+          "",
+          "_코드 변경 없이 답하는 경우 같은 댓글에 `@seori /review`를 한 번 포함해 주세요. 보정 커밋을 push하면 자동 재검토되며, 직전 요청과 그 이후 변경만 좁혀서 판정합니다._",
+        ].join("\n"),
+      ]),
+    };
+  }
+
   const summary = input.abstainSummaryKo
     ? requiredKoreanProse(input.abstainSummaryKo, "abstainSummaryKo")
     : "현재 HEAD를 자동 승인할 근거가 충분하지 않아 GitHub approval을 제출하지 않습니다.";
   const abstainItems = input.abstainItems || [];
+  if (abstainItems.length === 0 || abstainItems.some((item) => item.peripheral !== true)) {
+    throw new TypeError("판정 보류에는 하나 이상의 지엽적 후속 항목만 포함할 수 있습니다.");
+  }
   return {
     conclusion: "neutral",
     title: "자동 판정 보류 · 승인 없음",
@@ -170,7 +210,7 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
         "",
         formatPassedChecks(input.coveredCriteria || [], input.fatalCheckPassed === true),
         "",
-        formatAbstainItems(abstainItems),
+        formatFollowUpItems(abstainItems, "### 남은 지엽적 항목"),
         "",
         "_코드 수정을 자동 요구하지 않으며, 병합 여부는 current-HEAD 사람 검토·승인으로 결정합니다._",
       ].join("\n"),
@@ -193,19 +233,27 @@ function formatPassedChecks(
   return lines.join("\n");
 }
 
-function formatAbstainItems(items: readonly ReviewGateAbstainItem[]): string {
+function formatFollowUpItems(
+  items: readonly ReviewGateAbstainItem[],
+  heading: string,
+): string {
   if (items.length > 32) {
-    throw new TypeError("공개할 판정 보류 항목은 최대 32개입니다.");
+    throw new TypeError("공개할 후속 대응 항목은 최대 32개입니다.");
   }
-  const lines = ["### 판정 보류 항목"];
+  const lines = [heading];
   if (items.length === 0) {
-    lines.push("- **자동 판정 근거** — 현재 HEAD 근거가 충분하지 않아 세부 판정을 확정하지 못했습니다.");
+    lines.push("- **자동 판정 근거** — 현재 HEAD 근거가 충분하지 않습니다. PR 댓글로 확인 가능한 근거를 남겨 주세요.");
     return lines.join("\n");
   }
   for (const item of items) {
     const label = requiredText(item.label, "abstainItem.label", 500, false);
     const reason = requiredKoreanProse(item.reason, "abstainItem.reason");
-    lines.push(`- **${publicProse(label, MAX_PROSE_LENGTH)}** — ${publicProse(reason, MAX_PROSE_LENGTH)}`);
+    const requiredAction = requiredKoreanProse(item.requiredAction, "abstainItem.requiredAction");
+    lines.push(
+      `- **${publicProse(label, MAX_PROSE_LENGTH)}**`,
+      `  - 확인되지 않은 이유: ${publicProse(reason, MAX_PROSE_LENGTH)}`,
+      `  - 필요한 대응: ${publicProse(requiredAction, MAX_PROSE_LENGTH)}`,
+    );
   }
   return lines.join("\n");
 }
@@ -214,7 +262,7 @@ function formatCoveredCriteria(criteria: readonly ReviewGateCoveredCriterion[]):
   if (criteria.length === 0) {
     return "";
   }
-  return ["### 확인한 인수조건 테스트", ...formatCoveredCriterionLines(criteria)].join("\n");
+  return ["### 확인한 인수조건 근거", ...formatCoveredCriterionLines(criteria)].join("\n");
 }
 
 function formatCoveredCriterionLines(
@@ -238,7 +286,7 @@ function formatCoveredCriterionLines(
       throw new TypeError("coveredCriterion.line은 1 이상의 정수여야 합니다.");
     }
     lines.push(
-      `- **${publicProse(criterionId, 80)}** ${publicProse(source, MAX_PROSE_LENGTH)} — ${inlineCode(`${file}:${criterion.line}`)} · ${inlineCode(testName)}`,
+      `- **${publicProse(criterionId, 80)}** ${publicProse(source, MAX_PROSE_LENGTH)} — ${criterion.evidenceKind === "source" ? "소스" : "테스트"} ${inlineCode(`${file}:${criterion.line}`)} · ${inlineCode(testName)}`,
     );
   }
   return lines;
