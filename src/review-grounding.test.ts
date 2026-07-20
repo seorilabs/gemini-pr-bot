@@ -97,6 +97,52 @@ test("test evidence requires a real assertion near a nontrivial test name", () =
   );
 });
 
+test("#179 Python 멀티라인 assertion은 전체 호출과 표기 차이를 current HEAD 근거로 결속한다", () => {
+  const file = "tools/check_release_workflow_contract.py";
+  const source = [
+    "class ReleaseWorkflowContractTest(unittest.TestCase):",
+    "    def test_deploy_all_forwards_google_play_inputs(self) -> None:",
+    '        reusable_path = ("jobs", "google-play", "with")',
+    "        self.assertEqual(",
+    "            {",
+    '                "track": scalar(self.workflow_lines, reusable_path, "track"),',
+    '                "release_status": scalar(self.workflow_lines, reusable_path, "release_status"),',
+    "            },",
+    "            {",
+    '                "track": "${{ inputs.google_play_track }}",',
+    '                "release_status": "${{ inputs.google_play_release_status }}",',
+    "            },",
+    "        )",
+  ].join("\n");
+  const sourceQuote =
+    "`Deploy All`의 `jobs.google-play.with`가 `track: ${{ inputs.google_play_track }}`와 `release_status: ${{ inputs.google_play_release_status }}`를 reusable workflow에 전달합니다.";
+  const candidates = buildReviewEvidenceCandidates(
+    { [file]: source },
+    { acceptanceCriteria: [sourceQuote] },
+  );
+  const candidate = candidates.find((item) =>
+    item.testName === "test_deploy_all_forwards_google_play_inputs" &&
+    item.quote.startsWith("self.assertEqual("));
+
+  assert.ok(candidate);
+  assert.match(candidate.quote, /inputs\.google_play_track/);
+  assert.match(candidate.quote, /inputs\.google_play_release_status/);
+  assert.equal(
+    isGroundedTestEvidence(
+      { currentHeadFileContents: { [file]: source }, visibleChangedPatches: {}, evidenceCandidates: candidates },
+      criterion(sourceQuote),
+      {
+        file,
+        line: candidate.line,
+        testName: candidate.testName,
+        assertionQuote: candidate.quote,
+        explanationKo: "Deploy All 입력 전달 계약 전체를 비교합니다.",
+      },
+    ),
+    true,
+  );
+});
+
 test("test evidence supports XCTest and .NET test naming conventions", () => {
   assert.equal(
     isGroundedTestEvidence(

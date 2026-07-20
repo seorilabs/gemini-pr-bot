@@ -17,6 +17,8 @@ export type ReviewGateFatalOutcome = (typeof REVIEW_GATE_FATAL_OUTCOMES)[number]
 
 export type ReviewGateTestEvidence = {
   file: string;
+  /** Optional current-HEAD start line used to distinguish identical multiline call openings. */
+  line?: number;
   testName: string;
   assertionQuote: string;
   /** Provider explanation is used only to bind natural-language ACs to grounded code. */

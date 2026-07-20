@@ -644,6 +644,126 @@ test("skip된 테스트와 무의미한 assertion은 근거가 아니다", () =>
   assert.deepEqual(vacuous.validationErrors, ["AC-1: test_evidence_not_grounded"]);
 });
 
+test("#179처럼 첫 줄이 같은 Python 멀티라인 assertion도 line-aware 묶음으로 검증한다", () => {
+  const criterion =
+    "`Deploy All`의 `jobs.google-play.with`가 `track: ${{ inputs.google_play_track }}`와 `release_status: ${{ inputs.google_play_release_status }}`를 reusable workflow에 전달합니다.";
+  const file = "tools/check_release_workflow_contract.py";
+  const source = [
+    "class ReleaseWorkflowContractTest(unittest.TestCase):",
+    "    def test_deploy_all_forwards_google_play_inputs(self) -> None:",
+    '        start, end, _indent = block_for(self.workflow_lines, ("jobs", "google-play", "with"))',
+    "        reusable_inputs = self.workflow_lines[start:end]",
+    "        self.assertIn(",
+    '            "      track: ${{ inputs.google_play_track }}", reusable_inputs',
+    "        )",
+    "        self.assertIn(",
+    '            "      release_status: ${{ inputs.google_play_release_status }}",',
+    "            reusable_inputs,",
+    "        )",
+  ].join("\n");
+  const candidates = buildReviewEvidenceCandidates(
+    { [file]: source },
+    { acceptanceCriteria: [criterion] },
+  );
+  const assertions = candidates.filter((candidate) =>
+    candidate.testName === "test_deploy_all_forwards_google_play_inputs" &&
+    candidate.quote.startsWith("self.assertIn("));
+  assert.equal(assertions.length, 2);
+  assert.notEqual(assertions[0]?.line, assertions[1]?.line);
+  assert.notEqual(assertions[0]?.quote, assertions[1]?.quote);
+  const evidence = assertions.map((candidate) => ({
+    file: candidate.file,
+    line: candidate.line,
+    testName: candidate.testName,
+    assertionQuote: candidate.quote,
+    explanationKo: "Google Play 입력 전달 값을 직접 확인합니다.",
+  }));
+
+  const result = evaluateReviewAcceptanceCoverage(
+    {
+      currentHeadFileContents: { [file]: source },
+      visibleChangedPatches: {},
+      evidenceCandidates: candidates,
+    },
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: evidence[0],
+      supportingTestEvidence: [evidence[1]!],
+    })],
+  );
+
+  assert.equal(result.complete, true, JSON.stringify(result.validationErrors));
+  assert.deepEqual(result.validationErrors, []);
+});
+
+test("#387 locale catalog 근거는 CI command token과 분리하고 전체 locale 묶음을 요구한다", () => {
+  const criterion =
+    "신규 탭 라벨 문구를 ko-KR/en-US(및 나머지 6개 로케일) catalog에 추가하고 `pnpm check:i18n`이 통과한다.";
+  const file = "packages/farm-ui/src/__tests__/shopTabs.test.ts";
+  const source = [
+    "describe('상점 탭 라벨 i18n 커버리지', () => {",
+    "  it('ko-KR catalog에 4개 탭 라벨이 정의돼 있다', () => {",
+    "    expect(koFarmMessages.shopTabExpand).toBe('확장');",
+    "  });",
+    "  it('en-US catalog에 4개 탭 라벨이 정의돼 있다', () => {",
+    "    expect(enFarmMessages.shopTabExpand).toBe('Expand');",
+    "  });",
+    "  it('나머지 6개 로케일에도 4개 탭 라벨이 존재한다', () => {",
+    "    expect(otherCatalogs).toHaveLength(6);",
+    "    for (const catalog of otherCatalogs) {",
+    "      expect(catalog.shopTabExpand.trim().length).toBeGreaterThan(0);",
+    "    }",
+    "  });",
+    "});",
+  ].join("\n");
+  const candidates = buildReviewEvidenceCandidates(
+    { [file]: source },
+    { acceptanceCriteria: [criterion] },
+  );
+  const evidence = (quote: string) => {
+    const candidate = candidates.find((item) => item.quote === quote);
+    assert.ok(candidate, quote);
+    return {
+      file: candidate.file,
+      line: candidate.line,
+      testName: candidate.testName,
+      assertionQuote: candidate.quote,
+      explanationKo: `${candidate.testName} 검증입니다.`,
+    };
+  };
+  const ko = evidence("expect(koFarmMessages.shopTabExpand).toBe('확장');");
+  const en = evidence("expect(enFarmMessages.shopTabExpand).toBe('Expand');");
+  const remaining = evidence("expect(otherCatalogs).toHaveLength(6);");
+  const groundedContext: ReviewGroundingContext = {
+    currentHeadFileContents: { [file]: source },
+    visibleChangedPatches: {},
+    evidenceCandidates: candidates,
+  };
+
+  const complete = evaluateReviewAcceptanceCoverage(
+    groundedContext,
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: ko,
+      supportingTestEvidence: [en, remaining],
+    })],
+  );
+  const missingEnglish = evaluateReviewAcceptanceCoverage(
+    groundedContext,
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: ko,
+      supportingTestEvidence: [remaining],
+    })],
+  );
+
+  assert.equal(complete.complete, true, JSON.stringify(complete.validationErrors));
+  assert.deepEqual(complete.validationErrors, []);
+  assert.deepEqual(missingEnglish.validationErrors, [
+    "AC-1: test_evidence_missing_en_us_catalog_assertion",
+  ]);
+});
+
 test("#126처럼 두 설정의 저장과 재실행 복원은 같은 테스트의 근거 묶음으로 검증한다", () => {
   const criterion = "두 설정을 `user://lucid_chess_settings.json`에 저장하고 다시 실행할 때 복원합니다.";
   const file = "tests/feedback_settings_smoke.gd";

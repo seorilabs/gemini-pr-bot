@@ -60,6 +60,25 @@ test("복합 plan 근거에서 빠진 rollover assertion을 Contributor에게 �
   );
 });
 
+test("locale 묶음에서 빠진 en-US assertion을 Contributor에게 정확히 요청한다", () => {
+  const criterion =
+    "신규 라벨을 ko-KR/en-US 및 나머지 6개 로케일에 추가하고 `pnpm check:i18n`이 통과한다.";
+  const disclosure = buildReviewGateDisclosure({
+    explicitAcceptanceCriteria: [criterion],
+    acceptanceCoverage: [covered("AC-1", criterion)],
+    groundedAcceptanceCriteria: new Set(),
+    coverageValidationErrors: ["AC-1: test_evidence_missing_en_us_catalog_assertion"],
+    fatalContextComplete: true,
+    pipeline: pipeline(),
+    candidates: [],
+    verifications: [],
+    unconfirmedOpenFindings: [],
+  });
+
+  assert.match(disclosure.abstainItems[0]?.reason || "", /en-US.*assertion/);
+  assert.match(disclosure.abstainItems[0]?.requiredAction || "", /en-US.*supporting evidence/);
+});
+
 test("독립 검증이 불확실한 후보는 후보 제목과 불확실 범위를 공개한다", () => {
   const candidate = fatalCandidate();
   const disclosure = buildReviewGateDisclosure({

@@ -129,17 +129,19 @@ export function buildReviewEvidenceCandidates(
           }
         }
         for (let lineIndex = index + 1; lineIndex < end; lineIndex += 1) {
-          const quote = (lines[lineIndex] || "").trim();
-          if (!isEvidenceCandidateTestLine(file, quote)) {
+          const firstLine = (lines[lineIndex] || "").trim();
+          if (!isEvidenceCandidateTestLine(file, firstLine)) {
             continue;
           }
+          const candidateSpan = collectEvidenceCandidateSpan(lines, lineIndex, end);
           add(testCandidates, {
             kind: "test",
             file,
             line: lineIndex + 1,
             testName,
-            quote,
+            quote: candidateSpan.quote,
           });
+          lineIndex = candidateSpan.end;
         }
       }
       continue;
@@ -275,6 +277,93 @@ function isEvidenceCandidateTestLine(file: string, quote: string): boolean {
   );
 }
 
+type EvidenceSpan = {
+  start: number;
+  end: number;
+};
+
+function collectEvidenceCandidateSpan(
+  lines: readonly string[],
+  start: number,
+  boundary: number,
+): { quote: string; end: number } {
+  const firstLine = (lines[start] || "").trim();
+  let delimiterBalance = delimiterDeltaOutsideStrings(firstLine);
+  if (delimiterBalance <= 0) {
+    return { quote: firstLine, end: start };
+  }
+
+  const collected = [firstLine];
+  let end = start;
+  for (let index = start + 1; index < Math.min(boundary, start + 80); index += 1) {
+    const line = (lines[index] || "").trim();
+    collected.push(line);
+    delimiterBalance += delimiterDeltaOutsideStrings(line);
+    end = index;
+    const quote = collected.join("\n");
+    if (delimiterBalance <= 0) {
+      return quote.length <= 2_000
+        ? { quote, end }
+        : { quote: firstLine, end: start };
+    }
+    if (quote.length > 2_000) {
+      break;
+    }
+  }
+  return { quote: firstLine, end: start };
+}
+
+function findEvidenceSpan(lines: readonly string[], quote: string): EvidenceSpan | null {
+  const expected = normalizedEvidence(quote);
+  if (!expected) {
+    return null;
+  }
+  for (let start = 0; start < lines.length; start += 1) {
+    const singleLine = normalizedEvidence(lines[start] || "");
+    if (!quote.includes("\n") && singleLine.includes(expected)) {
+      return { start, end: start };
+    }
+    const collected: string[] = [];
+    for (let end = start; end < Math.min(lines.length, start + 80); end += 1) {
+      collected.push((lines[end] || "").trim());
+      const actual = normalizedEvidence(collected.join("\n"));
+      if (actual === expected) {
+        return { start, end };
+      }
+      if (actual.length > expected.length || collected.join("\n").length > 2_000) {
+        break;
+      }
+    }
+  }
+  return null;
+}
+
+function delimiterDeltaOutsideStrings(line: string): number {
+  let delta = 0;
+  let quote = "";
+  let escaped = false;
+  for (const char of line) {
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      quote = char;
+    } else if (char === "(" || char === "[" || char === "{") {
+      delta += 1;
+    } else if (char === ")" || char === "]" || char === "}") {
+      delta -= 1;
+    }
+  }
+  return delta;
+}
+
 function isEvidenceCandidateSourceLine(quote: string): boolean {
   if (!quote || /^(?:else\b|return\s*$|pass\s*$|[{}])$/u.test(quote)) {
     return false;
@@ -352,18 +441,16 @@ export function isGroundedTestEvidence(
       }
     }
     const functionLines = lines.slice(index, end);
-    const assertionIndex = functionLines.findIndex((line) =>
-      normalizedEvidence(line).includes(assertion),
-    );
-    if (assertionIndex < 0) {
+    const assertionSpan = findEvidenceSpan(functionLines, evidence.assertionQuote);
+    if (!assertionSpan) {
       continue;
     }
     // Large Godot smoke runners often contain thousands of lines in one _run
     // function. Keep the semantic anchor local to the exact assertion while
     // still proving that it belongs to the named executable function.
     const blockLines = functionLines.slice(
-      Math.max(0, assertionIndex - 80),
-      Math.min(functionLines.length, assertionIndex + 81),
+      Math.max(0, assertionSpan.start - 80),
+      Math.min(functionLines.length, assertionSpan.end + 81),
     );
     const rawBlock = blockLines.join("\n");
     const block = normalizedEvidence(rawBlock);
@@ -444,16 +531,17 @@ export function isGroundedTestEvidenceBundle(
       }
     }
     const blockLines = lines.slice(index, end);
-    const selectedIndices = evidences.map((evidence) =>
-      blockLines.findIndex((line) =>
-        normalizedEvidence(line) === normalizedEvidence(evidence.assertionQuote)),
+    const selectedSpans = evidences.map((evidence) =>
+      findEvidenceSpan(blockLines, evidence.assertionQuote),
     );
     if (
-      selectedIndices.some((selected) => selected < 0) ||
-      new Set(selectedIndices).size !== selectedIndices.length
+      selectedSpans.some((selected) => !selected) ||
+      new Set(selectedSpans.map((selected) => `${selected!.start}:${selected!.end}`)).size !==
+        selectedSpans.length
     ) {
       continue;
     }
+    const selectedIndices = selectedSpans.map((selected) => selected!.start);
     const ordered = [...selectedIndices].sort((left, right) => left - right);
     if (ordered.at(-1)! - ordered[0]! > 200) {
       continue;
@@ -512,12 +600,14 @@ function matchingReviewEvidenceCandidate(
   evidence: ReviewGateTestEvidence,
   kind?: ReviewEvidenceCandidate["kind"],
 ): ReviewEvidenceCandidate | undefined {
-  return candidates.find((candidate) =>
+  const matches = candidates.filter((candidate) =>
     (!kind || candidate.kind === kind) &&
     candidate.file === evidence.file &&
     candidate.testName === evidence.testName &&
     normalizedEvidence(candidate.quote) === normalizedEvidence(evidence.assertionQuote),
   );
+  return matches.find((candidate) => candidate.line === evidence.line) ||
+    (matches.length === 1 ? matches[0] : undefined);
 }
 
 function isGroundedSettingsPersistenceBundle(
@@ -1165,13 +1255,13 @@ function godotDirectCallContext(
 
   const blocks: string[] = [];
   const seen = new Set<string>();
-  const normalizedAssertion = normalizedEvidence(assertion);
-  const assertionIndex = testBlockLines.findIndex((line) =>
-    normalizedEvidence(line).includes(normalizedAssertion),
-  );
-  const callWindow = assertionIndex < 0
+  const assertionSpan = findEvidenceSpan(testBlockLines, assertion);
+  const callWindow = !assertionSpan
     ? assertion
-    : testBlockLines.slice(Math.max(0, assertionIndex - 8), assertionIndex + 1).join("\n");
+    : testBlockLines.slice(
+        Math.max(0, assertionSpan.start - 8),
+        assertionSpan.end + 1,
+      ).join("\n");
   for (const match of callWindow.matchAll(/\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(/gu)) {
     const sourcePath = aliases.get(match[1]!);
     const functionName = match[2]!;
@@ -1218,17 +1308,15 @@ function hasExecutableAssertionLine(lines: string[], assertion: string): boolean
   const lead = assertion.match(
     /(?:\b|_)(assert\w*|xctassert\w*|expect|should|verify\w*|check\w*|equal|match|fail|pass|throws?|raises?|snapshot)\b/iu,
   )?.[1];
-  for (let index = 0; index < lines.length; index += 1) {
-    const code = lines[index] || "";
-    if (
-      normalizedEvidence(code).includes(assertion) &&
-      ((lead && hasTokenOutsideString(code, lead)) ||
-        isExecutableFailureGuard(lines, index, assertion))
-    ) {
-      return true;
-    }
+  const span = findEvidenceSpan(lines, assertion);
+  if (!span) {
+    return false;
   }
-  return false;
+  const code = lines.slice(span.start, span.end + 1).join("\n");
+  return Boolean(
+    (lead && hasTokenOutsideString(code, lead)) ||
+    isExecutableFailureGuard(lines, span.start, assertion),
+  );
 }
 
 function isGuardAssertionSyntax(file: string, assertion: string): boolean {
@@ -1449,12 +1537,14 @@ function criterionAnchorsMatch(
     `${evidence.file} ${evidence.testName} ${evidence.assertionQuote} ${evidence.explanationKo || ""} ${testBlock} ${supportingContext} ${directCallContext}`,
   ).toLowerCase();
   const explicitIdentifiers = [...sourceQuote.matchAll(/`([^`]{2,80})`/gu)]
-    .map((match) => canonicalExplicitIdentifier(match[1] || ""))
+    .map((match) => match[1] || "")
+    .filter((identifier) => !isValidationCommandIdentifier(identifier))
+    .map(canonicalExplicitIdentifier)
     .filter(Boolean);
   if (explicitIdentifiers.length > 0) {
     const canonicalEvidence = canonicalExplicitIdentifier(evidenceText);
     return explicitIdentifiers.every((token) =>
-      canonicalEvidence.includes(token) || signatureIdentifierMatches(token, canonicalEvidence),
+      explicitIdentifierMatches(token, canonicalEvidence),
     );
   }
 
@@ -1498,6 +1588,25 @@ function commonPrefixLength(left: string, right: string): number {
 
 function canonicalExplicitIdentifier(value: string): string {
   return normalizedEvidence(value).toLowerCase().replace(/[\s'"`]+/gu, "");
+}
+
+function explicitIdentifierMatches(token: string, canonicalEvidence: string): boolean {
+  if (canonicalEvidence.includes(token) || signatureIdentifierMatches(token, canonicalEvidence)) {
+    return true;
+  }
+  const compactToken = compactExplicitIdentifier(token);
+  return compactToken.length >= 5 &&
+    compactExplicitIdentifier(canonicalEvidence).includes(compactToken);
+}
+
+function compactExplicitIdentifier(value: string): string {
+  return normalizedEvidence(value).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function isValidationCommandIdentifier(value: string): boolean {
+  return /^\s*(?:(?:pnpm|npm|npx|yarn|bun|deno|pytest|actionlint|cargo|make)\b|go\s+test\b|dotnet\s+test\b|(?:\.\/)?gradlew\b)/iu.test(
+    value,
+  );
 }
 
 function signatureIdentifierMatches(token: string, canonicalEvidence: string): boolean {
