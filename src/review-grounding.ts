@@ -84,7 +84,6 @@ export function isGroundedTestEvidence(
     GENERIC_TEST_NAMES.has(testName.toLowerCase()) ||
     assertion.length < 8 ||
     !/[\p{L}\p{N}_]/u.test(testName) ||
-    (!ASSERTION_PATTERN.test(assertion) && !isGuardAssertionSyntax(evidence.file, assertion)) ||
     isVacuousAssertion(assertion)
   ) {
     return false;
@@ -97,6 +96,17 @@ export function isGroundedTestEvidence(
 
   const lines = stripCommentsFromLines(rawContent.split(/\r?\n/u));
   const godotExecutableHarness = isGodotExecutableHarness(evidence.file, lines);
+  const executableApiContractCall =
+    godotExecutableHarness &&
+    isApiContractCriterion(criterion.sourceQuote) &&
+    isDirectGodotCallSyntax(assertion);
+  if (
+    !ASSERTION_PATTERN.test(assertion) &&
+    !isGuardAssertionSyntax(evidence.file, assertion) &&
+    !executableApiContractCall
+  ) {
+    return false;
+  }
   const supportingContext = supportingTestContext(evidence.file, lines);
   for (let index = 0; index < lines.length; index += 1) {
     if (
@@ -105,14 +115,27 @@ export function isGroundedTestEvidence(
     ) {
       continue;
     }
-    let end = Math.min(lines.length, index + 400);
+    let end = lines.length;
     for (let candidate = index + 1; candidate < end; candidate += 1) {
       if (isTestBoundary(evidence.file, lines, candidate, godotExecutableHarness)) {
         end = candidate;
         break;
       }
     }
-    const blockLines = lines.slice(index, end);
+    const functionLines = lines.slice(index, end);
+    const assertionIndex = functionLines.findIndex((line) =>
+      normalizedEvidence(line).includes(assertion),
+    );
+    if (assertionIndex < 0) {
+      continue;
+    }
+    // Large Godot smoke runners often contain thousands of lines in one _run
+    // function. Keep the semantic anchor local to the exact assertion while
+    // still proving that it belongs to the named executable function.
+    const blockLines = functionLines.slice(
+      Math.max(0, assertionIndex - 80),
+      Math.min(functionLines.length, assertionIndex + 81),
+    );
     const block = normalizedEvidence(blockLines.join("\n"));
     const directCallContext = godotDirectCallContext(
       evidence.file,
@@ -122,7 +145,8 @@ export function isGroundedTestEvidence(
       context.currentHeadFileContents,
     );
     if (
-      hasExecutableAssertionLine(blockLines, assertion) &&
+      (hasExecutableAssertionLine(blockLines, assertion) ||
+        (executableApiContractCall && hasExecutableGodotCallLine(blockLines, assertion))) &&
       criterionAnchorsMatch(
         criterion.sourceQuote,
         evidence,
@@ -453,7 +477,10 @@ function godotLifecycleCallsRunner(lines: string[]): boolean {
       if (/^\s*func\s+\w+\s*\(/u.test(line)) {
         break;
       }
-      if (/\b_(?:run|test)\w*\s*(?:\.|\()/iu.test(line)) {
+      if (
+        /\b_(?:run|test)\w*\s*(?:\.|\()/iu.test(line) ||
+        /\bcall_deferred\s*\(\s*&?["']_(?:run|test)\w*["']/iu.test(line)
+      ) {
         return true;
       }
     }
@@ -559,6 +586,24 @@ function hasExecutableAssertionLine(lines: string[], assertion: string): boolean
 
 function isGuardAssertionSyntax(file: string, assertion: string): boolean {
   return file.toLowerCase().endsWith(".gd") && /^if\b/iu.test(assertion.trim());
+}
+
+function isApiContractCriterion(sourceQuote: string): boolean {
+  return /포트|시그니처|인자|호출|어댑터|예외\s*없이|크래시|폴백|no[- ]?op|interface|signature|adapter|without\s+(?:an?\s+)?(?:error|exception)|crash/iu.test(
+    sourceQuote,
+  );
+}
+
+function isDirectGodotCallSyntax(assertion: string): boolean {
+  return /^(?:await\s+)?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\s*\(.+\)\s*;?$/u.test(
+    assertion.trim(),
+  );
+}
+
+function hasExecutableGodotCallLine(lines: string[], assertion: string): boolean {
+  return lines.some((line) =>
+    normalizedEvidence(line) === assertion && isDirectGodotCallSyntax(line),
+  );
 }
 
 function isExecutableFailureGuard(lines: string[], index: number, assertion: string): boolean {
@@ -761,7 +806,9 @@ function criterionAnchorsMatch(
     .filter(Boolean);
   if (explicitIdentifiers.length > 0) {
     const canonicalEvidence = canonicalExplicitIdentifier(evidenceText);
-    return explicitIdentifiers.every((token) => canonicalEvidence.includes(token));
+    return explicitIdentifiers.every((token) =>
+      canonicalEvidence.includes(token) || signatureIdentifierMatches(token, canonicalEvidence),
+    );
   }
 
   const sourceKorean = koreanTokens(sourceQuote);
@@ -804,6 +851,15 @@ function commonPrefixLength(left: string, right: string): number {
 
 function canonicalExplicitIdentifier(value: string): string {
   return normalizedEvidence(value).toLowerCase().replace(/[\s'"`]+/gu, "");
+}
+
+function signatureIdentifierMatches(token: string, canonicalEvidence: string): boolean {
+  const placeholderSignature = token.match(
+    /^([A-Za-z_]\w*)\((?:[A-Za-z_]\w*(?::[A-Za-z_]\w*)?)(?:,[A-Za-z_]\w*(?::[A-Za-z_]\w*)?)*\)$/u,
+  );
+  return Boolean(
+    placeholderSignature && canonicalEvidence.includes(`${placeholderSignature[1]}(`),
+  );
 }
 
 function koreanTokens(value: string): Set<string> {

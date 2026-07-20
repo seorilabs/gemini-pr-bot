@@ -139,7 +139,10 @@ function resolveCurrentHeadEvidenceLine(
 }
 
 function normalizedEvidenceLine(value: string): string {
-  return normalizeReviewAcceptanceEvidence(value).replace(/,$/u, "");
+  return normalizeReviewAcceptanceEvidence(value)
+    .replace(/,$/u, "")
+    .replace(/\\$/u, "")
+    .trim();
 }
 
 export function isExplicitlyManualAcceptanceCriterion(source: string): boolean {

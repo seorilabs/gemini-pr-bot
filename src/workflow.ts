@@ -18,6 +18,7 @@ import {
   type StoredReviewFinding,
 } from "./review-finding-ledger.js";
 import { metrics, type ActiveWorkflowMetric, type WorkflowQueueMetric } from "./metrics.js";
+import { transientGitHubRetryDelayMs } from "./workflow-retry.js";
 
 type Logger = {
   info: (value: unknown, message?: string) => void;
@@ -874,6 +875,23 @@ export class MysqlWorkflowStore {
     );
   }
 
+  async deferForTransientFailure(run: WorkflowRun, delayMs: number, message: string): Promise<void> {
+    await this.pool.execute(
+      `
+      UPDATE gemini_pr_bot_workflows
+      SET
+        status = 'queued',
+        attempts = GREATEST(attempts - 1, 0),
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        next_run_at = TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(3)),
+        last_error = ?
+      WHERE id = ?
+      `,
+      [Math.ceil(delayMs) * 1000, truncateError(message), run.id],
+    );
+  }
+
   async failExpiredFinalAttempt(run: ExpiredWorkflowRun, message: string): Promise<void> {
     await this.pool.execute(
       `
@@ -1196,6 +1214,29 @@ export class WorkflowEngine {
             retryAfterMs: error.retryAfterMs,
           },
           "workflow deferred because all AI providers are cooling down",
+        );
+        return true;
+      }
+
+      const transientRetryDelayMs = transientGitHubRetryDelayMs(
+        error,
+        run.createdAt,
+        this.config.workflowTransientRetryWindowMs,
+        this.config.workflowTransientRetryMaxDelayMs,
+      );
+      if (transientRetryDelayMs !== null) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.store.deferForTransientFailure(run, transientRetryDelayMs, message);
+        metrics.recordWorkflowFailed(run.eventName, false, elapsedSecondsSince(startedAt));
+        this.logger.warn(
+          {
+            error,
+            workflowId: run.id,
+            event: run.eventName,
+            attempt: run.attempts,
+            transientRetryDelayMs,
+          },
+          "workflow deferred after transient GitHub server error",
         );
         return true;
       }
