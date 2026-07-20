@@ -327,9 +327,7 @@ export async function buildPullRequestContext(
     requested: options.deepContextRequested,
   });
   const deepRepoContext = deepRepoContextResult.markdown;
-  const testInventoryFileCount = Number(
-    deepRepoContext.match(/^Test inventory discovered:\s*(\d+)$/mu)?.[1] || 0,
-  );
+  const testInventoryFileCount = deepRepoContextResult.testInventoryFileCount;
 
   const recentIssueComments = issueComments
     .slice(-50)
@@ -515,8 +513,6 @@ export async function buildPullRequestContext(
     config.maxContextChars - Math.max(0, options.reviewGatePromptReserveChars || 16_000),
   );
   const truncatedReviewGateMarkdown = truncate(reviewGateMarkdown, reviewGateContextBudget);
-  const deepContextFullyVisible =
-    !deepRepoContext || truncatedReviewGateMarkdown.includes(deepRepoContext);
   const visibleDeepContextFileContents = Object.fromEntries(
     Object.entries(deepRepoContextResult.fileContents).filter(([file, content]) =>
       isDeepContextFileFullyVisible(truncatedReviewGateMarkdown, file, content),
@@ -534,6 +530,14 @@ export async function buildPullRequestContext(
   const visibleCurrentHeadFileContents = {
     ...visibleDeepContextFileContents,
     ...visibleChangedFileContents,
+  };
+  // Acceptance grounding is a Host concern, not a prompt-rendering concern.
+  // Keep the exhaustive current-HEAD test index even when the bounded deep
+  // context could not render those full files for the model. The model sees
+  // only the exact candidates derived from this map later in the gate prompt.
+  const hostCurrentHeadFileContents = {
+    ...visibleCurrentHeadFileContents,
+    ...deepRepoContextResult.evidenceFileContents,
   };
   const visibleChangedPatches = Object.fromEntries(
     reviewPatchSections
@@ -564,9 +568,9 @@ export async function buildPullRequestContext(
     markdown: truncate(markdown, config.maxContextChars),
     reviewGateMarkdown: truncatedReviewGateMarkdown,
     acceptanceSourceText: truncate(acceptanceSourceText, config.maxContextChars),
-    testInventoryComplete: deepRepoContextResult.testInventoryComplete && deepContextFullyVisible,
+    testInventoryComplete: deepRepoContextResult.testInventoryComplete,
     testInventoryFileCount,
-    currentHeadFileContents: visibleCurrentHeadFileContents,
+    currentHeadFileContents: hostCurrentHeadFileContents,
     visibleChangedPatches,
     fatalContextComplete,
     changeClass,

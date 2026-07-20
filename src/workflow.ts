@@ -469,7 +469,6 @@ export class MysqlWorkflowStore {
     repoFullName: string,
     prNumber: number,
     headSha: string,
-    promptVersion: string,
   ): Promise<CachedReviewRun | null> {
     const [rows] = await this.pool.execute<CachedReviewRunRow[]>(
       `
@@ -478,12 +477,12 @@ export class MysqlWorkflowStore {
       INNER JOIN gemini_pr_bot_workflows AS workflows
         ON workflows.id = runs.workflow_id
       WHERE runs.repo_full_name = ? AND runs.pr_number = ? AND runs.head_sha = ?
-        AND runs.provider = 'gemini' AND runs.prompt_version = ?
+        AND runs.provider = 'gemini'
         AND runs.parse_valid = TRUE AND workflows.status = 'completed'
       ORDER BY runs.id DESC
       LIMIT 1
       `,
-      [repoFullName, prNumber, headSha, promptVersion],
+      [repoFullName, prNumber, headSha],
     );
     const row = rows[0];
     if (!row || !["PASS", "FAIL", "FOLLOW_UP", "ABSTAIN"].includes(row.verdict)) {
@@ -1227,12 +1226,11 @@ export class WorkflowEngine {
             promptVersion,
             contextSha256,
           ),
-        findLatestReviewGateRun: (repoFullName, prNumber, headSha, promptVersion) =>
+        findLatestReviewGateRun: (repoFullName, prNumber, headSha) =>
           this.store.findLatestReviewGateRun(
             repoFullName,
             prNumber,
             headSha,
-            promptVersion,
           ),
         recordReviewRun: (record) => this.store.recordReviewRun(run.id, record),
       });
