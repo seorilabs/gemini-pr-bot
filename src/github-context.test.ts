@@ -47,7 +47,7 @@ test("후속 review는 마지막 Seori 댓글과 그 이후 Contributor 응답�
   const state = buildReviewFollowUpHistory(
     [
       {
-        user: { login: "seorilabs-seori-pr-bot[bot]", type: "Bot" },
+        user: { login: "seori-bot[bot]", type: "Bot" },
         body: marker(firstHead, "첫 번째 요청"),
         created_at: "2026-07-20T00:00:00Z",
       },
@@ -424,7 +424,7 @@ test("review context prioritizes a large changed product file and can complete f
   );
 });
 
-test("후속 review context는 직전 Seori HEAD 이후 incremental diff만 노출한다", async () => {
+test("후속 review context는 incremental diff와 직전 요청에 명시된 현재 파일만 노출한다", async () => {
   const previousHead = "a".repeat(40);
   const currentHead = "b".repeat(40);
   const fullFiles = [
@@ -454,8 +454,8 @@ test("후속 review context는 직전 Seori HEAD 이후 incremental diff만 노�
       issues: {
         listComments: paged([
           {
-            user: { login: "seorilabs-seori-pr-bot[bot]", type: "Bot" },
-            body: `<!-- seorilabs-seori-pr-bot:status=action-required kind=review-follow-up head=${previousHead} -->\n테스트 위치를 알려 주세요.`,
+            user: { login: "seori-bot", type: "Bot" },
+            body: `<!-- seorilabs-seori-pr-bot:status=action-required kind=review-follow-up head=${previousHead} -->\nsrc/old-scope.ts:1 테스트 위치를 알려 주세요.`,
             created_at: "2026-07-20T00:00:00Z",
           },
           {
@@ -537,7 +537,7 @@ test("후속 review context는 직전 Seori HEAD 이후 incremental diff만 노�
   assert.match(changedFiles, /src\/follow-up\.ts/);
   assert.doesNotMatch(changedFiles, /src\/old-scope\.ts/);
   assert.match(changedContents, /src\/follow-up\.ts/);
-  assert.doesNotMatch(changedContents, /src\/old-scope\.ts/);
+  assert.match(changedContents, /src\/old-scope\.ts/);
   assert.deepEqual(Object.keys(context.visibleChangedPatches), ["src/follow-up.ts"]);
   assert.equal(context.fatalContextComplete, true);
 });

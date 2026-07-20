@@ -83,7 +83,7 @@ import {
 } from "./review-gate-cache.js";
 import {
   BOT_GITHUB_LOGIN,
-  LEGACY_BOT_GITHUB_LOGIN,
+  isBotGithubAuthor,
   bodyIncludesBotActionMarker,
   botActionMarker,
   botAutoSquashMergeFailedMarker,
@@ -100,7 +100,7 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
-const REVIEW_GATE_PROMPT_VERSION = "active-follow-up-gate-v7-gemini";
+const REVIEW_GATE_PROMPT_VERSION = "active-follow-up-gate-v8-gemini";
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
@@ -2360,8 +2360,7 @@ export class PrBot {
       let finding = record.finding;
       if (finding.state === "open" && thread) {
         const maintainerReply = thread.comments.find((comment) =>
-          comment.authorLogin !== BOT_GITHUB_LOGIN &&
-          comment.authorLogin !== LEGACY_BOT_GITHUB_LOGIN &&
+          !isBotGithubAuthor(comment.authorLogin) &&
           !comment.authorLogin.toLowerCase().endsWith("[bot]") &&
           isTrustedAssociation(comment.authorAssociation, this.config) &&
           /^\s*\/seori\s+refute(?:\s+.+)?\s*$/imu.test(comment.body),
@@ -2369,8 +2368,7 @@ export class PrBot {
         const humanResolved = Boolean(
           thread.isResolved &&
           thread.resolvedByLogin &&
-          thread.resolvedByLogin !== BOT_GITHUB_LOGIN &&
-          thread.resolvedByLogin !== LEGACY_BOT_GITHUB_LOGIN &&
+          !isBotGithubAuthor(thread.resolvedByLogin) &&
           context.headSha !== finding.lastSeenHeadSha,
         );
         if (maintainerReply || humanResolved) {

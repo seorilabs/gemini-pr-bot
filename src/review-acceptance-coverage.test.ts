@@ -351,14 +351,14 @@ test("lucid-chess PR 125의 다섯 인수조건을 현재 HEAD 테스트와 소�
     "\tvar profile_signatures := {}",
     "\tfor level in range(1, 10):",
     "\t\tvar profile: Dictionary = ai_test.get_ai_difficulty_profile(level)",
-    '\t\t_expect(profile.has("depth") and profile.has("blunder_prob") and profile.has("eval_noise"), "level exposes a complete AI profile")',
+    '\t\t_expect(profile.has("depth") and profile.has("blunder_prob") and profile.has("eval_noise"), "level %d exposes a complete AI profile" % level)',
     '\t\tvar signature := "%d|%.3f|%.1f" % [int(profile["depth"]), float(profile["blunder_prob"]), float(profile["eval_noise"])]',
-    '\t\t_expect(not profile_signatures.has(signature), "AI profile is unique")',
+    '\t\t_expect(not profile_signatures.has(signature), "level %d AI profile is unique" % level)',
     "\t\tprofile_signatures[signature] = true",
     "\t\tif not previous_profile.is_empty():",
-    '\t\t\t_expect(int(profile["depth"]) >= int(previous_profile["depth"]), "search depth is monotonic")',
-    '\t\t\t_expect(float(profile["blunder_prob"]) < float(previous_profile["blunder_prob"]), "blunder probability decreases")',
-    '\t\t\t_expect(float(profile["eval_noise"]) < float(previous_profile["eval_noise"]), "evaluation noise decreases")',
+    '\t\t\t_expect(int(profile["depth"]) >= int(previous_profile["depth"]), "level %d search depth is monotonic" % level)',
+    '\t\t\t_expect(float(profile["blunder_prob"]) < float(previous_profile["blunder_prob"]), "level %d blunder probability decreases" % level)',
+    '\t\t\t_expect(float(profile["eval_noise"]) < float(previous_profile["eval_noise"]), "level %d evaluation noise decreases" % level)',
     "\t\tprevious_profile = profile",
     "\tquit(1 if failures > 0 else 0)",
     "func _expect(condition: bool, message: String) -> void:",
@@ -366,21 +366,32 @@ test("lucid-chess PR 125의 다섯 인수조건을 현재 HEAD 테스트와 소�
     "\t\tfailures += 1",
   ].join("\n");
   const source = [
+    "const AI_DIFFICULTY_PROFILES := {",
+    '\t1: {"depth": 1, "blunder_prob": 0.55, "eval_noise": 45.0},',
+    '\t2: {"depth": 1, "blunder_prob": 0.45, "eval_noise": 36.0},',
+    '\t3: {"depth": 2, "blunder_prob": 0.32, "eval_noise": 28.0},',
+    '\t4: {"depth": 2, "blunder_prob": 0.23, "eval_noise": 21.0},',
+    '\t5: {"depth": 2, "blunder_prob": 0.15, "eval_noise": 15.0},',
+    '\t6: {"depth": 2, "blunder_prob": 0.09, "eval_noise": 10.0},',
+    '\t7: {"depth": 3, "blunder_prob": 0.04, "eval_noise": 6.0},',
+    '\t8: {"depth": 3, "blunder_prob": 0.01, "eval_noise": 3.0},',
+    '\t9: {"depth": 3, "blunder_prob": 0.0, "eval_noise": 0.0},',
+    "}",
     "func choose_ai_move(level: int) -> Dictionary:",
     "\tvar profile := get_ai_difficulty_profile(level)",
     '\tvar depth := int(profile["depth"])',
   ].join("\n");
   const evidence = [
     {
-      file: testFile,
-      line: 8,
-      testName: "_init",
-      assertionQuote: '_expect(profile.has("depth") and profile.has("blunder_prob") and profile.has("eval_noise"), "level exposes a complete AI profile")',
-      explanationKo: "각 난이도 프로필이 세 가지 강도 파라미터를 모두 정의하는지 검증합니다.",
+      file: sourceFile,
+      line: 2,
+      testName: "AI_DIFFICULTY_PROFILES",
+      assertionQuote: '1: {"depth": 1, "blunder_prob": 0.55, "eval_noise": 45.0},',
+      explanationKo: "상수에 레벨 1~9가 depth, blunder_prob, eval_noise를 모두 정의합니다.",
     },
     {
       file: sourceFile,
-      line: 2,
+      line: 14,
       testName: "choose_ai_move",
       assertionQuote: "var profile := get_ai_difficulty_profile(level)",
       explanationKo: "AI 착수 선택이 난이도 프로필 테이블 조회 결과를 사용합니다.",
@@ -389,15 +400,15 @@ test("lucid-chess PR 125의 다섯 인수조건을 현재 HEAD 테스트와 소�
       file: testFile,
       line: 14,
       testName: "_init",
-      assertionQuote: '_expect(float(profile["blunder_prob"]) < float(previous_profile["blunder_prob"]), "blunder probability decreases")',
+      assertionQuote: '_expect(float(profile["blunder_prob"]) < float(previous_profile["blunder_prob"]), "level %d blunder probability decreases" % level)',
       explanationKo: "깊이는 비감소하고 실수 확률과 평가 노이즈는 단계마다 감소하는지 검증합니다.",
     },
     {
       file: testFile,
       line: 10,
       testName: "_init",
-      assertionQuote: '_expect(not profile_signatures.has(signature), "AI profile is unique")',
-      explanationKo: "각 난이도의 전체 파라미터 조합이 서로 다른지 검증합니다.",
+      assertionQuote: '_expect(not profile_signatures.has(signature), "level %d AI profile is unique" % level)',
+      explanationKo: "각 레벨 profile signature가 unique해서 중복 조합이 없습니다.",
     },
     {
       file: testFile,
@@ -422,7 +433,7 @@ test("lucid-chess PR 125의 다섯 인수조건을 현재 HEAD 테스트와 소�
   assert.deepEqual(result.validationErrors, []);
   assert.deepEqual(
     [...result.groundedTestEvidence.values()].map((item) => item.kind),
-    ["test", "source", "test", "test", "test"],
+    ["source", "source", "test", "test", "test"],
   );
 });
 

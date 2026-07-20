@@ -144,16 +144,18 @@ export function isGroundedTestEvidence(
       supportingContext,
       context.currentHeadFileContents,
     );
-    if (
-      (hasExecutableAssertionLine(blockLines, assertion) ||
-        (executableApiContractCall && hasExecutableGodotCallLine(blockLines, assertion))) &&
+    const semanticMatch =
       criterionAnchorsMatch(
         criterion.sourceQuote,
         evidence,
         block,
         supportingContext,
         directCallContext,
-      )
+      ) || isGroundedUniquenessAssertion(criterion.sourceQuote, evidence, block);
+    if (
+      (hasExecutableAssertionLine(blockLines, assertion) ||
+        (executableApiContractCall && hasExecutableGodotCallLine(blockLines, assertion))) &&
+      semanticMatch
     ) {
       return true;
     }
@@ -211,11 +213,7 @@ export function isGroundedSourceContractEvidence(
   evidence: ReviewGateTestEvidence,
 ): boolean {
   const file = evidence.file.toLowerCase();
-  if (
-    isTestEvidencePath(evidence.file) ||
-    !file.endsWith(".gd") ||
-    !isSourceWiringCriterion(criterion.sourceQuote, evidence.testName)
-  ) {
+  if (isTestEvidencePath(evidence.file) || !file.endsWith(".gd")) {
     return false;
   }
   const content = context.currentHeadFileContents[evidence.file] || "";
@@ -223,6 +221,12 @@ export function isGroundedSourceContractEvidence(
     return false;
   }
   const lines = stripCommentsFromLines(content.split(/\r?\n/gu));
+  if (isGroundedGodotProfileTableContract(criterion.sourceQuote, evidence, lines)) {
+    return true;
+  }
+  if (!isSourceWiringCriterion(criterion.sourceQuote, evidence.testName)) {
+    return false;
+  }
   const declaration = new RegExp(`^\\s*func\\s+${escapeRegExp(evidence.testName)}\\s*\\(`, "iu");
   for (let index = 0; index < lines.length; index += 1) {
     if (!declaration.test(lines[index] || "")) {
@@ -253,6 +257,81 @@ export function isGroundedSourceContractEvidence(
     }
   }
   return false;
+}
+
+function isGroundedGodotProfileTableContract(
+  sourceQuote: string,
+  evidence: ReviewGateTestEvidence,
+  lines: string[],
+): boolean {
+  if (
+    !/(?:1\s*(?:~|-|부터)\s*9|1\s*to\s*9)/iu.test(sourceQuote) ||
+    !/(?:(?:세|3)\s*(?:가지|개)?\s*(?:강도\s*)?파라미터|three\s+(?:strength\s+)?parameters?)/iu.test(sourceQuote) ||
+    !/(?:정의|포함|제공|define|include|provide)/iu.test(sourceQuote)
+  ) {
+    return false;
+  }
+  const declaration = new RegExp(
+    `^\\s*const\\s+${escapeRegExp(evidence.testName)}\\s*(?::=|=)\\s*\\{`,
+    "u",
+  );
+  const start = lines.findIndex((line) => declaration.test(line));
+  if (start < 0) {
+    return false;
+  }
+
+  let depth = 0;
+  let end = -1;
+  for (let index = start; index < lines.length; index += 1) {
+    const line = lines[index] || "";
+    depth += (line.match(/\{/gu) || []).length;
+    depth -= (line.match(/\}/gu) || []).length;
+    if (depth === 0) {
+      end = index + 1;
+      break;
+    }
+  }
+  if (end < 0) {
+    return false;
+  }
+  const blockLines = lines.slice(start, end);
+  if (!blockLines.some((line) =>
+    normalizedEvidence(line) === normalizedEvidence(evidence.assertionQuote))) {
+    return false;
+  }
+
+  const entries = new Map<number, Set<string>>();
+  for (const line of blockLines) {
+    const match = line.match(/^\s*(\d+)\s*:\s*\{([^}]+)\}\s*,?\s*$/u);
+    if (!match) {
+      continue;
+    }
+    entries.set(
+      Number(match[1]),
+      new Set([...match[2]!.matchAll(/["']([A-Za-z_]\w*)["']\s*:/gu)].map((key) => key[1]!)),
+    );
+  }
+  const requiredKeys = ["depth", "blunder_prob", "eval_noise"];
+  return Array.from({ length: 9 }, (_, index) => index + 1).every((level) =>
+    requiredKeys.every((key) => entries.get(level)?.has(key)),
+  );
+}
+
+function isGroundedUniquenessAssertion(
+  sourceQuote: string,
+  evidence: ReviewGateTestEvidence,
+  block: string,
+): boolean {
+  const uniquenessCriterion =
+    /(?:동일|중복).{0,40}(?:조합|파라미터|프로필).{0,25}(?:없|않|금지)|(?:조합|파라미터|프로필).{0,40}(?:동일|중복).{0,25}(?:없|않|금지)|\b(?:no|without)\b.{0,35}\b(?:duplicate|identical)\b.{0,35}\b(?:combination|parameters?|profiles?)\b/iu;
+  const assertion = normalizedEvidence(evidence.assertionQuote);
+  const evidenceText = `${assertion} ${evidence.explanationKo || ""}`;
+  return (
+    uniquenessCriterion.test(sourceQuote) &&
+    /\bnot\s+[A-Za-z_]\w*\.(?:has|contains?)\s*\(\s*[A-Za-z_]\w*\s*\)|!\s*[A-Za-z_]\w*\.(?:has|contains?)\s*\(\s*[A-Za-z_]\w*\s*\)/iu.test(assertion) &&
+    /(?:고유|중복|서로\s*다|unique|duplicate|different)/iu.test(evidenceText) &&
+    /(?:signature|시그니처)/iu.test(block)
+  );
 }
 
 /**

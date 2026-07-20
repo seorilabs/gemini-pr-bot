@@ -3,9 +3,8 @@ import { buildDeepRepoContext, classifyChange, type ChangeClass } from "./repo-c
 import { isNonProductFatalPath } from "./review-grounding.js";
 import { githubCommentBody, truncate } from "./text.js";
 import {
-  BOT_GITHUB_LOGIN,
-  LEGACY_BOT_GITHUB_LOGIN,
   bodyIncludesBotStatusMarker,
+  isBotGithubAuthor,
 } from "./identity.js";
 
 type Octokit = any;
@@ -381,12 +380,21 @@ export async function buildPullRequestContext(
   );
   const acceptanceSourceText = trustedAcceptanceSources.text;
   const isFollowUpReview = reviewFollowUp.reviewRound > 1;
-  const reviewFiles = isFollowUpReview ? followUpChanges.files : files;
+  const incrementalReviewFiles = isFollowUpReview ? followUpChanges.files : files;
   const reviewPatchSections = isFollowUpReview
     ? followUpChanges.sections
     : completeFilePatchSections;
-  const reviewFileNames = new Set(reviewFiles.map((file: any) => String(file.filename || "")));
-  const changeClass = classifyChange(reviewFiles.map((file: any) => String(file.filename || "")));
+  const reviewFileNames = new Set(
+    incrementalReviewFiles.map((file: any) => String(file.filename || "")),
+  );
+  if (isFollowUpReview) {
+    for (const filename of reviewReferencedChangedPaths(reviewFollowUp, files)) {
+      reviewFileNames.add(filename);
+    }
+  }
+  const changeClass = classifyChange(
+    incrementalReviewFiles.map((file: any) => String(file.filename || "")),
+  );
   const gateChangedFilePatches = truncate(
     reviewPatchSections.map(({ section }) => section).join("\n\n") || "(none)",
     Math.min(config.maxPatchChars, MAX_REVIEW_GATE_PATCH_CHARS),
@@ -535,7 +543,7 @@ export async function buildPullRequestContext(
   const fatalContextComplete = reviewFollowUp.changesSincePreviousReviewComplete &&
     isFatalContextComplete(
       changeClass,
-      reviewFiles,
+      incrementalReviewFiles,
       visibleCurrentHeadFileContents,
       visibleChangedPatches,
     );
@@ -566,6 +574,28 @@ export async function buildPullRequestContext(
     explicitAcceptanceCriteria: trustedAcceptanceSources.criteria,
     reviewFollowUp,
   };
+}
+
+function reviewReferencedChangedPaths(
+  reviewFollowUp: ReviewFollowUpContext,
+  files: any[],
+): Set<string> {
+  const conversation = `${reviewFollowUp.previousReviewBody}\n${reviewFollowUp.contributorResponses}`;
+  return new Set(
+    files
+      .map((file: any) => String(file.filename || ""))
+      .filter((filename) =>
+        filename.length > 0 &&
+        new RegExp(
+          `(?:^|[^A-Za-z0-9_.\\/-])${escapeReviewPathRegExp(filename)}(?=$|[^A-Za-z0-9_.\\/-])`,
+          "u",
+        ).test(conversation),
+      ),
+  );
+}
+
+function escapeReviewPathRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
 type ReviewConversationEntry = {
@@ -635,8 +665,7 @@ function conversationEntry(entry: any, location: string): ReviewConversationEntr
 }
 
 function isSeoriAuthor(login: string): boolean {
-  const normalized = login.toLowerCase().replace(/\[bot\]$/u, "");
-  return normalized === BOT_GITHUB_LOGIN || normalized === LEGACY_BOT_GITHUB_LOGIN;
+  return isBotGithubAuthor(login);
 }
 
 function isPublishedReviewResult(body: string): boolean {
