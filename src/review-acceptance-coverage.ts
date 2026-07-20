@@ -76,7 +76,7 @@ export function evaluateReviewAcceptanceCoverage(
       validationErrors.push(`${expectedId}: test_evidence_bundle_invalid`);
       continue;
     }
-    const hostCandidates = evidenceItems.map((evidence) => {
+    const evidenceCandidates = evidenceItems.map((evidence) => {
       const matches = context.evidenceCandidates?.filter((candidate) =>
         candidate.file === evidence.file &&
         candidate.testName === evidence.testName &&
@@ -85,12 +85,24 @@ export function evaluateReviewAcceptanceCoverage(
       return matches?.find((candidate) => candidate.line === evidence.line) ||
         (matches?.length === 1 ? matches[0] : undefined);
     });
-    if (context.evidenceCandidates && hostCandidates.some((candidate) => !candidate)) {
+    if (context.evidenceCandidates && !evidenceCandidates[0]) {
       validationErrors.push(`${expectedId}: test_evidence_not_in_host_inventory`);
       continue;
     }
-    const groundedLines = evidenceItems.map((evidence, evidenceIndex) =>
-      hostCandidates[evidenceIndex]?.line ?? resolveCurrentHeadEvidenceLine(
+    // Supporting evidence is optional model guidance. Drop a fabricated or
+    // stale supporting row, then let host-side composite validation decide
+    // whether the remaining exact evidence is sufficient. The primary row is
+    // never optional and must stay inside the host inventory.
+    const selectedEvidence = evidenceItems
+      .map((evidence, evidenceIndex) => ({
+        evidence,
+        candidate: evidenceCandidates[evidenceIndex],
+      }))
+      .filter((entry, evidenceIndex) =>
+        evidenceIndex === 0 || !context.evidenceCandidates || Boolean(entry.candidate));
+    const selectedEvidenceItems = selectedEvidence.map((entry) => entry.evidence);
+    const groundedLines = selectedEvidence.map(({ evidence, candidate }) =>
+      candidate?.line ?? resolveCurrentHeadEvidenceLine(
         context.currentHeadFileContents[evidence.file],
         evidence.assertionQuote,
         evidence.line,
@@ -106,7 +118,7 @@ export function evaluateReviewAcceptanceCoverage(
       testability: "automated",
       coverage: "covered",
     };
-    const gateEvidence: ReviewGateTestEvidence[] = evidenceItems.map((evidence) => ({
+    const gateEvidence: ReviewGateTestEvidence[] = selectedEvidenceItems.map((evidence) => ({
       file: evidence.file,
       line: evidence.line,
       testName: evidence.testName,
@@ -157,7 +169,7 @@ export function evaluateReviewAcceptanceCoverage(
     const normalizedCriterion = normalizeReviewAcceptanceEvidence(source);
     groundedAcceptanceCriteria.add(normalizedCriterion);
     const publicEvidenceIndex = primaryGroundedIndex >= 0 ? primaryGroundedIndex : 0;
-    const publicEvidence = evidenceItems[publicEvidenceIndex]!;
+    const publicEvidence = selectedEvidenceItems[publicEvidenceIndex]!;
     groundedTestEvidence.set(normalizedCriterion, {
       file: publicEvidence.file,
       line: groundedLines[publicEvidenceIndex]!,
