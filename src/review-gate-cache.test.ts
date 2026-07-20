@@ -19,6 +19,7 @@ function validEnvelope(): MiniMaxReviewGateCacheEnvelope {
         acceptanceCriterion: ACCEPTANCE_CRITERION,
         status: "missing",
         testEvidence: null,
+        supportingTestEvidence: [],
       },
     ],
     candidates: [
@@ -66,6 +67,7 @@ test("valid cache envelope roundtrips through exact MiniMax wire fields", () => 
     "acceptance_criterion",
     "criterion_id",
     "status",
+    "supporting_test_evidence",
     "test_evidence",
   ]);
   assert.equal((encoded.candidates as any[])[0].candidate_id, "C-1");
@@ -88,7 +90,7 @@ test("empty arrays are a valid cache entry when the host has no acceptance crite
 
   const encoded = encodeReviewGateCache(envelope);
   assert.deepEqual(encoded, {
-    schemaVersion: 2,
+    schemaVersion: 3,
     acceptance_coverage: [],
     candidates: [],
     verifications: [],

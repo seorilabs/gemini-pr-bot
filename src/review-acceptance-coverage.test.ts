@@ -3,9 +3,13 @@ import test from "node:test";
 import type { MiniMaxAcceptanceCoverage } from "./minimax-review.js";
 import {
   evaluateReviewAcceptanceCoverage,
+  mergeStickyAcceptanceCoverage,
   normalizeReviewAcceptanceEvidence,
 } from "./review-acceptance-coverage.js";
-import type { ReviewGroundingContext } from "./review-grounding.js";
+import {
+  buildReviewEvidenceCandidates,
+  type ReviewGroundingContext,
+} from "./review-grounding.js";
 
 function context(
   currentHeadFileContents: Record<string, string> = {},
@@ -638,4 +642,119 @@ test("skip된 테스트와 무의미한 assertion은 근거가 아니다", () =>
   assert.equal(vacuous.complete, false);
   assert.deepEqual(skipped.validationErrors, ["AC-1: test_evidence_not_grounded"]);
   assert.deepEqual(vacuous.validationErrors, ["AC-1: test_evidence_not_grounded"]);
+});
+
+test("#126처럼 두 설정의 저장과 재실행 복원은 같은 테스트의 근거 묶음으로 검증한다", () => {
+  const criterion = "두 설정을 `user://lucid_chess_settings.json`에 저장하고 다시 실행할 때 복원합니다.";
+  const file = "tests/feedback_settings_smoke.gd";
+  const source = [
+    "extends SceneTree",
+    'const SETTINGS_PATH := "user://lucid_chess_settings.json"',
+    "var failures := 0",
+    "func _init() -> void:",
+    "\t_run()",
+    "func _run() -> void:",
+    "\tvar saved_settings := _read_settings()",
+    '\t_expect(saved_settings.get("sound_enabled", true) == false, "sound setting persists through the UI toggle")',
+    '\t_expect(saved_settings.get("haptics_enabled", true) == false, "haptics setting persists through the UI toggle")',
+    "\tvar restored = scene.instantiate()",
+    '\t_expect(not restored.sound_enabled, "sound setting restores after relaunch")',
+    '\t_expect(not restored.haptics_enabled, "haptics setting restores after relaunch")',
+    "\tquit(1 if failures > 0 else 0)",
+  ].join("\n");
+  const candidates = buildReviewEvidenceCandidates({ [file]: source });
+  const evidence = (quote: string) => {
+    const candidate = candidates.find((item) => item.quote === quote);
+    assert.ok(candidate, quote);
+    return {
+      file: candidate.file,
+      line: candidate.line,
+      testName: candidate.testName,
+      assertionQuote: candidate.quote,
+      explanationKo: "Host가 추출한 current HEAD assertion입니다.",
+    };
+  };
+  const savedSound = evidence('_expect(saved_settings.get("sound_enabled", true) == false, "sound setting persists through the UI toggle")');
+  const savedHaptics = evidence('_expect(saved_settings.get("haptics_enabled", true) == false, "haptics setting persists through the UI toggle")');
+  const restoredSound = evidence('_expect(not restored.sound_enabled, "sound setting restores after relaunch")');
+  const restoredHaptics = evidence('_expect(not restored.haptics_enabled, "haptics setting restores after relaunch")');
+  const groundedContext: ReviewGroundingContext = {
+    currentHeadFileContents: { [file]: source },
+    visibleChangedPatches: {},
+    evidenceCandidates: candidates,
+  };
+
+  const complete = evaluateReviewAcceptanceCoverage(
+    groundedContext,
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: savedSound,
+      supportingTestEvidence: [savedHaptics, restoredSound, restoredHaptics],
+    })],
+  );
+  const incomplete = evaluateReviewAcceptanceCoverage(
+    groundedContext,
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: savedSound,
+      supportingTestEvidence: [savedHaptics, restoredSound],
+    })],
+  );
+  const omittedFromHostInventory = evaluateReviewAcceptanceCoverage(
+    {
+      ...groundedContext,
+      evidenceCandidates: candidates.filter((candidate) =>
+        candidate.quote !== restoredHaptics.assertionQuote),
+    },
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: savedSound,
+      supportingTestEvidence: [savedHaptics, restoredSound, restoredHaptics],
+    })],
+  );
+
+  assert.equal(complete.complete, true, JSON.stringify(complete.validationErrors));
+  assert.deepEqual(complete.validationErrors, []);
+  assert.equal(incomplete.complete, false);
+  assert.deepEqual(incomplete.validationErrors, ["AC-1: test_evidence_not_grounded"]);
+  assert.equal(omittedFromHostInventory.complete, false);
+  assert.deepEqual(omittedFromHostInventory.validationErrors, [
+    "AC-1: test_evidence_not_in_host_inventory",
+  ]);
+});
+
+test("동일 HEAD에서 host가 검증한 AC PASS는 이후 모델의 unknown으로 후퇴하지 않는다", () => {
+  const criterion = "저장 후 다시 실행해 값을 복원한다.";
+  const grounded = normalizeReviewAcceptanceEvidence(criterion);
+  const prior = coverage(criterion, {
+    testEvidence: {
+      file: "tests/settings.test.ts",
+      line: 3,
+      testName: "restores settings",
+      assertionQuote: "assert.equal(restored, saved);",
+      explanationKo: "저장값을 복원합니다.",
+    },
+  });
+  const current = coverage(criterion, { status: "unknown" });
+
+  assert.deepEqual(
+    mergeStickyAcceptanceCoverage(
+      [criterion],
+      [current],
+      new Set(),
+      [prior],
+      new Set([grounded]),
+    ),
+    [prior],
+  );
+  assert.deepEqual(
+    mergeStickyAcceptanceCoverage(
+      [criterion],
+      [current],
+      new Set(),
+      [],
+      new Set(),
+    ),
+    [current],
+  );
 });

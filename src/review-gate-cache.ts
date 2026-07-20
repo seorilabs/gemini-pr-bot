@@ -6,7 +6,7 @@ import {
   type MiniMaxReviewCandidate,
 } from "./minimax-review.js";
 
-export const REVIEW_GATE_CACHE_SCHEMA_VERSION = 2 as const;
+export const REVIEW_GATE_CACHE_SCHEMA_VERSION = 3 as const;
 
 export type MiniMaxReviewGateCacheEnvelope = {
   schemaVersion: typeof REVIEW_GATE_CACHE_SCHEMA_VERSION;
@@ -46,6 +46,13 @@ export function encodeReviewGateCache(
             explanation_ko: coverage.testEvidence.explanationKo,
           }
         : null,
+      supporting_test_evidence: (coverage.supportingTestEvidence || []).map((evidence) => ({
+        file: evidence.file,
+        line: evidence.line,
+        test_name: evidence.testName,
+        assertion_quote: evidence.assertionQuote,
+        explanation_ko: evidence.explanationKo,
+      })),
     })),
     candidates: envelope.candidates.map((candidate) => ({
       candidate_id: candidate.candidateId,

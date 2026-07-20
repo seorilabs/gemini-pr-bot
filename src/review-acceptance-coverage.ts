@@ -3,6 +3,7 @@ import type { ReviewGateCriterion, ReviewGateTestEvidence } from "./review-gate.
 import {
   isGroundedTestExecutionEvidence,
   isGroundedTestEvidence,
+  isGroundedTestEvidenceBundle,
   isGroundedSourceContractEvidence,
   isGroundedTestMatrixEvidence,
   type ReviewGroundingContext,
@@ -63,35 +64,80 @@ export function evaluateReviewAcceptanceCoverage(
       validationErrors.push(`${expectedId}: test_evidence_required`);
       continue;
     }
-
-    const groundedLine = resolveCurrentHeadEvidenceLine(
-      context.currentHeadFileContents[item.testEvidence.file],
-      item.testEvidence.assertionQuote,
-      item.testEvidence.line,
+    const evidenceItems = [item.testEvidence, ...(item.supportingTestEvidence || [])];
+    const uniqueEvidence = new Set(
+      evidenceItems.map((evidence) =>
+        `${evidence.file}:${evidence.testName}:${normalizeReviewAcceptanceEvidence(evidence.assertionQuote)}`),
     );
-    if (groundedLine === null) {
+    if (
+      evidenceItems.length > 4 ||
+      uniqueEvidence.size !== evidenceItems.length
+    ) {
+      validationErrors.push(`${expectedId}: test_evidence_bundle_invalid`);
+      continue;
+    }
+    const hostCandidates = evidenceItems.map((evidence) =>
+      context.evidenceCandidates?.find((candidate) =>
+        candidate.file === evidence.file &&
+        candidate.testName === evidence.testName &&
+        normalizeReviewAcceptanceEvidence(candidate.quote) ===
+          normalizeReviewAcceptanceEvidence(evidence.assertionQuote)),
+    );
+    if (context.evidenceCandidates && hostCandidates.some((candidate) => !candidate)) {
+      validationErrors.push(`${expectedId}: test_evidence_not_in_host_inventory`);
+      continue;
+    }
+    const groundedLines = evidenceItems.map((evidence, evidenceIndex) =>
+      hostCandidates[evidenceIndex]?.line ?? resolveCurrentHeadEvidenceLine(
+        context.currentHeadFileContents[evidence.file],
+        evidence.assertionQuote,
+        evidence.line,
+      ),
+    );
+    if (groundedLines.some((line) => line === null)) {
       validationErrors.push(`${expectedId}: test_evidence_line_not_grounded`);
       continue;
     }
-
-    const criterion: ReviewGateCriterion = {
+    const criterionBase: Omit<ReviewGateCriterion, "testEvidence"> = {
       id: item.criterionId,
       sourceQuote: source,
       testability: "automated",
       coverage: "covered",
-      testEvidence: {
-        file: item.testEvidence.file,
-        testName: item.testEvidence.testName,
-        assertionQuote: item.testEvidence.assertionQuote,
-        explanationKo: item.testEvidence.explanationKo,
-      },
     };
-    const evidence: ReviewGateTestEvidence = criterion.testEvidence!;
-    const groundedAsTest =
-      isGroundedTestEvidence(context, criterion, evidence) ||
-      isGroundedTestExecutionEvidence(context, criterion, evidence) ||
-      isGroundedTestMatrixEvidence(context, criterion, evidence);
-    const groundedAsSource = isGroundedSourceContractEvidence(context, criterion, evidence);
+    const gateEvidence: ReviewGateTestEvidence[] = evidenceItems.map((evidence) => ({
+      file: evidence.file,
+      testName: evidence.testName,
+      assertionQuote: evidence.assertionQuote,
+      explanationKo: evidence.explanationKo,
+    }));
+    const groundedKinds = gateEvidence.map((evidence) => {
+      const criterion: ReviewGateCriterion = { ...criterionBase, testEvidence: evidence };
+      if (
+        isGroundedTestEvidence(context, criterion, evidence) ||
+        isGroundedTestExecutionEvidence(context, criterion, evidence) ||
+        isGroundedTestMatrixEvidence(context, criterion, evidence)
+      ) {
+        return "test" as const;
+      }
+      return isGroundedSourceContractEvidence(context, criterion, evidence)
+        ? "source" as const
+        : null;
+    });
+    const bundleCriterion: ReviewGateCriterion = {
+      ...criterionBase,
+      testEvidence: gateEvidence[0]!,
+    };
+    const groundedAsBundle = isGroundedTestEvidenceBundle(
+      context,
+      bundleCriterion,
+      gateEvidence,
+    );
+    const primaryGroundedIndex = groundedKinds.findIndex(Boolean);
+    const groundedAsTest = primaryGroundedIndex >= 0
+      ? groundedKinds[primaryGroundedIndex] === "test"
+      : groundedAsBundle;
+    const groundedAsSource = primaryGroundedIndex >= 0 &&
+      groundedKinds[primaryGroundedIndex] === "source";
     if (!groundedAsTest && !groundedAsSource) {
       validationErrors.push(`${expectedId}: test_evidence_not_grounded`);
       continue;
@@ -99,10 +145,12 @@ export function evaluateReviewAcceptanceCoverage(
 
     const normalizedCriterion = normalizeReviewAcceptanceEvidence(source);
     groundedAcceptanceCriteria.add(normalizedCriterion);
+    const publicEvidenceIndex = primaryGroundedIndex >= 0 ? primaryGroundedIndex : 0;
+    const publicEvidence = evidenceItems[publicEvidenceIndex]!;
     groundedTestEvidence.set(normalizedCriterion, {
-      file: item.testEvidence.file,
-      line: groundedLine,
-      testName: item.testEvidence.testName,
+      file: publicEvidence.file,
+      line: groundedLines[publicEvidenceIndex]!,
+      testName: publicEvidence.testName,
       kind: groundedAsSource ? "source" : "test",
     });
   }
@@ -157,4 +205,41 @@ export function isExplicitlyManualAcceptanceCriterion(source: string): boolean {
 
 export function normalizeReviewAcceptanceEvidence(value: string): string {
   return value.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase();
+}
+
+/**
+ * A grounded PASS for an unchanged HEAD is monotonic. A later model turn may
+ * add better evidence, but it cannot erase host-validated evidence from an
+ * earlier run of the same prompt contract and commit.
+ */
+export function mergeStickyAcceptanceCoverage(
+  explicitAcceptanceCriteria: readonly string[],
+  current: readonly MiniMaxAcceptanceCoverage[],
+  currentGrounded: ReadonlySet<string>,
+  prior: readonly MiniMaxAcceptanceCoverage[],
+  priorGrounded: ReadonlySet<string>,
+): MiniMaxAcceptanceCoverage[] {
+  return explicitAcceptanceCriteria.map((criterion, index) => {
+    const normalized = normalizeReviewAcceptanceEvidence(criterion);
+    const currentItem = current[index];
+    const priorItem = prior[index];
+    if (currentItem && currentGrounded.has(normalized)) {
+      return currentItem;
+    }
+    if (
+      priorItem &&
+      priorItem.criterionId === `AC-${index + 1}` &&
+      priorItem.acceptanceCriterion === criterion &&
+      priorGrounded.has(normalized)
+    ) {
+      return priorItem;
+    }
+    return currentItem || {
+      criterionId: `AC-${index + 1}`,
+      acceptanceCriterion: criterion,
+      status: "unknown",
+      testEvidence: null,
+      supportingTestEvidence: [],
+    };
+  });
 }

@@ -7,6 +7,16 @@ import type {
 export type ReviewGroundingContext = {
   currentHeadFileContents: Readonly<Record<string, string>>;
   visibleChangedPatches: Readonly<Record<string, string>>;
+  evidenceCandidates?: readonly ReviewEvidenceCandidate[];
+};
+
+export type ReviewEvidenceCandidate = {
+  id: string;
+  kind: "test" | "source";
+  file: string;
+  line: number;
+  testName: string;
+  quote: string;
 };
 
 export type ChangedLineEvidence = Map<string, Map<number, string>>;
@@ -60,6 +70,167 @@ const GENERIC_TEST_NAMES = new Set([
 const UNCERTAINTY_PATTERN =
   /\b(?:may|might|could|possibly|possible|unclear|unverified|probably|perhaps|apparently|seems?|assum(?:e|ing)|if)\b|가능성|가능(?:하|할)|수\s+있|우려|추정|불명확|검증\s*필요|보이지\s*않|아마|듯(?:하|합니다|함)|것으로\s*보|일\s*수|라면/iu;
 
+/**
+ * Builds a bounded, host-owned menu of exact current-HEAD evidence. The model
+ * may choose from this menu, but it no longer invents the identity of a test
+ * line. Executable test evidence is prioritized ahead of source contracts.
+ */
+export function buildReviewEvidenceCandidates(
+  currentHeadFileContents: Readonly<Record<string, string>>,
+  maxCandidates = 240,
+  maxChars = 40_000,
+): ReviewEvidenceCandidate[] {
+  const testCandidates: Omit<ReviewEvidenceCandidate, "id">[] = [];
+  const sourceCandidates: Omit<ReviewEvidenceCandidate, "id">[] = [];
+  const seen = new Set<string>();
+  const add = (
+    target: Omit<ReviewEvidenceCandidate, "id">[],
+    candidate: Omit<ReviewEvidenceCandidate, "id">,
+  ): void => {
+    const key = `${candidate.file}:${candidate.line}:${candidate.testName}:${normalizedEvidence(candidate.quote)}`;
+    if (!seen.has(key) && candidate.quote.trim().length >= 4 && candidate.quote.length <= 2_000) {
+      seen.add(key);
+      target.push(candidate);
+    }
+  };
+
+  for (const [file, rawContent] of Object.entries(currentHeadFileContents).sort(([left], [right]) =>
+    left.localeCompare(right))) {
+    if (!rawContent || !PRODUCT_SOURCE_EXTENSIONS.has(file.toLowerCase().match(/\.[^.\/]+$/u)?.[0] || "")) {
+      continue;
+    }
+    const lines = stripCommentsFromLines(rawContent.split(/\r?\n/gu));
+    if (isTestEvidencePath(file)) {
+      const godotExecutableHarness = isGodotExecutableHarness(file, lines);
+      for (let index = 0; index < lines.length; index += 1) {
+        if (
+          !isRegisteredTestDeclaration(file, lines, index, godotExecutableHarness) ||
+          isSkippedTestDeclaration(file, lines, index)
+        ) {
+          continue;
+        }
+        const testName = declaredTestName(file, lines[index] || "");
+        if (!testName || GENERIC_TEST_NAMES.has(testName.toLowerCase())) {
+          continue;
+        }
+        let end = lines.length;
+        for (let candidate = index + 1; candidate < lines.length; candidate += 1) {
+          if (isTestBoundary(file, lines, candidate, godotExecutableHarness)) {
+            end = candidate;
+            break;
+          }
+        }
+        for (let lineIndex = index + 1; lineIndex < end; lineIndex += 1) {
+          const quote = (lines[lineIndex] || "").trim();
+          if (!isEvidenceCandidateTestLine(file, quote)) {
+            continue;
+          }
+          add(testCandidates, {
+            kind: "test",
+            file,
+            line: lineIndex + 1,
+            testName,
+            quote,
+          });
+        }
+      }
+      continue;
+    }
+
+    let symbol = "";
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index] || "";
+      const functionName = line.match(/^\s*(?:static\s+)?func\s+([A-Za-z_]\w*)\s*\(/u)?.[1];
+      const constName = line.match(/^\s*const\s+([A-Za-z_]\w*)\s*(?::=|=)/u)?.[1];
+      if (functionName || constName) {
+        symbol = functionName || constName || "";
+        continue;
+      }
+      const quote = line.trim();
+      if (!symbol || !isEvidenceCandidateSourceLine(quote)) {
+        continue;
+      }
+      add(sourceCandidates, {
+        kind: "source",
+        file,
+        line: index + 1,
+        testName: symbol,
+        quote,
+      });
+    }
+  }
+
+  const bounded: Omit<ReviewEvidenceCandidate, "id">[] = [];
+  let serializedChars = 0;
+  for (const candidate of [...testCandidates, ...sourceCandidates]) {
+    if (bounded.length >= Math.max(0, maxCandidates)) {
+      break;
+    }
+    const candidateChars = JSON.stringify(candidate).length + 1;
+    if (bounded.length > 0 && serializedChars + candidateChars > Math.max(0, maxChars)) {
+      break;
+    }
+    bounded.push(candidate);
+    serializedChars += candidateChars;
+  }
+  return bounded.map((candidate, index) => ({
+    ...candidate,
+    id: `E-${String(index + 1).padStart(3, "0")}`,
+  }));
+}
+
+export function formatReviewEvidenceCandidates(
+  candidates: readonly ReviewEvidenceCandidate[],
+): string {
+  if (candidates.length === 0) {
+    return "(current-HEAD evidence candidate 없음)";
+  }
+  return candidates.map((candidate) => JSON.stringify({
+    id: candidate.id,
+    kind: candidate.kind,
+    file: candidate.file,
+    line: candidate.line,
+    test_name: candidate.testName,
+    quote: candidate.quote,
+  })).join("\n");
+}
+
+function declaredTestName(file: string, declaration: string): string | null {
+  if (/\.gd$/iu.test(file)) {
+    return declaration.match(/^\s*func\s+([A-Za-z_]\w*)\s*\(/u)?.[1] || null;
+  }
+  const quoted = declaration.match(/\b(?:test|it|describe)(?:\.\w+)?\s*\(\s*["'`]([^"'`]+)["'`]/iu)?.[1];
+  if (quoted) {
+    return quoted;
+  }
+  return declaration.match(/\b(?:def|fn|func|function|void)\s+([A-Za-z_]\w*)\s*\(/u)?.[1] ||
+    declaration.match(/\b(?:fun)\s+([A-Za-z_]\w*)\s*\(/u)?.[1] ||
+    null;
+}
+
+function isEvidenceCandidateTestLine(file: string, quote: string): boolean {
+  if (!quote || /^\s*(?:#|\/\/)/u.test(quote)) {
+    return false;
+  }
+  return (
+    ASSERTION_PATTERN.test(quote) ||
+    isGuardAssertionSyntax(file, quote) ||
+    /^\s*(?:for|foreach)\b/iu.test(quote) ||
+    /(?:^|[=;])\s*(?:await\s+)?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*\(/u.test(quote)
+  );
+}
+
+function isEvidenceCandidateSourceLine(quote: string): boolean {
+  if (!quote || /^(?:else\b|return\s*$|pass\s*$|[{}])$/u.test(quote)) {
+    return false;
+  }
+  return (
+    /^\d+\s*:\s*\{/u.test(quote) ||
+    /(?:=|return\b).*(?:\w+\s*\(|\[[^\]]+\]|\.\w+)/u.test(quote) ||
+    /\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\s*\(/u.test(quote)
+  );
+}
+
 export function buildChangedLineEvidence(
   patches: Readonly<Record<string, string>>,
 ): ChangedLineEvidence {
@@ -73,7 +244,10 @@ export function isGroundedTestEvidence(
   criterion: ReviewGateCriterion,
   evidence: ReviewGateTestEvidence,
 ): boolean {
-  if (!isTestEvidencePath(evidence.file)) {
+  if (
+    !isTestEvidencePath(evidence.file) ||
+    isSettingsPersistenceCriterion(criterion.sourceQuote)
+  ) {
     return false;
   }
 
@@ -136,7 +310,8 @@ export function isGroundedTestEvidence(
       Math.max(0, assertionIndex - 80),
       Math.min(functionLines.length, assertionIndex + 81),
     );
-    const block = normalizedEvidence(blockLines.join("\n"));
+    const rawBlock = blockLines.join("\n");
+    const block = normalizedEvidence(rawBlock);
     const directCallContext = godotDirectCallContext(
       evidence.file,
       evidence.assertionQuote,
@@ -161,6 +336,196 @@ export function isGroundedTestEvidence(
     }
   }
   return false;
+}
+
+/**
+ * Composite criteria such as "persist both settings and restore after
+ * relaunch" are proven by an ordered set of assertions, not a magical single
+ * line. Keep the bundle inside one executable test and bind every selected
+ * line back to the host-owned inventory before evaluating the combined
+ * contract.
+ */
+export function isGroundedTestEvidenceBundle(
+  context: ReviewGroundingContext,
+  criterion: ReviewGateCriterion,
+  evidences: readonly ReviewGateTestEvidence[],
+): boolean {
+  if (evidences.length === 0 || evidences.length > 4) {
+    return false;
+  }
+  const file = evidences[0]!.file;
+  const testName = evidences[0]!.testName;
+  if (
+    !isTestEvidencePath(file) ||
+    evidences.some((evidence) => evidence.file !== file || evidence.testName !== testName)
+  ) {
+    return false;
+  }
+  if (
+    context.evidenceCandidates &&
+    evidences.some((evidence) => !matchingReviewEvidenceCandidate(context.evidenceCandidates!, evidence, "test"))
+  ) {
+    return false;
+  }
+
+  const rawContent = context.currentHeadFileContents[file] || "";
+  if (!rawContent) {
+    return false;
+  }
+  const lines = stripCommentsFromLines(rawContent.split(/\r?\n/gu));
+  const godotExecutableHarness = isGodotExecutableHarness(file, lines);
+  for (let index = 0; index < lines.length; index += 1) {
+    if (
+      !isNamedTestDeclaration(file, lines, index, testName, godotExecutableHarness) ||
+      isSkippedTestDeclaration(file, lines, index)
+    ) {
+      continue;
+    }
+    let end = lines.length;
+    for (let candidate = index + 1; candidate < lines.length; candidate += 1) {
+      if (isTestBoundary(file, lines, candidate, godotExecutableHarness)) {
+        end = candidate;
+        break;
+      }
+    }
+    const blockLines = lines.slice(index, end);
+    const selectedIndices = evidences.map((evidence) =>
+      blockLines.findIndex((line) =>
+        normalizedEvidence(line) === normalizedEvidence(evidence.assertionQuote)),
+    );
+    if (
+      selectedIndices.some((selected) => selected < 0) ||
+      new Set(selectedIndices).size !== selectedIndices.length
+    ) {
+      continue;
+    }
+    const ordered = [...selectedIndices].sort((left, right) => left - right);
+    if (ordered.at(-1)! - ordered[0]! > 200) {
+      continue;
+    }
+    const selectedHasAssertion = evidences.some((evidence) =>
+      !isVacuousAssertion(evidence.assertionQuote) &&
+      (hasExecutableAssertionLine(blockLines, normalizedEvidence(evidence.assertionQuote)) ||
+        isGuardAssertionSyntax(file, evidence.assertionQuote)),
+    );
+    const rawBlock = blockLines.join("\n");
+    const block = normalizedEvidence(rawBlock);
+    const supportingContext = supportingTestContext(file, lines);
+    const selectedText = evidences.map((evidence) => evidence.assertionQuote).join("\n");
+    if (isSettingsPersistenceCriterion(criterion.sourceQuote)) {
+      return selectedHasAssertion && isGroundedSettingsPersistenceBundle(
+        criterion.sourceQuote,
+        selectedText,
+        block,
+        supportingContext,
+      );
+    }
+    const syntheticEvidence: ReviewGateTestEvidence = {
+      file,
+      testName,
+      assertionQuote: evidences.map((evidence) => evidence.assertionQuote).join("\n"),
+      explanationKo: evidences.map((evidence) => evidence.explanationKo || "").join(" "),
+    };
+    if (
+      selectedHasAssertion &&
+      criterionAnchorsMatch(
+        criterion.sourceQuote,
+        syntheticEvidence,
+        block,
+        supportingContext,
+        "",
+      )
+    ) {
+      return true;
+    }
+    if (
+      isGroundedImmediateToggleBundle(
+        criterion.sourceQuote,
+        selectedText,
+        rawBlock,
+        selectedIndices,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function matchingReviewEvidenceCandidate(
+  candidates: readonly ReviewEvidenceCandidate[],
+  evidence: ReviewGateTestEvidence,
+  kind?: ReviewEvidenceCandidate["kind"],
+): ReviewEvidenceCandidate | undefined {
+  return candidates.find((candidate) =>
+    (!kind || candidate.kind === kind) &&
+    candidate.file === evidence.file &&
+    candidate.testName === evidence.testName &&
+    normalizedEvidence(candidate.quote) === normalizedEvidence(evidence.assertionQuote),
+  );
+}
+
+function isGroundedSettingsPersistenceBundle(
+  sourceQuote: string,
+  selectedText: string,
+  block: string,
+  supportingContext: string,
+): boolean {
+  if (!isSettingsPersistenceCriterion(sourceQuote)) {
+    return false;
+  }
+  const context = `${block}\n${supportingContext}`;
+  const explicitIdentifiers = [...sourceQuote.matchAll(/`([^`]{2,120})`/gu)]
+    .map((match) => canonicalExplicitIdentifier(match[1] || ""))
+    .filter(Boolean);
+  const canonicalContext = canonicalExplicitIdentifier(context);
+  const selected = normalizedEvidence(selectedText);
+  const selectedLines = selectedText.split(/\r?\n/gu).map((line) => normalizedEvidence(line));
+  const lineMentions = (subject: RegExp, stage: RegExp): boolean =>
+    selectedLines.some((line) => subject.test(line) && stage.test(line));
+  const persistenceStage = /(?:persist|save|store|write|저장)/iu;
+  const restorationStage = /(?:restore|relaunch|restart|load|복원|재실행)/iu;
+  return (
+    explicitIdentifiers.every((identifier) => canonicalContext.includes(identifier)) &&
+    /(?:persist|save|store|write|저장)/iu.test(context) &&
+    /(?:restore|relaunch|restart|load|복원|재실행)/iu.test(context) &&
+    lineMentions(/sound/iu, persistenceStage) &&
+    lineMentions(/haptic/iu, persistenceStage) &&
+    lineMentions(/sound/iu, restorationStage) &&
+    lineMentions(/haptic/iu, restorationStage) &&
+    (selected.match(/(?:\b|_)(?:assert\w*|expect)\s*\(/giu) || []).length >= 2
+  );
+}
+
+function isSettingsPersistenceCriterion(sourceQuote: string): boolean {
+  return (
+    /두\s*(?:가지\s*)?설정|both\s+settings|sound.{0,80}haptic|haptic.{0,80}sound/iu.test(sourceQuote) &&
+    /(?:저장|persist|save).{0,80}(?:다시\s*실행|재실행|복원|relaunch|restart|restore)/iu.test(
+      sourceQuote,
+    )
+  );
+}
+
+function isGroundedImmediateToggleBundle(
+  sourceQuote: string,
+  selectedText: string,
+  block: string,
+  selectedIndices: readonly number[],
+): boolean {
+  if (
+    !/(?:토글|설정|toggle|setting).{0,40}(?:다음\s*착수|즉시|바로|next\s+move|immediate)/iu.test(sourceQuote)
+  ) {
+    return false;
+  }
+  const firstSelected = Math.min(...selectedIndices);
+  const selectedTail = block.split("\n").slice(firstSelected, firstSelected + 90).join("\n");
+  const selected = normalizedEvidence(selectedText);
+  return (
+    /(?:_set_(?:sound|haptics)_enabled|_press_toggle)\s*\(/u.test(selectedTail) &&
+    /(?:_play_move_(?:sound|haptic)|_commit_player_move)\s*\(/u.test(selectedTail) &&
+    /(?:\b|_)(?:assert\w*|expect)\s*\(/iu.test(selected) &&
+    /(?:다음\s*착수|즉시|바로|next\s+(?:committed\s+)?move|immediate)/iu.test(selected)
+  );
 }
 
 /**
@@ -721,7 +1086,7 @@ function supportingTestContext(file: string, lines: string[]): string {
   }
   return lines
     .filter((line) =>
-      /^\s*(?:const|var)\s+\w+\s*(?::=|=)\s*(?:preload|load)\s*\(/u.test(line),
+      /^\s*(?:const|var)\s+\w+\s*(?::=|=)\s*(?:(?:preload|load)\s*\(|["'][^"']+["']|[-+]?\d+(?:\.\d+)?|true\b|false\b)/u.test(line),
     )
     .join("\n");
 }

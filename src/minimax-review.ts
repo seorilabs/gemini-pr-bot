@@ -51,6 +51,8 @@ export type MiniMaxAcceptanceCoverage = {
   acceptanceCriterion: string;
   status: MiniMaxAcceptanceCoverageStatus;
   testEvidence: MiniMaxAcceptanceTestEvidence | null;
+  /** Additional current-HEAD lines that jointly prove a composite criterion. */
+  supportingTestEvidence?: MiniMaxAcceptanceTestEvidence[];
 };
 
 export type MiniMaxReviewCandidate = {
@@ -154,6 +156,7 @@ const ACCEPTANCE_COVERAGE_KEYS = [
   "acceptance_criterion",
   "status",
   "test_evidence",
+  "supporting_test_evidence",
 ] as const;
 const ACCEPTANCE_TEST_EVIDENCE_KEYS = [
   "file",
@@ -304,6 +307,13 @@ function candidateTool(): MiniMaxMessagesRequest["tools"][number] {
               status: { enum: [...MINIMAX_ACCEPTANCE_COVERAGE_STATUSES] },
               test_evidence: {
                 anyOf: [ACCEPTANCE_TEST_EVIDENCE_SCHEMA, { type: "null" }],
+              },
+              supporting_test_evidence: {
+                type: "array",
+                maxItems: 3,
+                description:
+                  "복합 인수조건이 여러 단언의 결합으로 증명될 때 같은 실행 테스트의 추가 current-HEAD 근거를 최대 3개 제출합니다. 단일 근거면 빈 배열입니다.",
+                items: ACCEPTANCE_TEST_EVIDENCE_SCHEMA,
               },
             },
           },
@@ -661,6 +671,11 @@ function validateAcceptanceCoverage(
       `${entryPath}.test_evidence`,
       errors,
     );
+    const supportingTestEvidence = readAcceptanceTestEvidenceArray(
+      entry.supporting_test_evidence,
+      `${entryPath}.supporting_test_evidence`,
+      errors,
+    );
 
     if (status === "covered" && testEvidence === null) {
       errors.push(`${entryPath}.test_evidence: covered status requires test evidence`);
@@ -668,17 +683,53 @@ function validateAcceptanceCoverage(
     if ((status === "missing" || status === "unknown") && entry.test_evidence !== null) {
       errors.push(`${entryPath}.test_evidence: ${status} status requires null`);
     }
+    if (
+      (status === "missing" || status === "unknown") &&
+      supportingTestEvidence &&
+      supportingTestEvidence.length > 0
+    ) {
+      errors.push(`${entryPath}.supporting_test_evidence: ${status} status requires an empty array`);
+    }
 
-    if (criterionId && acceptanceCriterion && status && testEvidence !== undefined) {
+    if (
+      criterionId &&
+      acceptanceCriterion &&
+      status &&
+      testEvidence !== undefined &&
+      supportingTestEvidence
+    ) {
       coverage.push({
         criterionId,
         acceptanceCriterion,
         status: status as MiniMaxAcceptanceCoverageStatus,
         testEvidence,
+        supportingTestEvidence,
       });
     }
   }
   return coverage;
+}
+
+function readAcceptanceTestEvidenceArray(
+  raw: unknown,
+  path: string,
+  errors: string[],
+): MiniMaxAcceptanceTestEvidence[] | null {
+  if (!Array.isArray(raw)) {
+    errors.push(`${path}: expected an array`);
+    return null;
+  }
+  if (raw.length > 3) {
+    errors.push(`${path}: expected at most 3 items`);
+  }
+  const result: MiniMaxAcceptanceTestEvidence[] = [];
+  for (const [index, item] of raw.entries()) {
+    const evidence = readAcceptanceTestEvidence(item, `${path}[${index}]`, errors);
+    if (evidence) {
+      result.push(evidence);
+    }
+  }
+  return result;
 }
 
 function readAcceptanceTestEvidence(

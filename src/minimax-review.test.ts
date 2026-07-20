@@ -82,6 +82,7 @@ function acceptanceCoverage(
             explanation_ko: "저장한 값과 다시 불러온 값을 직접 비교하는 단언입니다.",
           }
         : null,
+    supporting_test_evidence: [],
   };
 }
 
@@ -379,6 +380,23 @@ test("covered requires exact test evidence while missing and unknown require nul
   assert.ok(parsed.errors.some((error) => error.includes("covered status requires")));
   assert.ok(parsed.errors.some((error) => error.includes("missing status requires null")));
   assert.ok(parsed.errors.some((error) => error.includes("unknown status requires null")));
+});
+
+test("composite coverage accepts at most three additional current-HEAD evidence rows", () => {
+  const row = acceptanceCoverage("covered");
+  row.supporting_test_evidence = [
+    {
+      file: "src/save.test.ts",
+      line: 31,
+      test_name: "저장값을 다시 복원한다",
+      assertion_quote: "assert.equal(restored.haptics, false)",
+      explanation_ko: "재실행 후 햅틱 설정도 함께 복원되는지 확인합니다.",
+    },
+  ];
+  const parsed = parseMiniMaxReviewPayload(reviewPayload([], [row]));
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.acceptanceCoverage[0]?.supportingTestEvidence?.length, 1);
 });
 
 test("coverage and test evidence reject unknown fields and invalid Korean explanation", () => {
