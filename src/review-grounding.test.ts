@@ -3,6 +3,7 @@ import test from "node:test";
 import type { ReviewGateCriterion, ReviewGateFatalBlocker } from "./review-gate.js";
 import {
   buildChangedLineEvidence,
+  buildReviewEvidenceCandidates,
   isGroundedFatalBlocker,
   isGroundedTestEvidence,
   sameFatalBlockerSet,
@@ -25,6 +26,44 @@ function criterion(sourceQuote: string): ReviewGateCriterion {
     testEvidence: null,
   };
 }
+
+test("큰 Godot smoke에서는 AC와 직접 겹치는 후반 assertion을 후보 예산 안에 우선 포함한다", () => {
+  const file = "tools/core_probe.gd";
+  const noise = Array.from(
+    { length: 180 },
+    (_, index) => `\t_check(noise_${index} == ${index}, "unrelated probe ${index}")`,
+  );
+  const target =
+    '_check(sim_8h == 28800.0, "AC-2: plan(28800, cap) reflects the full 8h absence as the settlement window")';
+  const source = [
+    "extends SceneTree",
+    "var failures := 0",
+    "func _init() -> void:",
+    "\t_run()",
+    "func _run() -> void:",
+    ...noise,
+    `\t${target}`,
+    "\tquit(1 if failures > 0 else 0)",
+  ].join("\n");
+
+  const unranked = buildReviewEvidenceCandidates(
+    { [file]: source },
+    { maxChars: 2_000 },
+  );
+  const ranked = buildReviewEvidenceCandidates(
+    { [file]: source },
+    {
+      maxChars: 2_000,
+      acceptanceCriteria: [
+        "첫 조건",
+        "`offline_settlement.plan()`이 8시간 부재를 정산하며 sim=28800으로 반영한다.",
+      ],
+    },
+  );
+
+  assert.equal(unranked.some((candidate) => candidate.quote === target), false);
+  assert.equal(ranked.some((candidate) => candidate.quote === target), true);
+});
 
 test("test evidence requires a real assertion near a nontrivial test name", () => {
   const file = "src/save.test.ts";
