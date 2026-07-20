@@ -7,6 +7,7 @@ import {
   formatReviewEvidenceCandidates,
   isGroundedFatalBlocker,
   isGroundedTestEvidence,
+  isGroundedTestEvidenceBundle,
   sameFatalBlockerSet,
   type ReviewGroundingContext,
 } from "./review-grounding.js";
@@ -218,6 +219,71 @@ test("#227 다중 AC 근거는 대형 smoke와 TypeScript helper 사이에서도
     assert.match(quotes, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
   }
   assert.ok(formatReviewEvidenceCandidates(candidates).length <= 40_000);
+});
+
+test("Godot _expect_eq와 _expect_true bundle을 실행 assertion으로 검증한다", () => {
+  const file = "tests/main_ui_smoke_runner.gd";
+  const source = [
+    "extends SceneTree",
+    "var failures := 0",
+    "func _init() -> void:",
+    "\t_test_regression_buttons_signal()",
+    "\tquit(1 if failures > 0 else 0)",
+    "func _test_regression_buttons_signal() -> void:",
+    '\t_expect_eq(scene.enemy_hp, 999.0, "combat tick is frozen while the regression cinematic plays")',
+    '\t_expect_eq(scene.state["progress"]["towerIndex"], 1, "regression confirm resets to tower 1")',
+    '\t_expect_eq(scene.state["progress"]["stageIndex"], 1, "regression confirm signal resets stage")',
+    '\t_expect_true(scene.enemy_hp < 999.0, "combat resumes after the regression cinematic ends")',
+  ].join("\n");
+  const sourceQuote =
+    "연출 중 전투 틱이 정지되고, 연출 종료 후 Tower 1 Stage 1 상태가 정확히 반영된다.";
+  const evidence = [
+    {
+      file,
+      line: 7,
+      testName: "_test_regression_buttons_signal",
+      assertionQuote:
+        '_expect_eq(scene.enemy_hp, 999.0, "combat tick is frozen while the regression cinematic plays")',
+      explanationKo: "연출 중 전투 틱 정지를 검증합니다.",
+    },
+    {
+      file,
+      line: 8,
+      testName: "_test_regression_buttons_signal",
+      assertionQuote:
+        '_expect_eq(scene.state["progress"]["towerIndex"], 1, "regression confirm resets to tower 1")',
+      explanationKo: "Tower 1 상태를 검증합니다.",
+    },
+    {
+      file,
+      line: 9,
+      testName: "_test_regression_buttons_signal",
+      assertionQuote:
+        '_expect_eq(scene.state["progress"]["stageIndex"], 1, "regression confirm signal resets stage")',
+      explanationKo: "Stage 1 상태를 검증합니다.",
+    },
+    {
+      file,
+      line: 10,
+      testName: "_test_regression_buttons_signal",
+      assertionQuote:
+        '_expect_true(scene.enemy_hp < 999.0, "combat resumes after the regression cinematic ends")',
+      explanationKo: "연출 종료 후 전투 재개를 검증합니다.",
+    },
+  ];
+  const candidates = buildReviewEvidenceCandidates(
+    { [file]: source },
+    { acceptanceCriteria: [sourceQuote] },
+  );
+  const reviewContext = {
+    currentHeadFileContents: { [file]: source },
+    visibleChangedPatches: {},
+    evidenceCandidates: candidates,
+  };
+  const acceptance = criterion(sourceQuote);
+
+  assert.equal(isGroundedTestEvidence(reviewContext, acceptance, evidence[0]!), true);
+  assert.equal(isGroundedTestEvidenceBundle(reviewContext, acceptance, evidence), true);
 });
 
 test("test evidence requires a real assertion near a nontrivial test name", () => {
