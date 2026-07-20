@@ -88,12 +88,15 @@ test("tracked symlinks do not make test discovery partial and all regular tests 
     });
 
     assert.equal(result.testInventoryComplete, true);
+    assert.equal(result.testInventoryFileCount, 2);
     assert.match(result.markdown, /Test discovery complete: true/);
     assert.match(result.markdown, /Test inventory discovered: 2/);
     assert.match(result.markdown, /Test inventory included: 2/);
     assert.match(result.markdown, /Test inventory complete: true/);
     assert.ok(result.fileContents["tests/player_test.gd"]);
     assert.ok(result.fileContents["tests/network_test.gd"]);
+    assert.ok(result.evidenceFileContents["tests/player_test.gd"]);
+    assert.ok(result.evidenceFileContents["tests/network_test.gd"]);
     assert.equal(result.fileContents["vendor/tests/vendor_test.gd"], undefined);
     assert.equal(result.fileContents["generated/tests/generated_test.gd"], undefined);
     assert.ok(
@@ -101,6 +104,25 @@ test("tracked symlinks do not make test discovery partial and all regular tests 
         result.markdown.indexOf("### tests/network_test.gd"),
       "related test should remain ahead of unrelated discovered tests",
     );
+
+    const promptBounded = await buildDeepRepoContext({
+      repo: { owner: "local", repo: "repo", fullName: "local/repo", isPrivate: true },
+      prNumber: 149,
+      headSha,
+      files: [{ filename: "src/player.gd", patch: "+func move():" }],
+      installationToken: "fixture-token",
+      config: {
+        deepRepoContextMode: "always",
+        deepRepoContextTimeoutMs: 10_000,
+        deepRepoContextMaxFiles: 20,
+        deepRepoContextMaxBytes: 300,
+      } as Config,
+    });
+    assert.equal(promptBounded.testInventoryComplete, true);
+    assert.equal(promptBounded.testInventoryFileCount, 2);
+    assert.equal(promptBounded.fileContents["tests/player_test.gd"], undefined);
+    assert.ok(promptBounded.evidenceFileContents["tests/player_test.gd"]);
+    assert.ok(promptBounded.evidenceFileContents["tests/network_test.gd"]);
   } finally {
     if (previousGitConfigGlobal === undefined) {
       delete process.env.GIT_CONFIG_GLOBAL;

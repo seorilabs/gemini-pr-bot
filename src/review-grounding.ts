@@ -17,12 +17,20 @@ export type ReviewEvidenceCandidate = {
   line: number;
   testName: string;
   quote: string;
+  /** Host-extracted nearby declaration/AC comments used only for retrieval. */
+  contextHint?: string;
+  /** Assertion-local comments, excluding broad function-level context. */
+  localContextHint?: string;
+  /** Host-resolved local helper/call path used for semantic retrieval. */
+  semanticContextHint?: string;
 };
 
 export type ReviewEvidenceCandidateOptions = {
   maxCandidates?: number;
   maxChars?: number;
   acceptanceCriteria?: readonly string[];
+  /** Latest contributor response; explicit file/test references outrank guesses. */
+  referenceText?: string;
 };
 
 export type ChangedLineEvidence = Map<string, Map<number, string>>;
@@ -88,6 +96,7 @@ export function buildReviewEvidenceCandidates(
   const maxCandidates = options.maxCandidates ?? 240;
   const maxChars = options.maxChars ?? 40_000;
   const acceptanceCriteria = options.acceptanceCriteria || [];
+  const referenceText = options.referenceText || "";
   const testCandidates: Omit<ReviewEvidenceCandidate, "id">[] = [];
   const sourceCandidates: Omit<ReviewEvidenceCandidate, "id">[] = [];
   const seen = new Set<string>();
@@ -107,7 +116,8 @@ export function buildReviewEvidenceCandidates(
     if (!rawContent || !PRODUCT_SOURCE_EXTENSIONS.has(file.toLowerCase().match(/\.[^.\/]+$/u)?.[0] || "")) {
       continue;
     }
-    const lines = stripCommentsFromLines(rawContent.split(/\r?\n/gu));
+    const rawLines = rawContent.split(/\r?\n/gu);
+    const lines = stripCommentsFromLines(rawLines);
     if (isTestEvidencePath(file)) {
       const godotExecutableHarness = isGodotExecutableHarness(file, lines);
       for (let index = 0; index < lines.length; index += 1) {
@@ -121,6 +131,7 @@ export function buildReviewEvidenceCandidates(
         if (!testName || GENERIC_TEST_NAMES.has(testName.toLowerCase())) {
           continue;
         }
+        const testContextHint = evidenceContextHint(rawLines, index, index);
         let end = lines.length;
         for (let candidate = index + 1; candidate < lines.length; candidate += 1) {
           if (isTestBoundary(file, lines, candidate, godotExecutableHarness)) {
@@ -128,18 +139,29 @@ export function buildReviewEvidenceCandidates(
             break;
           }
         }
+        const functionLines = lines.slice(index, end);
         for (let lineIndex = index + 1; lineIndex < end; lineIndex += 1) {
           const firstLine = (lines[lineIndex] || "").trim();
           if (!isEvidenceCandidateTestLine(file, firstLine)) {
             continue;
           }
           const candidateSpan = collectEvidenceCandidateSpan(lines, lineIndex, end);
+          const localContextHint = localEvidenceContextHint(rawLines, lineIndex);
+          const semanticContextHint = localHelperCallContext(
+            file,
+            candidateSpan.quote,
+            functionLines,
+            currentHeadFileContents,
+          ).slice(0, 400) || undefined;
           add(testCandidates, {
             kind: "test",
             file,
             line: lineIndex + 1,
             testName,
             quote: candidateSpan.quote,
+            contextHint: evidenceContextHint(rawLines, index, lineIndex, testContextHint),
+            localContextHint,
+            semanticContextHint,
           });
           lineIndex = candidateSpan.end;
         }
@@ -166,28 +188,26 @@ export function buildReviewEvidenceCandidates(
         line: index + 1,
         testName: symbol,
         quote,
+        contextHint: evidenceContextHint(rawLines, index, index),
+        localContextHint: localEvidenceContextHint(rawLines, index),
       });
     }
   }
 
   const bounded: Omit<ReviewEvidenceCandidate, "id">[] = [];
   let serializedChars = 0;
-  const orderedCandidates = [...testCandidates, ...sourceCandidates].sort((left, right) => {
-    const relevance = evidenceCandidateRelevance(right, acceptanceCriteria) -
-      evidenceCandidateRelevance(left, acceptanceCriteria);
-    if (relevance !== 0) {
-      return relevance;
-    }
-    if (left.kind !== right.kind) {
-      return left.kind === "test" ? -1 : 1;
-    }
-    return left.file.localeCompare(right.file) || left.line - right.line;
-  });
+  const orderedCandidates = orderEvidenceCandidates(
+    [...testCandidates, ...sourceCandidates],
+    acceptanceCriteria,
+    referenceText,
+  );
   for (const candidate of orderedCandidates) {
     if (bounded.length >= Math.max(0, maxCandidates)) {
       break;
     }
-    const candidateChars = JSON.stringify(candidate).length + 1;
+    // The wire form gains a short E-NNN id after bounding. Reserve enough room
+    // so the final candidate menu never crosses the configured prompt budget.
+    const candidateChars = JSON.stringify(reviewEvidenceCandidateWire(candidate)).length + 24;
     if (bounded.length > 0 && serializedChars + candidateChars > Math.max(0, maxChars)) {
       break;
     }
@@ -200,18 +220,112 @@ export function buildReviewEvidenceCandidates(
   }));
 }
 
+function orderEvidenceCandidates(
+  candidates: Array<Omit<ReviewEvidenceCandidate, "id">>,
+  acceptanceCriteria: readonly string[],
+  referenceText: string,
+): Array<Omit<ReviewEvidenceCandidate, "id">> {
+  const compare = (criteria: readonly string[]) => (
+    left: Omit<ReviewEvidenceCandidate, "id">,
+    right: Omit<ReviewEvidenceCandidate, "id">,
+  ): number => {
+    const relevance = evidenceCandidateRelevance(right, criteria, referenceText) -
+      evidenceCandidateRelevance(left, criteria, referenceText);
+    if (relevance !== 0) {
+      return relevance;
+    }
+    if (left.kind !== right.kind) {
+      return left.kind === "test" ? -1 : 1;
+    }
+    return left.file.localeCompare(right.file) || left.line - right.line;
+  };
+  if (acceptanceCriteria.length === 0) {
+    return [...candidates].sort(compare([]));
+  }
+
+  const rankings = acceptanceCriteria.map((criterion, index) => {
+    const scopedReference = criterionReferenceText(referenceText, index);
+    const criterionCompare = (
+      left: Omit<ReviewEvidenceCandidate, "id">,
+      right: Omit<ReviewEvidenceCandidate, "id">,
+    ): number => {
+      const relevance = evidenceCandidateRelevance(right, [criterion], scopedReference, index) -
+        evidenceCandidateRelevance(left, [criterion], scopedReference, index);
+      if (relevance !== 0) {
+        return relevance;
+      }
+      if (left.kind !== right.kind) {
+        return left.kind === "test" ? -1 : 1;
+      }
+      return left.file.localeCompare(right.file) || left.line - right.line;
+    };
+    return [...candidates].sort(criterionCompare);
+  });
+  const ordered: Array<Omit<ReviewEvidenceCandidate, "id">> = [];
+  const selected = new Set<string>();
+  const key = (candidate: Omit<ReviewEvidenceCandidate, "id">): string =>
+    `${candidate.file}:${candidate.line}:${candidate.testName}:${normalizedEvidence(candidate.quote)}`;
+  // Round-robin the best evidence for every AC before filling the remaining
+  // global ranking. One large test function can no longer consume the entire
+  // prompt menu before later criteria receive a candidate.
+  const perCriterionDepth = 24;
+  const rankingCursors = rankings.map(() => 0);
+  for (let round = 0; round < perCriterionDepth; round += 1) {
+    for (const [rankingIndex, ranking] of rankings.entries()) {
+      while (rankingCursors[rankingIndex] < ranking.length) {
+        const candidate = ranking[rankingCursors[rankingIndex]];
+        rankingCursors[rankingIndex] += 1;
+        if (!candidate || selected.has(key(candidate))) {
+          continue;
+        }
+        selected.add(key(candidate));
+        ordered.push(candidate);
+        break;
+      }
+    }
+  }
+  for (const candidate of [...candidates].sort(compare(acceptanceCriteria))) {
+    if (!selected.has(key(candidate))) {
+      selected.add(key(candidate));
+      ordered.push(candidate);
+    }
+  }
+  return ordered;
+}
+
+function criterionReferenceText(referenceText: string, criterionIndex: number): string {
+  if (!referenceText) {
+    return "";
+  }
+  const marker = new RegExp(`\\bAC-${criterionIndex + 1}\\b`, "iu");
+  const match = marker.exec(referenceText);
+  if (!match) {
+    return referenceText;
+  }
+  const tail = referenceText.slice(match.index);
+  const nextMarker = /\bAC-\d+\b/giu;
+  nextMarker.lastIndex = match[0].length;
+  const next = nextMarker.exec(tail);
+  return tail.slice(0, next?.index ?? Math.min(tail.length, 1_200));
+}
+
 function evidenceCandidateRelevance(
   candidate: Omit<ReviewEvidenceCandidate, "id">,
   acceptanceCriteria: readonly string[],
+  referenceText = "",
+  criterionNumberOffset = 0,
 ): number {
   const haystack = normalizedEvidence(
-    `${candidate.file} ${candidate.testName} ${candidate.quote}`,
+    `${candidate.file} ${candidate.testName} ${candidate.quote} ${candidate.localContextHint || ""} ${candidate.semanticContextHint || ""}`,
   );
+  const retrievalHaystack = normalizedEvidence(`${haystack} ${candidate.contextHint || ""}`);
   const canonicalHaystack = canonicalExplicitIdentifier(haystack);
-  let best = 0;
+  let best = ASSERTION_PATTERN.test(candidate.quote) || isGuardAssertionSyntax(candidate.file, candidate.quote)
+    ? 30
+    : 0;
   for (const [index, criterion] of acceptanceCriteria.entries()) {
     let score = 0;
-    if (new RegExp(`(?:^|[^0-9])AC-${index + 1}(?:[^0-9]|$)`, "iu").test(haystack)) {
+    if (new RegExp(`(?:^|[^0-9])AC-${criterionNumberOffset + index + 1}(?:[^0-9]|$)`, "iu").test(retrievalHaystack)) {
       score += 40;
     }
     for (const match of criterion.matchAll(/`([^`]{2,120})`/gu)) {
@@ -233,6 +347,32 @@ function evidenceCandidateRelevance(
     }
     best = Math.max(best, score);
   }
+  // AC labels describe routing, not product data. Leaving the label number in
+  // token scoring lets unrelated noise_1/noise_10 assertions outrank an exact
+  // contributor reference such as `aura` or `whiteout`.
+  const normalizedReference = normalizedEvidence(
+    referenceText.replace(/\bAC-\d+\b/giu, " "),
+  );
+  if (normalizedReference) {
+    const fileMentioned = normalizedReference.includes(normalizedEvidence(candidate.file));
+    const testMentioned = normalizedReference.includes(normalizedEvidence(candidate.testName));
+    if (fileMentioned) {
+      best += 40;
+    }
+    if (testMentioned) {
+      best += 60;
+    }
+    const referenceTokens = new Set(
+      normalizedReference.match(
+        /[A-Za-z_][A-Za-z0-9_.]{2,}|\d+(?:\.\d+)?|[\p{Script=Hangul}]{2,}/gu,
+      ) || [],
+    );
+    for (const token of referenceTokens) {
+      if (haystack.includes(token)) {
+        best += /^\d/u.test(token) ? 4 : token.includes("_") ? 8 : 2;
+      }
+    }
+  }
   return best;
 }
 
@@ -242,14 +382,57 @@ export function formatReviewEvidenceCandidates(
   if (candidates.length === 0) {
     return "(current-HEAD evidence candidate 없음)";
   }
-  return candidates.map((candidate) => JSON.stringify({
-    id: candidate.id,
+  return candidates.map((candidate) => JSON.stringify(reviewEvidenceCandidateWire(candidate))).join("\n");
+}
+
+function reviewEvidenceCandidateWire(candidate: Omit<ReviewEvidenceCandidate, "id"> | ReviewEvidenceCandidate): Record<string, unknown> {
+  const promptContext = [candidate.contextHint, candidate.semanticContextHint]
+    .filter(Boolean)
+    .join(" ")
+    .slice(0, 500);
+  return {
+    ...("id" in candidate ? { id: candidate.id } : {}),
     kind: candidate.kind,
     file: candidate.file,
     line: candidate.line,
     test_name: candidate.testName,
     quote: candidate.quote,
-  })).join("\n");
+    ...(promptContext ? { context_hint: promptContext } : {}),
+  };
+}
+
+function evidenceContextHint(
+  rawLines: readonly string[],
+  declarationIndex: number,
+  evidenceIndex: number,
+  inherited = "",
+): string | undefined {
+  const windows = [
+    ...rawLines.slice(Math.max(0, declarationIndex - 4), Math.min(rawLines.length, declarationIndex + 9)),
+    ...rawLines.slice(Math.max(0, evidenceIndex - 5), evidenceIndex + 1),
+  ];
+  const comments = windows
+    .map((line) => line.trim())
+    .filter((line) => /^(?:#|\/\/|\/\*|\*|<!--)/u.test(line))
+    .map((line) => line.replace(/^(?:#+|\/\/|\/\*+|\*+|<!--)\s*/u, "").replace(/(?:\*\/|-->)$/u, "").trim())
+    .filter(Boolean);
+  const uniqueComments = comments.filter((comment) => !inherited.includes(comment));
+  const value = [inherited, ...new Set(uniqueComments)].filter(Boolean).join(" ");
+  return value ? value.slice(0, 240) : undefined;
+}
+
+function localEvidenceContextHint(
+  rawLines: readonly string[],
+  evidenceIndex: number,
+): string | undefined {
+  const comments = rawLines
+    .slice(Math.max(0, evidenceIndex - 6), evidenceIndex + 1)
+    .map((line) => line.trim())
+    .filter((line) => /^(?:#|\/\/|\/\*|\*|<!--)/u.test(line))
+    .map((line) => line.replace(/^(?:#+|\/\/|\/\*+|\*+|<!--)\s*/u, "").replace(/(?:\*\/|-->)$/u, "").trim())
+    .filter(Boolean);
+  const value = [...new Set(comments)].join(" ");
+  return value ? value.slice(0, 240) : undefined;
 }
 
 function declaredTestName(file: string, declaration: string): string | null {
@@ -454,13 +637,21 @@ export function isGroundedTestEvidence(
     );
     const rawBlock = blockLines.join("\n");
     const block = normalizedEvidence(rawBlock);
-    const directCallContext = godotDirectCallContext(
-      evidence.file,
-      evidence.assertionQuote,
-      blockLines,
-      supportingContext,
-      context.currentHeadFileContents,
-    );
+    const directCallContext = [
+      godotDirectCallContext(
+        evidence.file,
+        evidence.assertionQuote,
+        blockLines,
+        supportingContext,
+        context.currentHeadFileContents,
+      ),
+      localHelperCallContext(
+        evidence.file,
+        evidence.assertionQuote,
+        blockLines,
+        context.currentHeadFileContents,
+      ),
+    ].filter(Boolean).join("\n");
     const semanticMatch =
       criterionAnchorsMatch(
         criterion.sourceQuote,
@@ -1289,6 +1480,64 @@ function godotDirectCallContext(
       }
     }
     blocks.push(lines.slice(start, end).join("\n"));
+  }
+  return blocks.join("\n");
+}
+
+/**
+ * Resolve local JS/TS test helpers into a bounded Host-only call context.
+ * This connects semantic paths such as `system.settings` to an assertion that
+ * calls normalizeSettings(), without asking the model to fabricate that link.
+ */
+function localHelperCallContext(
+  file: string,
+  assertion: string,
+  testBlockLines: string[],
+  currentHeadFileContents: Readonly<Record<string, string>>,
+): string {
+  if (!/\.(?:[cm]?[jt]sx?)$/iu.test(file)) {
+    return "";
+  }
+  const source = currentHeadFileContents[file];
+  if (!source) {
+    return "";
+  }
+  const assertionSpan = findEvidenceSpan(testBlockLines, assertion);
+  const callWindow = !assertionSpan
+    ? assertion
+    : testBlockLines.slice(Math.max(0, assertionSpan.start - 12), assertionSpan.end + 1).join("\n");
+  const calledNames = new Set(
+    [...callWindow.matchAll(/(?:^|[^.\w])([A-Za-z_$][\w$]*)\s*\(/gu)]
+      .map((match) => match[1] || "")
+      .filter((name) => name.length >= 3 && !["assert", "expect", "test", "describe", "it"].includes(name)),
+  );
+  if (calledNames.size === 0) {
+    return "";
+  }
+
+  const lines = stripCommentsFromLines(source.split(/\r?\n/gu));
+  const blocks: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] || "";
+    const declaration = line.match(/^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/u)?.[1] ||
+      line.match(/^\s*(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=.*(?:=>|function\b)/u)?.[1];
+    if (!declaration || !calledNames.has(declaration)) {
+      continue;
+    }
+    const collected: string[] = [];
+    let balance = 0;
+    let opened = false;
+    for (let end = index; end < Math.min(lines.length, index + 120); end += 1) {
+      const current = lines[end] || "";
+      collected.push(current);
+      const delta = delimiterDeltaOutsideStrings(current);
+      balance += delta;
+      opened ||= current.includes("{");
+      if (opened && balance <= 0) {
+        break;
+      }
+    }
+    blocks.push(collected.join("\n"));
   }
   return blocks.join("\n");
 }

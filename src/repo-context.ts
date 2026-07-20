@@ -88,6 +88,12 @@ type TestInventorySelection = {
   contentScanComplete: boolean;
   discovered: string[];
   relevant: string[];
+  /**
+   * Host-only current-HEAD test bodies used to build and verify the evidence
+   * index. These contents are deliberately independent from the bounded
+   * markdown rendered for the model prompt.
+   */
+  fileContents: Readonly<Record<string, string>>;
 };
 
 type ContextFileSelection = {
@@ -114,17 +120,29 @@ export type DeepRepoContextInput = {
 export type DeepRepoContextResult = {
   markdown: string;
   testInventoryComplete: boolean;
+  testInventoryFileCount: number;
+  /** Host-only exhaustive test evidence source. Never rendered wholesale. */
+  evidenceFileContents: Readonly<Record<string, string>>;
+  /** Prompt-visible selected repository files. */
   fileContents: Readonly<Record<string, string>>;
 };
 
 export async function buildDeepRepoContext(input: DeepRepoContextInput): Promise<DeepRepoContextResult> {
   if (!shouldBuildDeepRepoContext(input)) {
-    return { markdown: "", testInventoryComplete: false, fileContents: {} };
+    return {
+      markdown: "",
+      testInventoryComplete: false,
+      testInventoryFileCount: 0,
+      evidenceFileContents: {},
+      fileContents: {},
+    };
   }
   if (!input.installationToken) {
     return {
       markdown: "Deep repository context skipped: installation token unavailable.",
       testInventoryComplete: false,
+      testInventoryFileCount: 0,
+      evidenceFileContents: {},
       fileContents: {},
     };
   }
@@ -140,6 +158,8 @@ export async function buildDeepRepoContext(input: DeepRepoContextInput): Promise
     return {
       markdown: `Deep repository context unavailable: ${sanitizeError(error)}`,
       testInventoryComplete: false,
+      testInventoryFileCount: 0,
+      evidenceFileContents: {},
       fileContents: {},
     };
   } finally {
@@ -253,14 +273,18 @@ async function collectRepositoryContext(
     if (result.length <= maxBytes) {
       return {
         markdown: result,
-        testInventoryComplete: isTestInventoryComplete(selection, includedPaths),
+        testInventoryComplete: isTestInventoryComplete(selection),
+        testInventoryFileCount: selection.testInventory.discovered.length,
+        evidenceFileContents: selection.testInventory.fileContents,
         fileContents: Object.fromEntries(rendered.map((item) => [item.path, item.content])),
       };
     }
     if (rendered.length === 0) {
       return {
         markdown: truncate(header, maxBytes),
-        testInventoryComplete: false,
+        testInventoryComplete: isTestInventoryComplete(selection),
+        testInventoryFileCount: selection.testInventory.discovered.length,
+        evidenceFileContents: selection.testInventory.fileContents,
         fileContents: {},
       };
     }
@@ -276,7 +300,7 @@ function buildRepositoryContextHeader(
   const inventory = selection.testInventory;
   const includedTests = inventory.discovered.filter((file) => includedPaths.has(file));
   const includedRelevantTests = inventory.relevant.filter((file) => includedPaths.has(file));
-  const inventoryComplete = isTestInventoryComplete(selection, includedPaths);
+  const inventoryComplete = isTestInventoryComplete(selection);
 
   return [
     `Deep repository context source: shallow clone of current PR HEAD ${input.headSha}.`,
@@ -294,15 +318,12 @@ function buildRepositoryContextHeader(
   ].join("\n");
 }
 
-function isTestInventoryComplete(
-  selection: ContextFileSelection,
-  includedPaths: Set<string>,
-): boolean {
+function isTestInventoryComplete(selection: ContextFileSelection): boolean {
   const inventory = selection.testInventory;
   return (
     inventory.discoveryComplete &&
     inventory.contentScanComplete &&
-    inventory.discovered.every((file) => includedPaths.has(file))
+    inventory.discovered.every((file) => Boolean(inventory.fileContents[file]))
   );
 }
 
@@ -434,6 +455,7 @@ async function buildTestInventory(
   const scanPaths = new Set(scanOrder.slice(0, MAX_TEST_CONTENT_SCAN_FILES));
   let contentScanComplete = discovery.paths.length <= MAX_TEST_CONTENT_SCAN_FILES;
   const scored: ScoredTestCandidate[] = [];
+  const fileContents: Record<string, string> = {};
 
   for (const candidate of discovery.paths) {
     let score = cheapScores.get(candidate) || 0;
@@ -442,6 +464,7 @@ async function buildTestInventory(
       if (content === null) {
         contentScanComplete = false;
       } else {
+        fileContents[candidate] = content;
         score += await scoreTestContent(checkoutDir, candidate, content, changedPaths);
       }
     }
@@ -458,6 +481,7 @@ async function buildTestInventory(
     contentScanComplete,
     discovered: discovery.paths,
     relevant,
+    fileContents,
   };
 }
 

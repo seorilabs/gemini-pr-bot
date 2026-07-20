@@ -306,7 +306,8 @@ function localeCatalogCoverageValidationError(
 /**
  * A grounded PASS for an unchanged HEAD is monotonic. A later model turn may
  * add better evidence, but it cannot erase host-validated evidence from an
- * earlier run of the same prompt contract and commit.
+ * earlier compatible-cache run of the same commit. Every carried quote is
+ * re-grounded against the current Host evidence index before it is reused.
  */
 export function mergeStickyAcceptanceCoverage(
   explicitAcceptanceCriteria: readonly string[],

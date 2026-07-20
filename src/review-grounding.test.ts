@@ -4,6 +4,7 @@ import type { ReviewGateCriterion, ReviewGateFatalBlocker } from "./review-gate.
 import {
   buildChangedLineEvidence,
   buildReviewEvidenceCandidates,
+  formatReviewEvidenceCandidates,
   isGroundedFatalBlocker,
   isGroundedTestEvidence,
   sameFatalBlockerSet,
@@ -63,6 +64,160 @@ test("큰 Godot smoke에서는 AC와 직접 겹치는 후반 assertion을 후보
 
   assert.equal(unranked.some((candidate) => candidate.quote === target), false);
   assert.equal(ranked.some((candidate) => candidate.quote === target), true);
+});
+
+test("Contributor가 지정한 대형 Godot 테스트와 AC 주석은 prompt 파일 예산과 무관하게 우선 검색된다", () => {
+  const file = "tests/main_ui_smoke_runner.gd";
+  const noise = Array.from(
+    { length: 220 },
+    (_, index) => `\t_expect_true(noise_${index}, "unrelated ${index}")`,
+  );
+  const target =
+    '_expect_true(scene.enemy_hp < 999.0, "combat resumes after the regression cinematic ends")';
+  const source = [
+    "extends SceneTree",
+    "var failures := 0",
+    "func _init() -> void:",
+    "\t_test_regression_buttons_signal()",
+    "\tquit(1 if failures > 0 else 0)",
+    "func _test_regression_buttons_signal() -> void:",
+    "\t# [#206][AC-2] 연출 중 전투 틱 정지와 종료 후 재개를 검증한다.",
+    ...noise,
+    `\t${target}`,
+  ].join("\n");
+  const candidates = buildReviewEvidenceCandidates(
+    { [file]: source },
+    {
+      maxChars: 2_500,
+      acceptanceCriteria: ["연출 중 전투 틱이 정지되고 종료 후 재개된다."],
+      referenceText: `${file}::_test_regression_buttons_signal의 enemy_hp assertion을 확인해 주세요.`,
+    },
+  );
+  const selected = candidates.find((candidate) => candidate.quote === target);
+
+  assert.ok(selected);
+  assert.match(selected.contextHint || "", /AC-2/);
+});
+
+test("로컬 테스트 helper 호출을 따라 설명용 dotted 설정 경로를 결속한다", () => {
+  const file = "functions/src/saveSchema.test.ts";
+  const source = [
+    "function normalizeSettings(settings: Record<string, unknown>) {",
+    "  return normalizeSaveState({ system: { settings } }).save.system.settings;",
+    "}",
+    'test("회귀 시네마틱 토글을 라운드트립한다", () => {',
+    "  assert.equal(normalizeSettings({ regressionCinematic: false }).regressionCinematic, false);",
+    "});",
+  ].join("\n");
+  const evidence = {
+    file,
+    testName: "회귀 시네마틱 토글을 라운드트립한다",
+    assertionQuote:
+      "assert.equal(normalizeSettings({ regressionCinematic: false }).regressionCinematic, false);",
+    explanationKo: "회귀 시네마틱 설정값이 라운드트립 뒤에도 유지됩니다.",
+  };
+
+  assert.equal(
+    isGroundedTestEvidence(
+      context({ [file]: source }),
+      criterion("`system.settings`에 회귀 시네마틱 토글이 저장·복원된다."),
+      evidence,
+    ),
+    true,
+  );
+});
+
+test("#227 다중 AC 근거는 대형 smoke와 TypeScript helper 사이에서도 모두 후보 예산에 남는다", () => {
+  const noise = Array.from(
+    { length: 210 },
+    (_, index) => `\t_expect_true(noise_${index}, "unrelated smoke ${index}")`,
+  );
+  const uiComponentsFile = "tests/ui_components_runner.gd";
+  const mainUiFile = "tests/main_ui_smoke_runner.gd";
+  const gddFile = "tests/gdd_acceptance_runner.gd";
+  const schemaFile = "functions/src/saveSchema.test.ts";
+  const sources = {
+    [uiComponentsFile]: [
+      "extends SceneTree",
+      "var failures := 0",
+      "func _init() -> void:",
+      "\t_test_regression_sequence()",
+      "\tquit(1 if failures > 0 else 0)",
+      "func _test_regression_sequence() -> void:",
+      "\t# [AC-1] 회귀 연출 sequence 완료 뒤 상태를 원복한다.",
+      ...noise,
+      '\t_expect_true(sequence.rewind_count == 1, "regression sequence rewinds exactly once")',
+      '\t_expect_true(aura.animation == "idle", "aura animation returns to idle")',
+      '\t_expect_true(whiteout.modulate.a == 0.0, "whiteout is cleared after sequence")',
+    ].join("\n"),
+    [mainUiFile]: [
+      "extends SceneTree",
+      "var failures := 0",
+      "func _init() -> void:",
+      "\t_test_regression_runtime()",
+      "\t_test_regression_toggle_off()",
+      "\tquit(1 if failures > 0 else 0)",
+      "func _test_regression_runtime() -> void:",
+      "\t# [AC-2] 연출 중 전투를 정지하고 종료 뒤 재개한다.",
+      '\t_expect_true(scene.combat_frozen, "combat remains frozen during regression cinematic")',
+      '\t_expect_true(scene.enemy_hp < 999.0, "combat resumes after regression cinematic ends")',
+      "func _test_regression_toggle_off() -> void:",
+      "\t# [AC-4] 사용자 설정이 OFF면 연출을 건너뛴다.",
+      '\t_expect_true(scene.regression_skip_count == 1, "dedicated toggle OFF skips regression cinematic")',
+    ].join("\n"),
+    [gddFile]: [
+      "extends SceneTree",
+      "var failures := 0",
+      "func _init() -> void:",
+      "\t_test_regression_reset_contract()",
+      "\tquit(1 if failures > 0 else 0)",
+      "func _test_regression_reset_contract() -> void:",
+      "\t# [AC-3] GDD 회귀 연출은 tower와 stage를 함께 초기화한다.",
+      '\t_expect_true(state.tower == 0, "gdd regression resets tower")',
+      '\t_expect_true(state.stage == 0, "gdd regression resets stage")',
+    ].join("\n"),
+    [schemaFile]: [
+      "function normalizeSettings(settings: Record<string, unknown>) {",
+      "  return normalizeSaveState({ system: { settings } }).save.system.settings;",
+      "}",
+      'test("regression cinematic setting round-trip", () => {',
+      "  // [AC-5] system.settings 값을 저장하고 복원한다.",
+      "  assert.equal(normalizeSettings({ regressionCinematic: false }).regressionCinematic, false);",
+      "});",
+    ].join("\n"),
+  };
+  const candidates = buildReviewEvidenceCandidates(sources, {
+    acceptanceCriteria: [
+      "Regression Cinematic sequence가 완료되면 상태와 시각 효과가 원복된다.",
+      "연출 중 전투가 정지하고 종료 뒤 다시 진행된다.",
+      "GDD 회귀 연출은 tower와 stage를 초기화한다.",
+      "전용 토글 OFF에서는 회귀 연출을 건너뛴다.",
+      "`system.settings.regressionCinematic` 설정이 저장·복원된다.",
+    ],
+    referenceText: [
+      `AC-1 ${uiComponentsFile}::_test_regression_sequence sequence rewind aura whiteout`,
+      `AC-2 ${mainUiFile}::_test_regression_runtime combat frozen resumes`,
+      `AC-3 ${gddFile}::_test_regression_reset_contract tower stage`,
+      `AC-4 ${mainUiFile}::_test_regression_toggle_off dedicated toggle OFF skip`,
+      `AC-5 ${schemaFile} normalizeSettings regressionCinematic system.settings`,
+    ].join("\n"),
+  });
+  const quotes = candidates.map((candidate) => candidate.quote).join("\n");
+
+  for (const expected of [
+    "regression sequence rewinds exactly once",
+    "aura animation returns to idle",
+    "whiteout is cleared after sequence",
+    "combat remains frozen during regression cinematic",
+    "combat resumes after regression cinematic ends",
+    "dedicated toggle OFF skips regression cinematic",
+    "gdd regression resets tower",
+    "gdd regression resets stage",
+    "normalizeSettings({ regressionCinematic: false })",
+  ]) {
+    assert.match(quotes, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+  }
+  assert.ok(formatReviewEvidenceCandidates(candidates).length <= 40_000);
 });
 
 test("test evidence requires a real assertion near a nontrivial test name", () => {
