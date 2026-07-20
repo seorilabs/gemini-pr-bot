@@ -199,6 +199,152 @@ export function isGroundedTestExecutionEvidence(
   });
 }
 
+/**
+ * A narrow class of acceptance criteria describes source wiring rather than an
+ * observable behavior (for example, "choose_ai_move uses the profile table").
+ * Those criteria may be grounded by an exact current-HEAD implementation line
+ * inside the named function instead of inventing a test-only requirement.
+ */
+export function isGroundedSourceContractEvidence(
+  context: ReviewGroundingContext,
+  criterion: ReviewGateCriterion,
+  evidence: ReviewGateTestEvidence,
+): boolean {
+  const file = evidence.file.toLowerCase();
+  if (
+    isTestEvidencePath(evidence.file) ||
+    !file.endsWith(".gd") ||
+    !isSourceWiringCriterion(criterion.sourceQuote, evidence.testName)
+  ) {
+    return false;
+  }
+  const content = context.currentHeadFileContents[evidence.file] || "";
+  if (!content) {
+    return false;
+  }
+  const lines = stripCommentsFromLines(content.split(/\r?\n/gu));
+  const declaration = new RegExp(`^\\s*func\\s+${escapeRegExp(evidence.testName)}\\s*\\(`, "iu");
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!declaration.test(lines[index] || "")) {
+      continue;
+    }
+    let end = lines.length;
+    for (let candidate = index + 1; candidate < lines.length; candidate += 1) {
+      if (/^\s*func\s+\w+\s*\(/u.test(lines[candidate] || "")) {
+        end = candidate;
+        break;
+      }
+    }
+    const blockLines = lines.slice(index, end);
+    const exactLine = blockLines.find((line) =>
+      normalizedEvidence(line) === normalizedEvidence(evidence.assertionQuote));
+    if (
+      exactLine &&
+      /(?:\w+\s*\(|\[[^\]]+\]|\.\w+)/u.test(exactLine) &&
+      criterionAnchorsMatch(
+        criterion.sourceQuote,
+        evidence,
+        normalizedEvidence(blockLines.join("\n")),
+        "",
+        "",
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Test-matrix criteria may cite the bounded loop that executes assertions for
+ * every case. Accept it only inside an executable test and only when the loop
+ * body contains a real assertion that semantically matches the criterion.
+ */
+export function isGroundedTestMatrixEvidence(
+  context: ReviewGroundingContext,
+  criterion: ReviewGateCriterion,
+  evidence: ReviewGateTestEvidence,
+): boolean {
+  if (
+    !isTestEvidencePath(evidence.file) ||
+    !isTestMatrixCriterion(criterion.sourceQuote) ||
+    !/^\s*(?:for|foreach)\b/iu.test(evidence.assertionQuote)
+  ) {
+    return false;
+  }
+  const content = context.currentHeadFileContents[evidence.file] || "";
+  if (!content) {
+    return false;
+  }
+  const lines = stripCommentsFromLines(content.split(/\r?\n/gu));
+  const godotExecutableHarness = isGodotExecutableHarness(evidence.file, lines);
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!isNamedTestDeclaration(evidence.file, lines, index, evidence.testName, godotExecutableHarness)) {
+      continue;
+    }
+    let end = lines.length;
+    for (let candidate = index + 1; candidate < lines.length; candidate += 1) {
+      if (isTestBoundary(evidence.file, lines, candidate, godotExecutableHarness)) {
+        end = candidate;
+        break;
+      }
+    }
+    const functionLines = lines.slice(index, end);
+    const loopIndex = functionLines.findIndex((line) =>
+      normalizedEvidence(line) === normalizedEvidence(evidence.assertionQuote));
+    if (loopIndex < 0) {
+      continue;
+    }
+    const loopIndent = leadingWhitespace(functionLines[loopIndex] || "");
+    let loopEnd = Math.min(functionLines.length, loopIndex + 60);
+    for (let candidate = loopIndex + 1; candidate < loopEnd; candidate += 1) {
+      const line = functionLines[candidate] || "";
+      if (line.trim() && leadingWhitespace(line) <= loopIndent) {
+        loopEnd = candidate;
+        break;
+      }
+    }
+    const loopBlock = functionLines.slice(loopIndex, loopEnd);
+    if (
+      loopBlock.some((line) => ASSERTION_PATTERN.test(line)) &&
+      criterionAnchorsMatch(
+        criterion.sourceQuote,
+        evidence,
+        normalizedEvidence(loopBlock.join("\n")),
+        "",
+        "",
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isSourceWiringCriterion(sourceQuote: string, functionName: string): boolean {
+  const canonicalSource = canonicalExplicitIdentifier(sourceQuote);
+  const canonicalFunction = canonicalExplicitIdentifier(functionName);
+  const wiringVerb = /사용|호출|참조|조회|읽|연결|적용|통해|\buses?\b|\bcalls?\b|\breferences?\b|\breads?\b|\bwires?\b/iu;
+  const explicitResource =
+    /(?:테이블|프로필|설정|어댑터|API|함수).{0,35}(?:사용|호출|참조|조회|읽|연결|적용)|(?:사용|호출|참조|조회|읽|연결|적용).{0,35}(?:테이블|프로필|설정|어댑터|API|함수)/iu;
+  return (
+    canonicalFunction.length >= 4 &&
+    wiringVerb.test(sourceQuote) &&
+    (canonicalSource.includes(canonicalFunction) || explicitResource.test(sourceQuote))
+  );
+}
+
+function isTestMatrixCriterion(sourceQuote: string): boolean {
+  return (
+    /테스트.{0,40}(?:전체|모든|각|범위|차이).{0,40}(?:검증|확인)|(?:전체|모든|각|범위|차이).{0,40}테스트.{0,40}(?:검증|확인)/iu.test(sourceQuote) ||
+    /\btests?\b.{0,50}\b(?:all|every|each|range|matrix|difference)\b|\b(?:all|every|each|range|matrix|difference)\b.{0,50}\btests?\b/iu.test(sourceQuote)
+  );
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
 function testExecutionSubjectMatches(
   sourceQuote: string,
   evidence: ReviewGateTestEvidence,
@@ -443,7 +589,7 @@ function isRegisteredTestDeclaration(
   if (extension === ".gd") {
     return (
       /^\s*func\s+_?test[_A-Z]\w*\s*\(/iu.test(line) ||
-      (godotExecutableHarness && /^\s*func\s+_(?:run|test)\w*\s*\(/iu.test(line))
+      (godotExecutableHarness && /^\s*func\s+_(?:run|test|init|initialize|ready)\w*\s*\(/iu.test(line))
     );
   }
   if ([".rb", ".php"].includes(extension)) {
@@ -461,13 +607,13 @@ function isGodotExecutableHarness(file: string, lines: string[]): boolean {
   if (!lines.some((line) => /^\s*extends\s+SceneTree\b/u.test(line))) {
     return false;
   }
-  if (!godotLifecycleCallsRunner(lines)) {
+  if (!godotLifecycleExecutesChecks(lines)) {
     return false;
   }
   return lines.some((line) => hasGodotFailureExit(line));
 }
 
-function godotLifecycleCallsRunner(lines: string[]): boolean {
+function godotLifecycleExecutesChecks(lines: string[]): boolean {
   for (let index = 0; index < lines.length; index += 1) {
     if (!/^\s*func\s+_(?:init|initialize|ready)\s*\(/u.test(lines[index] || "")) {
       continue;
@@ -479,7 +625,9 @@ function godotLifecycleCallsRunner(lines: string[]): boolean {
       }
       if (
         /\b_(?:run|test)\w*\s*(?:\.|\()/iu.test(line) ||
-        /\bcall_deferred\s*\(\s*&?["']_(?:run|test)\w*["']/iu.test(line)
+        /\bcall_deferred\s*\(\s*&?["']_(?:run|test)\w*["']/iu.test(line) ||
+        ASSERTION_PATTERN.test(line) ||
+        isGuardAssertionSyntax("test.gd", line)
       ) {
         return true;
       }

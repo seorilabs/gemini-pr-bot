@@ -17,23 +17,24 @@ flowchart LR
 
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
 - Runs a conservative structured merge gate (`STRUCTURED_REVIEW_ENABLED`) instead of a general-purpose code review.
-- Maps only host-recognized checklist items or bullets under acceptance/requirements/definition-of-done/behavior headings (`동작`, `기대 동작` 포함) to visible current-HEAD test evidence; unchanged tests count when their test body and assertion are present in context. Validation-result sections such as `검증` are not acceptance criteria.
-- Explicit acceptance criteria are preserved across wrapped lines and must map one-to-one to distinct model criteria. Automated criteria need grounded test evidence; explicitly manual, visual, or real-device criteria are nonblocking notes.
+- Maps only host-recognized checklist items or bullets under acceptance/requirements/definition-of-done/behavior headings (`동작`, `기대 동작` 포함) to visible current-HEAD test or source evidence; unchanged tests count when their test body and assertion are present in context. Validation-result sections such as `검증` are not acceptance criteria.
+- Explicit acceptance criteria are preserved across wrapped lines and must map one-to-one to distinct model criteria. Behavioral criteria need grounded test evidence, while narrowly phrased source-wiring criteria such as a named function using a table/API may use an exact implementation line. Explicitly manual, visual, or real-device criteria are nonblocking notes.
 - Test evidence must come from a registered, active current-HEAD test with a real non-vacuous assertion. A model-provided line number is rebound only when its exact assertion quote occurs uniquely in the current HEAD; a trailing Godot multiline continuation marker may be omitted, but fabricated or ambiguous quotes remain rejected. Commented code, skipped/disabled tests or suites, ordinary helper functions, comparison-only expressions, and assertion-shaped strings are rejected by the host.
-- Godot `probe`/`smoke` scripts count as executable tests when a `SceneTree` lifecycle (`_init`, `_initialize`, `_ready`) calls or `call_deferred(...)` dispatches a `_run*`/`_test*` entrypoint and the harness has a non-zero failure exit. `_expect(...)`, `_check(...)`, and `if ...: _fail(...)` evidence are supported. Large single-function smoke runners are searched to their real function boundary while semantic matching stays bounded to the assertion's local context. For API surface, adapter fallback, and no-crash acceptance criteria, an exact direct invocation in that executable harness is also valid execution evidence. A test-addition criterion may use an exact runner manifest line when it names a current-HEAD executable test file.
+- Godot `probe`/`smoke` scripts count as executable tests when a `SceneTree` lifecycle (`_init`, `_initialize`, `_ready`) either executes assertions directly or calls/`call_deferred(...)` dispatches a `_run*`/`_test*` entrypoint, and the harness has a non-zero failure exit. `_expect(...)`, `_check(...)`, and `if ...: _fail(...)` evidence are supported. A bounded loop with nested assertions may ground an explicit all-input test-matrix criterion. Large single-function smoke runners are searched to their real function boundary while semantic matching stays bounded to the assertion's local context. For API surface, adapter fallback, and no-crash acceptance criteria, an exact direct invocation in that executable harness is also valid execution evidence. A test-addition criterion may use an exact runner manifest line when it names a current-HEAD executable test file.
 - Reports at most two fatal blockers, limited to a deterministic common-path crash, permanent data loss/corruption, exploitable security/privacy exposure, or a certainly unusable primary flow. The added root line must itself directly perform the fatal outcome and end a 2-6-line ordered causal chain; normal false/null returns, UI flags, and deny-by-default security rules are rejected.
 - Uses Gemini structured output plus host-side strict schema and evidence validation. Gemini does not assign severity or decide approval itself.
-- Produces internal `PASS`, `FAIL`, or `ABSTAIN` decisions. A missing acceptance test blocks only after exhaustive current-HEAD inventory search; a fatal defect blocks only when Gemini's separate verifier confirms the same host-grounded added root. Uncertainty completes as check-level `neutral` without a GitHub approval, with separate `확인 완료 (PASS)` and `판정 보류 항목` sections. It is not merge authorization: selected org-ruleset repositories still require a current-HEAD approval and autonomous agents hand off unresolved scope to a human.
+- Produces host decisions `PASS`, `FAIL`, `FOLLOW_UP`, or `ABSTAIN`. A missing acceptance test blocks only after exhaustive current-HEAD inventory search; a fatal defect blocks only when Gemini's separate verifier confirms the same host-grounded added root. First- or second-turn uncertainty becomes an actionable `FOLLOW_UP`: the check is `action_required` and a PR comment names why each item is unresolved and exactly what the Contributor should answer or change. `ABSTAIN` is allowed only from the third review turn when every remaining item is host-classified as peripheral; it still posts a PR comment and submits no approval.
 - Omits Medium/Low findings, style/refactor suggestions, speculative risks, and automatic follow-up issue creation from the merge-gate path.
 - Responds to PR comments containing `@seorilabs-seori`, `@seori-bot`, `@seori`, `@gemini-cli`, or `@gemini`.
-- Runs explicit review on `@gemini-cli /review`; a gate pass submits approval, confirmed blockers request changes, and inconclusive results submit no approval and require human handoff without inventing a code change request.
+- Runs explicit review on `@gemini-cli /review`; a gate pass submits approval, confirmed blockers request changes, and incomplete early-turn evidence posts an actionable Contributor follow-up comment instead of silently deferring.
 - Submits a GitHub approval review on `@gemini-cli /approve [reason]` and changes the latest `Seori Review` check for the same HEAD to `success` (or creates a successful check when none exists).
 - Allows trusted maintainers to bypass bot-side merge conflict and status-check approval blockers with `@gemini-cli /approve --skip-validation [reason]` or `@gemini-cli /force-approve [reason]`.
 - Treats a normal mention as an agent handoff: it analyzes PR context, comments when action is needed, and approves when no actionable findings remain.
 - Requests changes with conflict-resolution instructions when GitHub reports merge conflicts.
 - Replies directly to inline review comments when mentioned there.
 - Creates a `Seori Review` check run for review and agent jobs.
-- Marks `Seori Review` as `success` after a gate pass or explicit current-HEAD approval. Confirmed blockers complete as `action_required`; unresolved model uncertainty completes as nonblocking `neutral`.
+- Marks `Seori Review` as `success` after a gate pass or explicit current-HEAD approval. Confirmed blockers and early-turn follow-up requests complete as `action_required`; only later-turn peripheral uncertainty may complete as `neutral`.
+- Every completed non-approval review is visible in the PR conversation. Follow-up reviews retain the latest Seori result and Contributor responses, compare the previous reviewed HEAD with the current HEAD, and limit investigation to that incremental diff plus resolution of the previous request.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
 - Routes production AI jobs through the Gemini API. Cursor remains an optional separately configured fallback; paid second-opinion calls are disabled by default. GitHub Copilot is not a bot review provider — use GitHub's native Copilot review separately.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
@@ -80,7 +81,7 @@ flowchart LR
 
 Other review agents should treat the latest non-stale approval marker as "no further agent action required". A new commit makes the marker stale when the repository's branch protection dismisses stale approvals.
 
-An inconclusive `ABSTAIN` never emits that approval marker. It emits a separate handoff marker and submits no GitHub approval:
+An allowed later-turn `ABSTAIN` never emits that approval marker. It posts a PR comment, emits a separate handoff marker, and submits no GitHub approval:
 
 ```html
 <!-- seorilabs-seori-pr-bot:status=review-deferred head=<head-sha> -->
@@ -98,7 +99,8 @@ flowchart TD
   Verifier --> Host["Host: AC 원문·전체 테스트·현재 HEAD exact 근거 검증"]
   Host --> Ledger["finding 원장: open / resolved / refuted"]
   Ledger -->|"확정 치명 결함 또는 테스트 누락"| Output["한글 REQUEST_CHANGES + action_required"]
-  Ledger -->|"근거 불완전"| Neutral["PR 댓글 없이 neutral; approval 없음; 사람 handoff"]
+  Ledger -->|"첫째 또는 둘째 턴 근거 불완전"| FollowUp["구체적 PR 댓글 + action_required"]
+  Ledger -->|"셋째 이후 지엽적 항목만 남음"| Neutral["PR 댓글 + neutral; approval 없음"]
   Ledger -->|통과| GateApproval["GitHub APPROVE 후 check success; bot 자동 병합 없음"]
   Output --> Approve["Maintainer or trusted agent runs /approve"]
   Approve --> Validation{"Bot-side validation passes?"}
@@ -230,7 +232,7 @@ AUTO_SQUASH_MERGE_ENABLED=true
 
 The conservative gate uses the Gemini API with low thinking and JSON-schema-constrained output. It runs two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
 
-Structured PR reviews use the bounded Gemini candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable; incomplete or ambiguous evidence becomes a check-level neutral decision without posting a fabricated task back to the author. Neutral submits no approval, names each unresolved criterion or validation scope with a host-owned reason, and hands merge authorization to a current-HEAD human review.
+Structured PR reviews use the bounded Gemini candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable. Incomplete or ambiguous evidence on the first two review turns becomes `FOLLOW_UP`, posts a PR comment with a host-owned reason and concrete Contributor response, and completes the check as `action_required`. From the third turn, `neutral` is permitted only when every remaining item is peripheral; it still posts the unresolved scope and required response, submits no approval, and hands merge authorization to a current-HEAD human review.
 
 Changed-file context is product-code-first. Small changed product files are supplied in full; large files use changed-hunk windows plus a bounded symbol outline. Fatal review is scoped to defects introduced on changed lines, so a PASS requires a visible usable patch for every current product file instead of the full body of every large file. Related tests and repository context use the remaining prompt budget.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.

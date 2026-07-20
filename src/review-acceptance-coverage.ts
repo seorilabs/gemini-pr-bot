@@ -3,6 +3,8 @@ import type { ReviewGateCriterion, ReviewGateTestEvidence } from "./review-gate.
 import {
   isGroundedTestExecutionEvidence,
   isGroundedTestEvidence,
+  isGroundedSourceContractEvidence,
+  isGroundedTestMatrixEvidence,
   type ReviewGroundingContext,
 } from "./review-grounding.js";
 
@@ -17,6 +19,7 @@ export type GroundedAcceptanceTestEvidence = {
   file: string;
   line: number;
   testName: string;
+  kind: "test" | "source";
 };
 
 const MANUAL_ACCEPTANCE_CRITERION_PATTERN =
@@ -84,10 +87,12 @@ export function evaluateReviewAcceptanceCoverage(
       },
     };
     const evidence: ReviewGateTestEvidence = criterion.testEvidence!;
-    if (
-      !isGroundedTestEvidence(context, criterion, evidence) &&
-      !isGroundedTestExecutionEvidence(context, criterion, evidence)
-    ) {
+    const groundedAsTest =
+      isGroundedTestEvidence(context, criterion, evidence) ||
+      isGroundedTestExecutionEvidence(context, criterion, evidence) ||
+      isGroundedTestMatrixEvidence(context, criterion, evidence);
+    const groundedAsSource = isGroundedSourceContractEvidence(context, criterion, evidence);
+    if (!groundedAsTest && !groundedAsSource) {
       validationErrors.push(`${expectedId}: test_evidence_not_grounded`);
       continue;
     }
@@ -98,6 +103,7 @@ export function evaluateReviewAcceptanceCoverage(
       file: item.testEvidence.file,
       line: groundedLine,
       testName: item.testEvidence.testName,
+      kind: groundedAsSource ? "source" : "test",
     });
   }
 

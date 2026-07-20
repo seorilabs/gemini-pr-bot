@@ -1,4 +1,4 @@
-export type ReviewGateVerdict = "PASS" | "FAIL" | "ABSTAIN";
+export type ReviewGateVerdict = "PASS" | "FAIL" | "FOLLOW_UP" | "ABSTAIN";
 
 export type ReviewRunRecord = {
   repoFullName: string;

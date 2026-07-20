@@ -30,7 +30,7 @@ function coverage(
 test("명시적 인수조건이 없으면 테스트 근거 없이 완료된다", () => {
   const result = evaluateReviewAcceptanceCoverage(context(), [], []);
 
-  assert.equal(result.complete, true);
+  assert.equal(result.complete, true, JSON.stringify(result.validationErrors));
   assert.deepEqual([...result.groundedAcceptanceCriteria], []);
   assert.deepEqual([...result.groundedTestEvidence], []);
   assert.deepEqual(result.validationErrors, []);
@@ -146,7 +146,7 @@ test("이름 있는 실행 테스트의 실제 assertion은 인수조건을 충�
   );
   assert.deepEqual(
     result.groundedTestEvidence.get(normalizeReviewAcceptanceEvidence(criterion)),
-    { file, line: 3, testName: "restartLoad keeps savedValue" },
+    { file, line: 3, testName: "restartLoad keeps savedValue", kind: "test" },
   );
   assert.deepEqual(result.validationErrors, []);
 });
@@ -228,6 +228,202 @@ test("Godot 멀티라인 assertion의 continuation 표기를 제외하고 현재
     7,
   );
   assert.deepEqual(result.validationErrors, []);
+});
+
+test("Godot SceneTree _init에서 직접 실행되는 assertion을 테스트 근거로 인정한다", () => {
+  const criterion = "난이도 1~9 각각 depth, blunder_prob, eval_noise를 정의한다.";
+  const file = "tests/chess_engine_smoke.gd";
+  const source = [
+    "extends SceneTree",
+    "var failures := 0",
+    "func _init() -> void:",
+    "\tfor level in range(1, 10):",
+    "\t\tvar profile := engine.get_ai_difficulty_profile(level)",
+    '\t\t_expect(profile.has("depth") and profile.has("blunder_prob") and profile.has("eval_noise"), "complete AI profile")',
+    "\tquit(1 if failures > 0 else 0)",
+    "func _expect(condition: bool, message: String) -> void:",
+    "\tif not condition:",
+    "\t\tfailures += 1",
+  ].join("\n");
+  const result = evaluateReviewAcceptanceCoverage(
+    context({ [file]: source }),
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: {
+        file,
+        line: 6,
+        testName: "_init",
+        assertionQuote: '_expect(profile.has("depth") and profile.has("blunder_prob") and profile.has("eval_noise"), "complete AI profile")',
+        explanationKo: "각 난이도 프로필이 세 필드를 모두 제공하는지 검증합니다.",
+      },
+    })],
+  );
+
+  assert.equal(result.complete, true);
+  assert.equal(
+    result.groundedTestEvidence.get(normalizeReviewAcceptanceEvidence(criterion))?.kind,
+    "test",
+  );
+});
+
+test("전체 입력 범위를 도는 실행 테스트의 loop와 내부 assertion을 매트릭스 근거로 인정한다", () => {
+  const criterion = "테스트가 1~9 전체 프로필의 차이를 검증한다.";
+  const file = "tests/chess_engine_smoke.gd";
+  const source = [
+    "extends SceneTree",
+    "var failures := 0",
+    "func _init() -> void:",
+    "\tvar signatures := {}",
+    "\tfor level in range(1, 10):",
+    "\t\tvar profile := engine.get_ai_difficulty_profile(level)",
+    "\t\tvar signature := str(profile)",
+    '\t\t_expect(not signatures.has(signature), "AI profile is unique")',
+    "\t\tsignatures[signature] = true",
+    "\tquit(1 if failures > 0 else 0)",
+    "func _expect(condition: bool, message: String) -> void:",
+    "\tif not condition:",
+    "\t\tfailures += 1",
+  ].join("\n");
+  const result = evaluateReviewAcceptanceCoverage(
+    context({ [file]: source }),
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: {
+        file,
+        line: 5,
+        testName: "_init",
+        assertionQuote: "for level in range(1, 10):",
+        explanationKo: "1부터 9까지 모든 프로필의 조합이 서로 다른지 검증합니다.",
+      },
+    })],
+  );
+
+  assert.equal(result.complete, true, JSON.stringify(result.validationErrors));
+  assert.deepEqual(result.validationErrors, []);
+});
+
+test("함수의 특정 테이블 사용 조건은 현재 HEAD의 정확한 소스 연결 근거로 인정한다", () => {
+  const criterion = "choose_ai_move()는 해당 프로필 테이블을 사용한다.";
+  const file = "scripts/chess_engine.gd";
+  const source = [
+    "func get_ai_difficulty_profile(level: int) -> Dictionary:",
+    "\treturn AI_DIFFICULTY_PROFILES[level]",
+    "func choose_ai_move(level: int) -> Dictionary:",
+    "\tvar profile := get_ai_difficulty_profile(level)",
+    '\tvar depth := int(profile["depth"])',
+  ].join("\n");
+  const result = evaluateReviewAcceptanceCoverage(
+    context({ [file]: source }),
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: {
+        file,
+        line: 4,
+        testName: "choose_ai_move",
+        assertionQuote: "var profile := get_ai_difficulty_profile(level)",
+        explanationKo: "AI 이동 선택 함수가 난이도 프로필을 조회해 사용합니다.",
+      },
+    })],
+  );
+
+  assert.equal(result.complete, true);
+  assert.deepEqual(
+    result.groundedTestEvidence.get(normalizeReviewAcceptanceEvidence(criterion)),
+    { file, line: 4, testName: "choose_ai_move", kind: "source" },
+  );
+});
+
+test("lucid-chess PR 125의 다섯 인수조건을 현재 HEAD 테스트와 소스 근거로 모두 결속한다", () => {
+  const criteria = [
+    "난이도 1~9가 세 가지 강도 파라미터를 모두 정의합니다.",
+    "AI 착수 선택이 프로필 테이블을 사용합니다.",
+    "깊이는 비감소하고 실수 확률과 평가 노이즈는 감소합니다.",
+    "인접 난이도에 동일한 전체 파라미터 조합이 없습니다.",
+    "테스트가 9개 프로필의 차이를 검증합니다.",
+  ];
+  const testFile = "tests/chess_engine_smoke.gd";
+  const sourceFile = "scripts/chess_engine.gd";
+  const testSource = [
+    "extends SceneTree",
+    "var failures := 0",
+    "func _init() -> void:",
+    "\tvar previous_profile: Dictionary = {}",
+    "\tvar profile_signatures := {}",
+    "\tfor level in range(1, 10):",
+    "\t\tvar profile: Dictionary = ai_test.get_ai_difficulty_profile(level)",
+    '\t\t_expect(profile.has("depth") and profile.has("blunder_prob") and profile.has("eval_noise"), "level exposes a complete AI profile")',
+    '\t\tvar signature := "%d|%.3f|%.1f" % [int(profile["depth"]), float(profile["blunder_prob"]), float(profile["eval_noise"])]',
+    '\t\t_expect(not profile_signatures.has(signature), "AI profile is unique")',
+    "\t\tprofile_signatures[signature] = true",
+    "\t\tif not previous_profile.is_empty():",
+    '\t\t\t_expect(int(profile["depth"]) >= int(previous_profile["depth"]), "search depth is monotonic")',
+    '\t\t\t_expect(float(profile["blunder_prob"]) < float(previous_profile["blunder_prob"]), "blunder probability decreases")',
+    '\t\t\t_expect(float(profile["eval_noise"]) < float(previous_profile["eval_noise"]), "evaluation noise decreases")',
+    "\t\tprevious_profile = profile",
+    "\tquit(1 if failures > 0 else 0)",
+    "func _expect(condition: bool, message: String) -> void:",
+    "\tif not condition:",
+    "\t\tfailures += 1",
+  ].join("\n");
+  const source = [
+    "func choose_ai_move(level: int) -> Dictionary:",
+    "\tvar profile := get_ai_difficulty_profile(level)",
+    '\tvar depth := int(profile["depth"])',
+  ].join("\n");
+  const evidence = [
+    {
+      file: testFile,
+      line: 8,
+      testName: "_init",
+      assertionQuote: '_expect(profile.has("depth") and profile.has("blunder_prob") and profile.has("eval_noise"), "level exposes a complete AI profile")',
+      explanationKo: "각 난이도 프로필이 세 가지 강도 파라미터를 모두 정의하는지 검증합니다.",
+    },
+    {
+      file: sourceFile,
+      line: 2,
+      testName: "choose_ai_move",
+      assertionQuote: "var profile := get_ai_difficulty_profile(level)",
+      explanationKo: "AI 착수 선택이 난이도 프로필 테이블 조회 결과를 사용합니다.",
+    },
+    {
+      file: testFile,
+      line: 14,
+      testName: "_init",
+      assertionQuote: '_expect(float(profile["blunder_prob"]) < float(previous_profile["blunder_prob"]), "blunder probability decreases")',
+      explanationKo: "깊이는 비감소하고 실수 확률과 평가 노이즈는 단계마다 감소하는지 검증합니다.",
+    },
+    {
+      file: testFile,
+      line: 10,
+      testName: "_init",
+      assertionQuote: '_expect(not profile_signatures.has(signature), "AI profile is unique")',
+      explanationKo: "각 난이도의 전체 파라미터 조합이 서로 다른지 검증합니다.",
+    },
+    {
+      file: testFile,
+      line: 6,
+      testName: "_init",
+      assertionQuote: "for level in range(1, 10):",
+      explanationKo: "1부터 9까지 모든 프로필의 전체 파라미터 차이를 검증합니다.",
+    },
+  ];
+  const result = evaluateReviewAcceptanceCoverage(
+    context({ [testFile]: testSource, [sourceFile]: source }),
+    criteria,
+    criteria.map((criterion, index) => ({
+      criterionId: `AC-${index + 1}`,
+      acceptanceCriterion: criterion,
+      status: "covered" as const,
+      testEvidence: evidence[index]!,
+    })),
+  );
+
+  assert.equal(result.complete, true, JSON.stringify(result.validationErrors));
+  assert.deepEqual(result.validationErrors, []);
+  assert.deepEqual(
+    [...result.groundedTestEvidence.values()].map((item) => item.kind),
+    ["test", "source", "test", "test", "test"],
+  );
 });
 
 test("lizard 알림 smoke의 실제 근거는 미검증 attendance 항목만 보류한다", () => {

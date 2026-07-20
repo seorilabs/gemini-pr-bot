@@ -138,7 +138,8 @@ test("통과 결과는 확인한 인수조건과 현재 HEAD 테스트 근거를
     ],
   });
 
-  assert.match(output.text, /### 확인한 인수조건 테스트/);
+  assert.match(output.text, /### 확인한 인수조건 근거/);
+  assert.match(output.text, /테스트 `src\/session\.test\.ts:27`/);
   assert.match(output.text, /\*\*AC-1\*\*/);
   assert.match(output.text, /앱을 다시 열어도 기존 세션이 유지된다/);
   assert.match(output.text, /`src\/session\.test\.ts:27`/);
@@ -162,6 +163,8 @@ test("자동 판정 보류는 approval 부재와 사람 handoff를 명확히 알
     abstainItems: [{
       label: "AC-2 · 네트워크가 끊겨도 작성 중인 내용이 보존된다.",
       reason: "현재 HEAD에서 이 인수조건의 자동화 테스트 커버리지를 확정하지 못했습니다.",
+      requiredAction: "AC-2를 검증하는 테스트 위치를 댓글로 알려 주거나 자동화 테스트를 추가해 주세요.",
+      peripheral: true,
     }],
   });
 
@@ -172,23 +175,43 @@ test("자동 판정 보류는 approval 부재와 사람 handoff를 명확히 알
   assert.match(output.text, /치명 결함 검사/);
   assert.match(output.text, /AC-1/);
   assert.match(output.text, /`src\/session\.test\.ts:27`/);
-  assert.match(output.text, /### 판정 보류 항목/);
+  assert.match(output.text, /### 남은 지엽적 항목/);
   assert.match(output.text, /AC-2/);
   assert.match(output.text, /커버리지를 확정하지 못했습니다/);
   assert.match(output.text, /current-HEAD 사람 검토·승인/);
   assert.doesNotMatch(output.text, /병합 비차단|병합을 차단하지 않습니다|no-action-required/);
-  assert.doesNotMatch(output.text, /\bABSTAIN\b|해주세요|추가하세요|확인하세요|수정하세요/);
+  assert.match(output.text, /필요한 대응/);
+  assert.doesNotMatch(output.text, /\bABSTAIN\b/);
 });
 
-test("세부 정보가 없는 예외 보류도 공개용 기본 사유를 표시한다", () => {
+test("첫 리뷰의 불확실성은 보류 대신 구체적인 Contributor 후속 대응을 요청한다", () => {
   const output = formatReviewGateCheckOutput({
     headSha: "abc1234",
-    verdict: "ABSTAIN",
+    verdict: "FOLLOW_UP",
+    followUpSummaryKo: "첫 검토에서 판정을 미루지 않고 확인이 필요한 항목을 요청합니다.",
+    abstainItems: [{
+      label: "AC-1 · 저장 결과가 유지된다.",
+      reason: "현재 HEAD에서 저장 결과를 검증하는 assertion 위치를 확인하지 못했습니다.",
+      requiredAction: "해당 테스트의 파일과 assertion을 댓글로 알려 주거나 회귀 테스트를 추가해 주세요.",
+      peripheral: false,
+    }],
   });
 
-  assert.match(output.text, /확정적으로 통과한 세부 항목이 없습니다/);
-  assert.match(output.text, /자동 판정 근거/);
-  assert.match(output.text, /세부 판정을 확정하지 못했습니다/);
+  assert.equal(output.conclusion, "action_required");
+  assert.equal(output.title, "Contributor 후속 대응 필요");
+  assert.match(output.text, /판정: \*\*후속 대응 필요\*\*/);
+  assert.match(output.text, /### Contributor 후속 대응/);
+  assert.match(output.text, /확인되지 않은 이유/);
+  assert.match(output.text, /필요한 대응/);
+  assert.match(output.text, /@seori \/review/);
+  assert.match(output.text, /직전 요청과 그 이후 변경만 좁혀서 판정/);
+});
+
+test("지엽적 세부 항목이 없는 판정 보류는 게시하지 않는다", () => {
+  assert.throws(
+    () => formatReviewGateCheckOutput({ headSha: "abc1234", verdict: "ABSTAIN" }),
+    /지엽적 후속 항목/,
+  );
 });
 
 test("차단 지적의 핵심 설명이 없거나 한글이 아니면 게시하지 않는다", () => {

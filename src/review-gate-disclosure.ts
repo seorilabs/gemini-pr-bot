@@ -17,6 +17,7 @@ import type {
   ReviewGateCoveredCriterion,
 } from "./review-gate-format.js";
 import type { GroundedAcceptanceTestEvidence } from "./review-acceptance-coverage.js";
+import { isPeripheralAcceptanceCriterion } from "./review-turn.js";
 
 export type ReviewGateDisclosure = {
   coveredCriteria: ReviewGateCoveredCriterion[];
@@ -69,12 +70,15 @@ export function buildReviewGateDisclosure(
         file: groundedEvidence?.file ?? coverage.testEvidence.file,
         line: groundedEvidence?.line ?? coverage.testEvidence.line,
         testName: groundedEvidence?.testName ?? coverage.testEvidence.testName,
+        evidenceKind: groundedEvidence?.kind ?? "test",
       });
       continue;
     }
     abstainItems.push({
       label: `${criterionId} · ${criterion}`,
       reason: coverageAbstainReason(coverageErrors.get(criterionId)),
+      requiredAction: coverageRequiredAction(coverageErrors.get(criterionId), criterionId),
+      peripheral: isPeripheralAcceptanceCriterion(criterion),
     });
   }
 
@@ -84,12 +88,16 @@ export function buildReviewGateDisclosure(
       abstainItems.push({
         label: "자동 검증 결과 구조",
         reason: "검토 후보와 독립 검증 결과의 구조가 호스트 검증 규칙을 충족하지 않아 판정을 확정하지 못했습니다.",
+        requiredAction: "코드 수정은 필요하지 않습니다. 이 댓글에 현재 HEAD 재검토를 요청하면 Seori가 검증 결과를 다시 생성합니다.",
+        peripheral: false,
       });
     } else {
       for (const code of codes) {
         abstainItems.push({
           label: "자동 검증 결과 구조",
           reason: protocolAbstainReason(code),
+          requiredAction: "코드 수정은 필요하지 않습니다. 이 댓글에 현재 HEAD 재검토를 요청하면 Seori가 검증 결과를 다시 생성합니다.",
+          peripheral: false,
         });
       }
     }
@@ -99,6 +107,8 @@ export function buildReviewGateDisclosure(
     abstainItems.push({
       label: "치명 결함 검사",
       reason: "변경 파일의 현재 HEAD 코드 또는 패치 문맥이 완전하지 않아 검사 범위를 확정하지 못했습니다.",
+      requiredAction: "누락된 변경 파일의 현재 HEAD 코드가 리뷰에서 보이도록 보정 커밋을 올리거나, 해당 경로의 동작과 검증 근거를 PR 댓글에 명시해 주세요.",
+      peripheral: false,
     });
   }
 
@@ -116,6 +126,10 @@ export function buildReviewGateDisclosure(
       reason: candidate.kind === "missing_acceptance_test"
         ? "독립 검증에서 자동화 테스트의 실제 누락 여부를 확정하지 못했습니다."
         : "독립 검증에서 치명 결함 여부를 확정도 기각도 하지 못했습니다.",
+      requiredAction: candidate.kind === "missing_acceptance_test"
+        ? "해당 인수조건을 직접 검증하는 테스트의 파일·테스트명·assertion을 댓글로 알려 주거나, 없다면 자동화 테스트를 추가해 주세요."
+        : "후보 경로가 안전함을 보여 주는 가드·호출 조건·회귀 테스트를 댓글로 제시하거나, 실제 결함이면 해당 경로를 수정해 주세요.",
+      peripheral: false,
     });
   }
 
@@ -123,6 +137,8 @@ export function buildReviewGateDisclosure(
     abstainItems.push({
       label: unconfirmedFindingLabel(finding),
       reason: "이전에 확인된 지적이 현재 HEAD에서 유지되는지 또는 해소됐는지 재검증 근거가 충분하지 않습니다.",
+      requiredAction: "직전 Seori 댓글에 해결 커밋과 검증 근거를 답글로 남기거나, 지적이 사실과 다르면 해당 스레드에 `/seori refute`와 반증 근거를 남겨 주세요.",
+      peripheral: false,
     });
   }
 
@@ -155,6 +171,22 @@ function coverageAbstainReason(code: string | undefined): string {
       return "자동 검증 결과가 이 인수조건의 ID와 원문에 정확히 대응하지 않았습니다.";
     default:
       return "현재 HEAD에서 이 인수조건의 자동화 테스트 근거를 확정하지 못했습니다.";
+  }
+}
+
+function coverageRequiredAction(code: string | undefined, criterionId: string): string {
+  switch (code) {
+    case "acceptance_coverage_identity_mismatch":
+      return `${criterionId} 원문과 정확히 대응하는 테스트 또는 소스 근거를 PR 댓글에 파일·위치와 함께 알려 주세요.`;
+    case "test_evidence_line_not_grounded":
+      return `${criterionId}을 검증하는 현재 HEAD의 실제 assertion 위치를 댓글로 알려 주거나 해당 테스트를 보정해 주세요.`;
+    case "test_evidence_not_grounded":
+      return `${criterionId} 전체를 직접 검증하는 assertion과 실행 경로를 댓글로 알려 주거나, 직접 검증하는 테스트를 추가해 주세요.`;
+    case "acceptance_coverage_missing":
+    case "acceptance_coverage_unknown":
+    case "test_evidence_required":
+    default:
+      return `${criterionId}을 직접 검증하는 테스트의 파일·테스트명·assertion을 댓글로 알려 주거나, 없다면 자동화 테스트를 추가해 주세요.`;
   }
 }
 

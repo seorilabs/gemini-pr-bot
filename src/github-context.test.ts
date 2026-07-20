@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   buildLargeFileDigest,
   buildPullRequestContext,
+  buildReviewFollowUpHistory,
   countExplicitAcceptanceCriteria,
   isDeepContextFileFullyVisible,
   isFatalContextComplete,
@@ -25,6 +26,63 @@ test("only acceptance-section checkboxes and explicit AC labels form a determini
   ].join("\n");
   assert.equal(countExplicitAcceptanceCriteria(body), 3);
   assert.equal(countExplicitAcceptanceCriteria("## 변경사항\n- 내부 함수 이름 변경"), 0);
+});
+
+test("첫 Seori 결과 전에는 review round 1로 시작한다", () => {
+  const state = buildReviewFollowUpHistory([], [], []);
+
+  assert.equal(state.reviewRound, 1);
+  assert.equal(state.previousReviewHeadSha, null);
+  assert.equal(state.previousReviewBody, "");
+  assert.equal(state.contributorResponses, "");
+});
+
+test("후속 review는 마지막 Seori 댓글과 그 이후 Contributor 응답만 보존한다", () => {
+  const firstHead = "a".repeat(40);
+  const secondHead = "b".repeat(40);
+  const marker = (head: string, body: string) => [
+    `<!-- seorilabs-seori-pr-bot:status=action-required kind=review-follow-up head=${head} -->`,
+    body,
+  ].join("\n");
+  const state = buildReviewFollowUpHistory(
+    [
+      {
+        user: { login: "seorilabs-seori-pr-bot[bot]", type: "Bot" },
+        body: marker(firstHead, "첫 번째 요청"),
+        created_at: "2026-07-20T00:00:00Z",
+      },
+      {
+        user: { login: "contributor", type: "User" },
+        body: "첫 요청을 반영했습니다.",
+        created_at: "2026-07-20T00:10:00Z",
+      },
+      {
+        user: { login: "seorilabs-seori-pr-bot[bot]", type: "Bot" },
+        body: marker(secondHead, "두 번째 요청"),
+        created_at: "2026-07-20T00:20:00Z",
+      },
+      {
+        user: { login: "contributor", type: "User" },
+        body: "두 번째 요청은 커밋 cafe123으로 보완했습니다.",
+        created_at: "2026-07-20T00:30:00Z",
+      },
+      {
+        user: { login: "other", type: "User" },
+        body: marker("c".repeat(40), "사람이 위조한 marker"),
+        created_at: "2026-07-20T00:40:00Z",
+      },
+    ],
+    [],
+    [],
+  );
+
+  assert.equal(state.reviewRound, 3);
+  assert.equal(state.previousReviewHeadSha, secondHead);
+  assert.match(state.previousReviewBody, /두 번째 요청/);
+  assert.doesNotMatch(state.previousReviewBody, /첫 번째 요청/);
+  assert.match(state.contributorResponses, /두 번째 요청은 커밋 cafe123/);
+  assert.doesNotMatch(state.contributorResponses, /첫 요청을 반영/);
+  assert.match(state.contributorResponses, /사람이 위조한 marker/);
 });
 
 test("release and command checklists outside acceptance sections are not requirements", () => {
@@ -364,4 +422,122 @@ test("review context prioritizes a large changed product file and can complete f
     changedPatches.indexOf("### src/large.ts") <
       changedPatches.indexOf("### tests/large.test.ts"),
   );
+});
+
+test("후속 review context는 직전 Seori HEAD 이후 incremental diff만 노출한다", async () => {
+  const previousHead = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  const fullFiles = [
+    {
+      filename: "src/old-scope.ts",
+      status: "modified",
+      additions: 1,
+      deletions: 1,
+      patch: "@@ -1 +1 @@\n-export const oldScope = false;\n+export const oldScope = true;",
+    },
+    {
+      filename: "src/follow-up.ts",
+      status: "modified",
+      additions: 1,
+      deletions: 1,
+      patch: "@@ -1 +1 @@\n-export const followUp = false;\n+export const followUp = true;",
+    },
+  ];
+  const followUpFiles = [fullFiles[1]];
+  const paged = (data: any[]) => async () => ({ data });
+  let comparedBasehead = "";
+  const octokit = {
+    paginate: async (method: (params: any) => Promise<{ data: any[] }>, params: any) =>
+      (await method(params)).data,
+    rest: {
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+      issues: {
+        listComments: paged([
+          {
+            user: { login: "seorilabs-seori-pr-bot[bot]", type: "Bot" },
+            body: `<!-- seorilabs-seori-pr-bot:status=action-required kind=review-follow-up head=${previousHead} -->\n테스트 위치를 알려 주세요.`,
+            created_at: "2026-07-20T00:00:00Z",
+          },
+          {
+            user: { login: "contributor", type: "User" },
+            body: "요청한 테스트를 추가했습니다.",
+            created_at: "2026-07-20T00:10:00Z",
+          },
+        ]),
+      },
+      pulls: {
+        get: async () => ({
+          data: {
+            state: "open",
+            merged: false,
+            title: "follow-up change",
+            body: "",
+            draft: false,
+            mergeable: true,
+            mergeable_state: "clean",
+            user: { login: "author" },
+            head: { sha: currentHead, ref: "feature", repo: { full_name: "seorilabs/example" } },
+            base: { ref: "main", repo: { full_name: "seorilabs/example" } },
+          },
+        }),
+        listFiles: paged(fullFiles),
+        listCommits: paged([
+          { sha: previousHead, commit: { message: "이전 변경" } },
+          { sha: currentHead, commit: { message: "후속 변경" } },
+        ]),
+        listReviewComments: paged([]),
+        listReviews: paged([]),
+      },
+      repos: {
+        compareCommitsWithBasehead: async ({ basehead }: { basehead: string }) => {
+          comparedBasehead = basehead;
+          return { data: { files: followUpFiles } };
+        },
+        getContent: async ({ path: file }: { path: string }) => ({
+          data: {
+            type: "file",
+            size: 32,
+            content: Buffer.from(`export const value = ${file.includes("follow-up")};`).toString("base64"),
+          },
+        }),
+        listCommitStatusesForRef: async () => ({ data: [] }),
+      },
+    },
+  };
+  const config = {
+    allowPublicRepos: false,
+    deepRepoContextMode: "off",
+    deepRepoContextTimeoutMs: 10_000,
+    deepRepoContextMaxFiles: 40,
+    deepRepoContextMaxBytes: 80_000,
+    maxPatchChars: 120_000,
+    maxContextChars: 160_000,
+    trustedAssociations: new Set(["OWNER", "MEMBER", "COLLABORATOR"]),
+  } as Config;
+
+  const context = await buildPullRequestContext(
+    octokit,
+    { owner: "seorilabs", repo: "example", fullName: "seorilabs/example", isPrivate: true },
+    1,
+    config,
+  );
+  const changedFiles = context.reviewGateMarkdown.slice(
+    context.reviewGateMarkdown.indexOf("## Changed Files"),
+    context.reviewGateMarkdown.indexOf("## Current Changed File Contents"),
+  );
+  const changedContents = context.reviewGateMarkdown.slice(
+    context.reviewGateMarkdown.indexOf("## Current Changed File Contents"),
+    context.reviewGateMarkdown.indexOf("## Deep Repository Context"),
+  );
+
+  assert.equal(comparedBasehead, `${previousHead}...${currentHead}`);
+  assert.equal(context.reviewFollowUp.reviewRound, 2);
+  assert.match(context.reviewGateMarkdown, /테스트 위치를 알려 주세요/);
+  assert.match(context.reviewGateMarkdown, /요청한 테스트를 추가했습니다/);
+  assert.match(changedFiles, /src\/follow-up\.ts/);
+  assert.doesNotMatch(changedFiles, /src\/old-scope\.ts/);
+  assert.match(changedContents, /src\/follow-up\.ts/);
+  assert.doesNotMatch(changedContents, /src\/old-scope\.ts/);
+  assert.deepEqual(Object.keys(context.visibleChangedPatches), ["src/follow-up.ts"]);
+  assert.equal(context.fatalContextComplete, true);
 });
