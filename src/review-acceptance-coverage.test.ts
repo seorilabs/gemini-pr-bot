@@ -189,6 +189,162 @@ test("모델 줄 번호가 어긋나도 현재 HEAD의 유일한 exact assertion
   assert.deepEqual(ambiguous.validationErrors, ["AC-1: test_evidence_line_not_grounded"]);
 });
 
+test("Godot 멀티라인 assertion의 continuation 표기를 제외하고 현재 HEAD에 재결속한다", () => {
+  const criterion = "레거시 알림 세이브가 `notify_pending` 구조로 무손실 이전된다.";
+  const file = "tools/core_probe.gd";
+  const assertionQuote =
+    '_check((legacy_save.get("notify_pending", {}) as Dictionary).get("care_reminder", 0) == 111';
+  const source = [
+    "extends SceneTree",
+    "var failures := 0",
+    "func _initialize() -> void:",
+    "\t_run()",
+    "func _run() -> void:",
+    "\tvar legacy_save := {}",
+    `${assertionQuote} \\`,
+    '\t\tand int(legacy_save.get("notify_last_fired", 0)) == 222, "lossless migration")',
+    "\tquit(1 if failures > 0 else 0)",
+    "func _check(condition: bool, message: String) -> void:",
+    "\tif not condition:",
+    "\t\tfailures += 1",
+  ].join("\n");
+  const result = evaluateReviewAcceptanceCoverage(
+    context({ [file]: source }),
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: {
+        file,
+        line: 999,
+        testName: "_run",
+        assertionQuote,
+        explanationKo: "레거시 예약과 발송 이력을 새 구조로 무손실 이전하는지 확인합니다.",
+      },
+    })],
+  );
+
+  assert.equal(result.complete, true);
+  assert.equal(
+    result.groundedTestEvidence.get(normalizeReviewAcceptanceEvidence(criterion))?.line,
+    7,
+  );
+  assert.deepEqual(result.validationErrors, []);
+});
+
+test("lizard 알림 smoke의 실제 근거는 미검증 attendance 항목만 보류한다", () => {
+  const criteria = [
+    "Notifier 포트가 태그 인자를 받는 `schedule`/`cancel(tag)`로 확장되고 기존 케어 알림 동작이 회귀 없이 유지된다",
+    "알 인큐베이션 시작 시 부화 예상 시각으로 `egg_hatch` 알림이 예약되고, 앱 내 부화 처리 시 취소된다",
+    "출석 미수령 상태로 하루가 지나면 `attendance` 리마인드가 1회 예약된다",
+    "하루 발송 총량이 1건을 넘지 않는 우선순위 규칙이 `arbitrate` 테스트로 고정된다",
+    "세이브의 기존 `care_notify_pending_at`/`care_notify_last_fired`가 새 구조(`notify_pending`/`notify_last_fired`)로 무손실 마이그레이션된다",
+    "headless/플러그인 미탑재 환경에서 no-op 폴백이 유지된다",
+  ];
+  const smokeFile = "tools/headless_smoke.gd";
+  const coreFile = "tools/core_probe.gd";
+  const filler = Array.from({ length: 450 }, (_, index) => `\tvar filler_${index} := ${index}`);
+  const smokeSource = [
+    "extends SceneTree",
+    "func _initialize() -> void:",
+    '\tcall_deferred("_run")',
+    "func _run() -> void:",
+    ...filler,
+    '\tmain._notifier.schedule("egg_hatch", 60, "테스트 알림", "본문")',
+    '\tmain._notifier.cancel("egg_hatch")',
+    '\tif not (main._save().get("notify_pending", {}) as Dictionary).has("egg_hatch"):',
+    '\t\t_fail("Incubating egg did not schedule an egg_hatch notification")',
+    '\tif main._notifier._resolve_plugin() != null:',
+    '\t\t_fail("Notifier resolved a plugin in headless")',
+    "func _fail(message: String) -> void:",
+    "\tquit(1)",
+  ].join("\n");
+  const migrationQuote =
+    '_check((legacy_save.get("notify_pending", {}) as Dictionary).get("care_reminder", 0) == 111';
+  const coreSource = [
+    "extends SceneTree",
+    "var failures := 0",
+    "func _initialize() -> void:",
+    "\t_run()",
+    "func _run() -> void:",
+    '    var legacy_save := {"care_notify_pending_at": 111, "care_notify_last_fired": 222}',
+    `${migrationQuote} \\`,
+    '\t\tand int(legacy_save.get("notify_last_fired", 0)) == 222, "notify legacy migration lossless")',
+    "\tvar conflict := Notifications.arbitrate(candidates, 86400)",
+    '\t_check(conflict.size() == 1 and conflict[0].tag == "egg_hatch", "arbitrate keeps higher priority")',
+    "\tquit(1 if failures > 0 else 0)",
+    "func _check(condition: bool, message: String) -> void:",
+    "\tif not condition:",
+    "\t\tfailures += 1",
+  ].join("\n");
+  const modelCoverage: MiniMaxAcceptanceCoverage[] = [
+    coverage(criteria[0]!, {
+      testEvidence: {
+        file: smokeFile,
+        line: 2151,
+        testName: "_run",
+        assertionQuote: 'main._notifier.schedule("egg_hatch", 60, "테스트 알림", "본문")',
+        explanationKo: "태그 기반 schedule과 cancel 포트 호출을 smoke에서 실행합니다.",
+      },
+    }),
+    coverage(criteria[1]!, {
+      criterionId: "AC-2",
+      testEvidence: {
+        file: smokeFile,
+        line: 2121,
+        testName: "_run",
+        assertionQuote: 'if not (main._save().get("notify_pending", {}) as Dictionary).has("egg_hatch"):',
+        explanationKo: "인큐베이션 중 egg_hatch 슬롯이 예약되는지 검증합니다.",
+      },
+    }),
+    coverage(criteria[2]!, { criterionId: "AC-3", status: "unknown" }),
+    coverage(criteria[3]!, {
+      criterionId: "AC-4",
+      testEvidence: {
+        file: coreFile,
+        line: 294,
+        testName: "_run",
+        assertionQuote: '_check(conflict.size() == 1 and conflict[0].tag == "egg_hatch", "arbitrate keeps higher priority")',
+        explanationKo: "arbitrate가 충돌 시 우선순위가 높은 알림만 유지하는지 검증합니다.",
+      },
+    }),
+    coverage(criteria[4]!, {
+      criterionId: "AC-5",
+      testEvidence: {
+        file: coreFile,
+        line: 274,
+        testName: "_run",
+        assertionQuote: migrationQuote,
+        explanationKo: "레거시 예약과 발송 이력을 notify_pending과 notify_last_fired로 이전합니다.",
+      },
+    }),
+    coverage(criteria[5]!, {
+      criterionId: "AC-6",
+      testEvidence: {
+        file: smokeFile,
+        line: 2147,
+        testName: "_run",
+        assertionQuote: "if main._notifier._resolve_plugin() != null:",
+        explanationKo: "플러그인 없는 headless 환경에서 null no-op 폴백을 검증합니다.",
+      },
+    }),
+  ];
+
+  const result = evaluateReviewAcceptanceCoverage(
+    context({ [smokeFile]: smokeSource, [coreFile]: coreSource }),
+    criteria,
+    modelCoverage,
+  );
+
+  assert.equal(result.complete, false);
+  assert.deepEqual(result.validationErrors, ["AC-3: acceptance_coverage_unknown"]);
+  assert.deepEqual([...result.groundedAcceptanceCriteria], [
+    normalizeReviewAcceptanceEvidence(criteria[0]!),
+    normalizeReviewAcceptanceEvidence(criteria[1]!),
+    normalizeReviewAcceptanceEvidence(criteria[3]!),
+    normalizeReviewAcceptanceEvidence(criteria[4]!),
+    normalizeReviewAcceptanceEvidence(criteria[5]!),
+  ]);
+});
+
 test("테스트 추가 인수조건은 실행 manifest와 실제 executable test를 함께 결속한다", () => {
   const criterion = "레벨별 순수 함수 유닛 테스트를 추가한다.";
   const manifest = "package.json";

@@ -268,6 +268,65 @@ test("Godot _init 테스트와 조건문 기반 smoke assertion을 실행 근거
   );
 });
 
+test("Godot call_deferred 문자열 runner와 API 계약 smoke 호출을 실행 근거로 인정한다", () => {
+  const file = "tools/headless_smoke.gd";
+  const filler = Array.from({ length: 450 }, (_, index) => `\tvar filler_${index} := ${index}`);
+  const source = [
+    "extends SceneTree",
+    "func _initialize() -> void:",
+    '\tcall_deferred("_run")',
+    "func _run() -> void:",
+    ...filler,
+    '\tmain._notifier.schedule("egg_hatch", 60, "테스트 알림", "본문")',
+    '\tmain._notifier.cancel("egg_hatch")',
+    '\tif main._notifier._resolve_plugin() != null:',
+    '\t\t_fail("expected null fallback")',
+    "func _fail(message: String) -> void:",
+    "\tquit(1)",
+  ].join("\n");
+  const reviewContext = context({ [file]: source });
+
+  assert.equal(
+    isGroundedTestEvidence(
+      reviewContext,
+      criterion("Notifier 포트가 태그 인자를 받는 `schedule`/`cancel(tag)`로 확장된다."),
+      {
+        file,
+        testName: "_run",
+        assertionQuote: 'main._notifier.schedule("egg_hatch", 60, "테스트 알림", "본문")',
+        explanationKo: "태그 기반 schedule과 cancel 포트 호출이 headless smoke에서 실행됩니다.",
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    isGroundedTestEvidence(
+      reviewContext,
+      criterion("headless 환경에서 no-op 폴백이 유지된다."),
+      {
+        file,
+        testName: "_run",
+        assertionQuote: "if main._notifier._resolve_plugin() != null:",
+        explanationKo: "플러그인이 없는 headless 환경에서 null 폴백을 검증합니다.",
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    isGroundedTestEvidence(
+      reviewContext,
+      criterion("알림이 사용자에게 정확히 한 번 표시된다."),
+      {
+        file,
+        testName: "_run",
+        assertionQuote: 'main._notifier.schedule("egg_hatch", 60, "테스트 알림", "본문")',
+        explanationKo: "알림 표시 횟수를 검증합니다.",
+      },
+    ),
+    false,
+  );
+});
+
 test("Godot test 함수의 if와 _fail 조합은 자연어 인수조건의 assertion 근거다", () => {
   const file = "godot/tests/dirt_progression_test.gd";
   const source = [
