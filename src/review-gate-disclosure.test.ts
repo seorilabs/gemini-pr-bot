@@ -39,6 +39,27 @@ test("부분 보류 결과는 통과한 인수조건과 애매한 인수조건�
   assert.match(disclosure.abstainItems[0]?.requiredAction || "", /테스트의 파일/);
 });
 
+test("복합 plan 근거에서 빠진 rollover assertion을 Contributor에게 정확히 요청한다", () => {
+  const criterion = "plan 결과가 sim=28800, rollover=0이다.";
+  const disclosure = buildReviewGateDisclosure({
+    explicitAcceptanceCriteria: [criterion],
+    acceptanceCoverage: [covered("AC-1", criterion)],
+    groundedAcceptanceCriteria: new Set(),
+    coverageValidationErrors: ["AC-1: test_evidence_missing_rollover_assertion"],
+    fatalContextComplete: true,
+    pipeline: pipeline(),
+    candidates: [],
+    verifications: [],
+    unconfirmedOpenFindings: [],
+  });
+
+  assert.match(disclosure.abstainItems[0]?.reason || "", /sim=28800만 확인/);
+  assert.match(
+    disclosure.abstainItems[0]?.requiredAction || "",
+    /rollover_seconds == 0.*supporting evidence/,
+  );
+});
+
 test("독립 검증이 불확실한 후보는 후보 제목과 불확실 범위를 공개한다", () => {
   const candidate = fatalCandidate();
   const disclosure = buildReviewGateDisclosure({
