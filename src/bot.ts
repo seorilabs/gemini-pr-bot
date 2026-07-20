@@ -1694,7 +1694,10 @@ export class PrBot {
       context,
       workflow?.reviewGateFindingStore,
     );
-    const evidenceCandidates = buildReviewEvidenceCandidates(context.currentHeadFileContents);
+    const evidenceCandidates = buildReviewEvidenceCandidates(
+      context.currentHeadFileContents,
+      { acceptanceCriteria: explicitAcceptanceCriteria },
+    );
     const prompts = this.reviewGatePrompts(
       context,
       trigger,

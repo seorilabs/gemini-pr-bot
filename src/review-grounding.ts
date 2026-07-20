@@ -19,6 +19,12 @@ export type ReviewEvidenceCandidate = {
   quote: string;
 };
 
+export type ReviewEvidenceCandidateOptions = {
+  maxCandidates?: number;
+  maxChars?: number;
+  acceptanceCriteria?: readonly string[];
+};
+
 export type ChangedLineEvidence = Map<string, Map<number, string>>;
 
 const PRODUCT_SOURCE_EXTENSIONS = new Set([
@@ -77,9 +83,11 @@ const UNCERTAINTY_PATTERN =
  */
 export function buildReviewEvidenceCandidates(
   currentHeadFileContents: Readonly<Record<string, string>>,
-  maxCandidates = 240,
-  maxChars = 40_000,
+  options: ReviewEvidenceCandidateOptions = {},
 ): ReviewEvidenceCandidate[] {
+  const maxCandidates = options.maxCandidates ?? 240;
+  const maxChars = options.maxChars ?? 40_000;
+  const acceptanceCriteria = options.acceptanceCriteria || [];
   const testCandidates: Omit<ReviewEvidenceCandidate, "id">[] = [];
   const sourceCandidates: Omit<ReviewEvidenceCandidate, "id">[] = [];
   const seen = new Set<string>();
@@ -162,7 +170,18 @@ export function buildReviewEvidenceCandidates(
 
   const bounded: Omit<ReviewEvidenceCandidate, "id">[] = [];
   let serializedChars = 0;
-  for (const candidate of [...testCandidates, ...sourceCandidates]) {
+  const orderedCandidates = [...testCandidates, ...sourceCandidates].sort((left, right) => {
+    const relevance = evidenceCandidateRelevance(right, acceptanceCriteria) -
+      evidenceCandidateRelevance(left, acceptanceCriteria);
+    if (relevance !== 0) {
+      return relevance;
+    }
+    if (left.kind !== right.kind) {
+      return left.kind === "test" ? -1 : 1;
+    }
+    return left.file.localeCompare(right.file) || left.line - right.line;
+  });
+  for (const candidate of orderedCandidates) {
     if (bounded.length >= Math.max(0, maxCandidates)) {
       break;
     }
@@ -177,6 +196,42 @@ export function buildReviewEvidenceCandidates(
     ...candidate,
     id: `E-${String(index + 1).padStart(3, "0")}`,
   }));
+}
+
+function evidenceCandidateRelevance(
+  candidate: Omit<ReviewEvidenceCandidate, "id">,
+  acceptanceCriteria: readonly string[],
+): number {
+  const haystack = normalizedEvidence(
+    `${candidate.file} ${candidate.testName} ${candidate.quote}`,
+  );
+  const canonicalHaystack = canonicalExplicitIdentifier(haystack);
+  let best = 0;
+  for (const [index, criterion] of acceptanceCriteria.entries()) {
+    let score = 0;
+    if (new RegExp(`(?:^|[^0-9])AC-${index + 1}(?:[^0-9]|$)`, "iu").test(haystack)) {
+      score += 40;
+    }
+    for (const match of criterion.matchAll(/`([^`]{2,120})`/gu)) {
+      const identifier = canonicalExplicitIdentifier(match[1] || "");
+      if (identifier && canonicalHaystack.includes(identifier)) {
+        score += 16;
+      }
+    }
+    const tokens = new Set(
+      normalizedEvidence(criterion).match(
+        /[A-Za-z_][A-Za-z0-9_.]{2,}|\d+(?:\.\d+)?|[\p{Script=Hangul}]{2,}/gu,
+      ) || [],
+    );
+    for (const token of tokens) {
+      if (!haystack.includes(token)) {
+        continue;
+      }
+      score += /^\d/u.test(token) ? 5 : token.includes("_") ? 4 : 1;
+    }
+    best = Math.max(best, score);
+  }
+  return best;
 }
 
 export function formatReviewEvidenceCandidates(
