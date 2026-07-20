@@ -764,6 +764,50 @@ test("#387 locale catalog 근거는 CI command token과 분리하고 전체 loca
   ]);
 });
 
+test("#387처럼 primary가 충분하면 inventory 밖의 불필요한 supporting 근거는 버린다", () => {
+  const criterion = "광고 지원 환경에서는 확장/업그레이드/꾸미기/보상 4개 탭을 모두 노출한다.";
+  const file = "packages/farm-ui/src/__tests__/shopTabs.test.ts";
+  const source = [
+    "test('4개 탭을 모두 노출한다', () => {",
+    "  expect(getVisibleShopTabs({ adSupported: true })).toEqual(['expand', 'upgrade', 'decorate', 'rewards']);",
+    "});",
+  ].join("\n");
+  const candidates = buildReviewEvidenceCandidates(
+    { [file]: source },
+    { acceptanceCriteria: [criterion] },
+  );
+  const candidate = candidates.find((item) => item.quote.startsWith("expect(getVisibleShopTabs"));
+  assert.ok(candidate);
+
+  const result = evaluateReviewAcceptanceCoverage(
+    {
+      currentHeadFileContents: { [file]: source },
+      visibleChangedPatches: {},
+      evidenceCandidates: candidates,
+    },
+    [criterion],
+    [coverage(criterion, {
+      testEvidence: {
+        file,
+        line: candidate.line,
+        testName: candidate.testName,
+        assertionQuote: candidate.quote,
+        explanationKo: "광고 지원 환경의 전체 탭 목록을 검증합니다.",
+      },
+      supportingTestEvidence: [{
+        file: "packages/farm-ui/src/shopTabs.ts",
+        line: 40,
+        testName: "SHOP_TAB_SECTIONS",
+        assertionQuote: "export const SHOP_TAB_SECTIONS = {",
+        explanationKo: "모델이 불필요하게 추가한 inventory 밖 소스 행입니다.",
+      }],
+    })],
+  );
+
+  assert.equal(result.complete, true, JSON.stringify(result.validationErrors));
+  assert.deepEqual(result.validationErrors, []);
+});
+
 test("#126처럼 두 설정의 저장과 재실행 복원은 같은 테스트의 근거 묶음으로 검증한다", () => {
   const criterion = "두 설정을 `user://lucid_chess_settings.json`에 저장하고 다시 실행할 때 복원합니다.";
   const file = "tests/feedback_settings_smoke.gd";
@@ -839,7 +883,7 @@ test("#126처럼 두 설정의 저장과 재실행 복원은 같은 테스트의
   assert.deepEqual(incomplete.validationErrors, ["AC-1: test_evidence_not_grounded"]);
   assert.equal(omittedFromHostInventory.complete, false);
   assert.deepEqual(omittedFromHostInventory.validationErrors, [
-    "AC-1: test_evidence_not_in_host_inventory",
+    "AC-1: test_evidence_not_grounded",
   ]);
 });
 
