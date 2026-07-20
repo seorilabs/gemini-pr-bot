@@ -1,5 +1,14 @@
 export const BOT_GITHUB_LOGIN = "seorilabs-seori-pr-bot";
 export const LEGACY_BOT_GITHUB_LOGIN = "seorilabs-gemini-pr-bot";
+const BOT_GITHUB_AUTHOR_LOGINS = new Set([
+  BOT_GITHUB_LOGIN,
+  LEGACY_BOT_GITHUB_LOGIN,
+  "seori-bot",
+]);
+
+export function isBotGithubAuthor(login: string): boolean {
+  return BOT_GITHUB_AUTHOR_LOGINS.has(login.toLowerCase().replace(/\[bot\]$/u, ""));
+}
 
 export type BotActionMarker = "approve" | "comment" | "close";
 export type BotStatusMarker =
