@@ -51,9 +51,7 @@ import {
 import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./telegram.js";
 import { parseBotCommand, truncate } from "./text.js";
 import type { ReviewRunRecord } from "./review-run.js";
-import {
-  type MiniMaxReviewCandidate,
-} from "./minimax-review.js";
+import { type MiniMaxReviewCandidate } from "./minimax-review.js";
 import {
   evaluateMiniMaxReviewGateCandidates,
 } from "./review-gate-pipeline.js";
@@ -74,7 +72,15 @@ import {
 } from "./review-gate-format.js";
 import { buildReviewGateDisclosure } from "./review-gate-disclosure.js";
 import { resolveReviewTurnVerdict } from "./review-turn.js";
-import { evaluateReviewAcceptanceCoverage } from "./review-acceptance-coverage.js";
+import {
+  evaluateReviewAcceptanceCoverage,
+  mergeStickyAcceptanceCoverage,
+} from "./review-acceptance-coverage.js";
+import {
+  buildReviewEvidenceCandidates,
+  formatReviewEvidenceCandidates,
+  type ReviewEvidenceCandidate,
+} from "./review-grounding.js";
 import {
   REVIEW_GATE_CACHE_SCHEMA_VERSION,
   decodeReviewGateCache,
@@ -100,7 +106,7 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
-const REVIEW_GATE_PROMPT_VERSION = "active-follow-up-gate-v8-gemini";
+const REVIEW_GATE_PROMPT_VERSION = "host-evidence-bundles-v9-gemini";
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
@@ -203,6 +209,12 @@ export type WorkflowExecution = {
     headSha: string,
     promptVersion: string,
     contextSha256: string,
+  ) => Promise<CachedReviewRun | null>;
+  findLatestReviewGateRun?: (
+    repoFullName: string,
+    prNumber: number,
+    headSha: string,
+    promptVersion: string,
   ) => Promise<CachedReviewRun | null>;
   recordReviewRun?: (record: ReviewRunRecord) => Promise<void>;
 };
@@ -1682,11 +1694,13 @@ export class PrBot {
       context,
       workflow?.reviewGateFindingStore,
     );
+    const evidenceCandidates = buildReviewEvidenceCandidates(context.currentHeadFileContents);
     const prompts = this.reviewGatePrompts(
       context,
       trigger,
       explicitAcceptanceCriteria,
       ledgerSnapshot.records.map((record) => record.finding),
+      evidenceCandidates,
     );
     const contextHash = this.reviewGateContextHash({
       context,
@@ -1781,20 +1795,73 @@ export class PrBot {
       return;
     }
 
+    const groundingContext = { ...context, evidenceCandidates };
+    const currentCoverage = evaluateReviewAcceptanceCoverage(
+      groundingContext,
+      explicitAcceptanceCriteria,
+      envelope.acceptanceCoverage,
+    );
+    let priorEnvelope: MiniMaxReviewGateCacheEnvelope | null = null;
+    try {
+      const prior = await workflow?.findLatestReviewGateRun?.(
+        repo.fullName,
+        prNumber,
+        context.headSha,
+        REVIEW_GATE_PROMPT_VERSION,
+      );
+      priorEnvelope = prior
+        ? decodeReviewGateCache(prior.rawOutput, explicitAcceptanceCriteria)
+        : null;
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, prNumber, headSha: context.headSha },
+        "failed to load same-HEAD grounded acceptance history",
+      );
+    }
+    const priorCoverage = priorEnvelope
+      ? evaluateReviewAcceptanceCoverage(
+          groundingContext,
+          explicitAcceptanceCriteria,
+          priorEnvelope.acceptanceCoverage,
+        )
+      : null;
+    const effectiveAcceptanceCoverage = mergeStickyAcceptanceCoverage(
+      explicitAcceptanceCriteria,
+      envelope.acceptanceCoverage,
+      currentCoverage.groundedAcceptanceCriteria,
+      priorEnvelope?.acceptanceCoverage || [],
+      priorCoverage?.groundedAcceptanceCriteria || new Set<string>(),
+    );
+    const coverage = evaluateReviewAcceptanceCoverage(
+      groundingContext,
+      explicitAcceptanceCriteria,
+      effectiveAcceptanceCoverage,
+    );
+    const stickyGroundedCriteria = priorCoverage?.groundedAcceptanceCriteria || new Set<string>();
+    const effectiveCandidates = envelope.candidates.filter((candidate) =>
+      candidate.kind !== "missing_acceptance_test" ||
+      !candidate.acceptanceCriterion ||
+      !stickyGroundedCriteria.has(this.normalizedEvidence(candidate.acceptanceCriterion).toLowerCase()),
+    );
+    const effectiveCandidateIds = new Set(effectiveCandidates.map((candidate) => candidate.candidateId));
+    const effectiveVerifications = envelope.verifications.filter((verification) =>
+      effectiveCandidateIds.has(verification.candidateId),
+    );
+    const evaluatedEnvelope: MiniMaxReviewGateCacheEnvelope = {
+      ...envelope,
+      acceptanceCoverage: effectiveAcceptanceCoverage,
+      candidates: effectiveCandidates,
+      verifications: effectiveVerifications,
+    };
     const pipeline = evaluateMiniMaxReviewGateCandidates({
-      candidates: envelope.candidates,
-      verifications: envelope.verifications,
+      candidates: evaluatedEnvelope.candidates,
+      verifications: evaluatedEnvelope.verifications,
       explicitAcceptanceCriteria,
       testInventoryComplete: context.testInventoryComplete,
       testInventoryFileCount: context.testInventoryFileCount,
       currentHeadFileContents: context.currentHeadFileContents,
       visibleChangedPatches: context.visibleChangedPatches,
     });
-    const coverage = evaluateReviewAcceptanceCoverage(
-      context,
-      explicitAcceptanceCriteria,
-      envelope.acceptanceCoverage,
-    );
     const identity = { headSha: context.headSha, contextHash };
     const regressionEvidence = await this.reviewGateRegressionEvidence(
       octokit,
@@ -1859,14 +1926,14 @@ export class PrBot {
       : [];
     const disclosure = buildReviewGateDisclosure({
       explicitAcceptanceCriteria,
-      acceptanceCoverage: envelope.acceptanceCoverage,
+      acceptanceCoverage: evaluatedEnvelope.acceptanceCoverage,
       groundedAcceptanceCriteria: coverage.groundedAcceptanceCriteria,
       groundedTestEvidence: coverage.groundedTestEvidence,
       coverageValidationErrors: coverage.validationErrors,
       fatalContextComplete: context.fatalContextComplete,
       pipeline,
-      candidates: envelope.candidates,
-      verifications: envelope.verifications,
+      candidates: evaluatedEnvelope.candidates,
+      verifications: evaluatedEnvelope.verifications,
       unconfirmedOpenFindings,
     });
     const verdict = resolveReviewTurnVerdict(
@@ -1891,7 +1958,9 @@ export class PrBot {
         ? "명시적 인수조건이 없어 현재 변경 전체에서 치명 결함만 검사했으며, 증명된 치명 결함이 없습니다."
         : "모든 자동 검증 대상 인수조건의 현재 HEAD 테스트 또는 소스 근거와 변경 전체의 치명 결함 검사를 확인했습니다.",
       abstainSummaryKo: "현재 근거만으로 자동 승인할 수 없어 GitHub approval을 제출하지 않습니다. 판정 보류 범위는 사람에게 handoff합니다.",
-      followUpSummaryKo: "첫 검토에서 판정을 미루지 않습니다. 아래 항목에 답하거나 보정 커밋을 올리면 직전 요청 이후 변경만 좁혀서 다시 검토합니다.",
+      followUpSummaryKo: context.reviewFollowUp.reviewRound <= 1
+        ? "첫 검토에서 판정을 미루지 않습니다. 아래 항목에 답하거나 보정 커밋을 올리면 직전 요청 이후 변경만 좁혀서 다시 검토합니다."
+        : "직전 Seori 요청 이후의 응답과 변경만 좁혀서 확인했습니다. 아래 남은 항목에 답하거나 보정 커밋을 올리면 그 이후 변경만 이어서 검토합니다.",
       coveredCriteria: disclosure.coveredCriteria,
       fatalCheckPassed: disclosure.fatalCheckPassed,
       abstainItems: disclosure.abstainItems,
@@ -1905,7 +1974,7 @@ export class PrBot {
       context,
       contextHash,
       prompts,
-      envelope,
+      evaluatedEnvelope,
       verdict,
       [
         ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
@@ -2085,6 +2154,7 @@ export class PrBot {
     trigger: ReviewTrigger,
     explicitAcceptanceCriteria: readonly string[],
     priorFindings: readonly StoredReviewFinding[],
+    evidenceCandidates: readonly ReviewEvidenceCandidate[],
   ): {
     candidateSystem: string;
     candidateUser: string;
@@ -2099,7 +2169,9 @@ export class PrBot {
       "review_round가 2 이상이면 Previous Seori Result와 Contributor Responses를 먼저 읽고, Changes Since Previous Seori Result에 포함된 추가 변경 및 직전 요청의 해소 여부만 조사하세요.",
       "후속 턴에서 이전 review 이후 수정되지 않은 누적 PR 코드로 새 범위를 열지 마세요. 현재 HEAD 전체 파일은 추가 변경의 최종 상태와 직전 요청 해소 여부를 확인할 때만 사용하세요.",
       "acceptance_coverage에는 Host가 준 모든 AC를 AC-1부터 순서와 원문 그대로 한 번씩 제출하세요. AC가 없으면 빈 배열입니다.",
-      "covered는 실행되는 현재 HEAD 테스트의 정확한 assertion 한 줄이 AC 전체를 직접 증명할 때 사용하고, file/line/test_name/assertion_quote를 정확히 복사하세요.",
+      "covered의 test_evidence는 Host Evidence Candidates에서 정확히 복사하세요. 후보에 없는 file/test_name/assertion_quote를 만들지 마세요.",
+      "단일 assertion이 AC 전체를 증명하면 supporting_test_evidence는 빈 배열입니다. 저장 후 복원처럼 여러 단계가 함께 증명하는 복합 AC는 같은 실행 테스트의 추가 후보를 supporting_test_evidence에 최대 3개 제출하세요.",
+      "setup 호출만 단독 근거로 내지 말고, 그 직후 동작을 확인하는 assertion 후보를 supporting_test_evidence에 함께 제출하세요.",
       "단, 함수가 특정 테이블·프로필·API를 사용하거나 호출한다는 소스 연결 조건은 그 함수의 현재 HEAD 구현 한 줄로 직접 확인할 수 있습니다. 이때 file은 소스 파일, test_name은 함수명, assertion_quote는 정확한 구현 한 줄을 복사하세요.",
       "전체 테스트 인벤토리가 불완전하거나 테스트 근거를 확정하지 못하면 missing이 아니라 unknown입니다. complete inventory에서 대응 테스트가 없을 때만 missing입니다.",
       "missing_acceptance_test는 host가 test_inventory_complete=true라고 명시했고 AC-N 원문에 대응하는 테스트가 전체 인벤토리에 없을 때만 제출하세요.",
@@ -2149,6 +2221,10 @@ export class PrBot {
       "",
       "## Host가 추출한 명시적 인수조건",
       criteria,
+      "",
+      "## Host Evidence Candidates",
+      "아래 JSON line만 test_evidence와 supporting_test_evidence의 근거로 선택할 수 있습니다.",
+      formatReviewEvidenceCandidates(evidenceCandidates),
       "",
       "## 신뢰된 명시 요청",
       trustedRequest || "(없음)",
