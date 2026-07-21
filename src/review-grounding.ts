@@ -225,12 +225,14 @@ function orderEvidenceCandidates(
   acceptanceCriteria: readonly string[],
   referenceText: string,
 ): Array<Omit<ReviewEvidenceCandidate, "id">> {
-  const compare = (criteria: readonly string[]) => (
+  // Relevance is computed once per candidate per ranking pass. Recomputing it
+  // inside a sort comparator re-tokenizes the reference text N·log N times and
+  // blocks the event loop for minutes on large test inventories.
+  const compareWithScores = (scores: ReadonlyMap<Omit<ReviewEvidenceCandidate, "id">, number>) => (
     left: Omit<ReviewEvidenceCandidate, "id">,
     right: Omit<ReviewEvidenceCandidate, "id">,
   ): number => {
-    const relevance = evidenceCandidateRelevance(right, criteria, referenceText) -
-      evidenceCandidateRelevance(left, criteria, referenceText);
+    const relevance = (scores.get(right) || 0) - (scores.get(left) || 0);
     if (relevance !== 0) {
       return relevance;
     }
@@ -239,27 +241,24 @@ function orderEvidenceCandidates(
     }
     return left.file.localeCompare(right.file) || left.line - right.line;
   };
+  const scoreCandidates = (
+    criteria: readonly string[],
+    reference: string,
+    criterionNumberOffset = 0,
+  ): Map<Omit<ReviewEvidenceCandidate, "id">, number> =>
+    new Map(candidates.map((candidate) => [
+      candidate,
+      evidenceCandidateRelevance(candidate, criteria, reference, criterionNumberOffset),
+    ]));
   if (acceptanceCriteria.length === 0) {
-    return [...candidates].sort(compare([]));
+    return [...candidates].sort(compareWithScores(scoreCandidates([], referenceText)));
   }
 
   const rankings = acceptanceCriteria.map((criterion, index) => {
     const scopedReference = criterionReferenceText(referenceText, index);
-    const criterionCompare = (
-      left: Omit<ReviewEvidenceCandidate, "id">,
-      right: Omit<ReviewEvidenceCandidate, "id">,
-    ): number => {
-      const relevance = evidenceCandidateRelevance(right, [criterion], scopedReference, index) -
-        evidenceCandidateRelevance(left, [criterion], scopedReference, index);
-      if (relevance !== 0) {
-        return relevance;
-      }
-      if (left.kind !== right.kind) {
-        return left.kind === "test" ? -1 : 1;
-      }
-      return left.file.localeCompare(right.file) || left.line - right.line;
-    };
-    return [...candidates].sort(criterionCompare);
+    return [...candidates].sort(
+      compareWithScores(scoreCandidates([criterion], scopedReference, index)),
+    );
   });
   const ordered: Array<Omit<ReviewEvidenceCandidate, "id">> = [];
   const selected = new Set<string>();
@@ -284,7 +283,8 @@ function orderEvidenceCandidates(
       }
     }
   }
-  for (const candidate of [...candidates].sort(compare(acceptanceCriteria))) {
+  const globalCompare = compareWithScores(scoreCandidates(acceptanceCriteria, referenceText));
+  for (const candidate of [...candidates].sort(globalCompare)) {
     if (!selected.has(key(candidate))) {
       selected.add(key(candidate));
       ordered.push(candidate);
@@ -307,6 +307,53 @@ function criterionReferenceText(referenceText: string, criterionIndex: number): 
   nextMarker.lastIndex = match[0].length;
   const next = nextMarker.exec(tail);
   return tail.slice(0, next?.index ?? Math.min(tail.length, 1_200));
+}
+
+const RELEVANCE_TOKEN_PATTERN = /[A-Za-z_][A-Za-z0-9_.]{2,}|\d+(?:\.\d+)?|[\p{Script=Hangul}]{2,}/gu;
+
+type RelevanceReferenceContext = {
+  normalizedReference: string;
+  referenceTokens: ReadonlySet<string>;
+};
+
+const relevanceReferenceCache = new Map<string, RelevanceReferenceContext>();
+const criterionTokenCache = new Map<string, ReadonlySet<string>>();
+
+function relevanceReferenceContext(referenceText: string): RelevanceReferenceContext {
+  const cached = relevanceReferenceCache.get(referenceText);
+  if (cached) {
+    return cached;
+  }
+  // AC labels describe routing, not product data. Leaving the label number in
+  // token scoring lets unrelated noise_1/noise_10 assertions outrank an exact
+  // contributor reference such as `aura` or `whiteout`.
+  const normalizedReference = normalizedEvidence(
+    referenceText.replace(/\bAC-\d+\b/giu, " "),
+  );
+  const value: RelevanceReferenceContext = {
+    normalizedReference,
+    referenceTokens: new Set(normalizedReference.match(RELEVANCE_TOKEN_PATTERN) || []),
+  };
+  if (relevanceReferenceCache.size >= 16) {
+    relevanceReferenceCache.clear();
+  }
+  relevanceReferenceCache.set(referenceText, value);
+  return value;
+}
+
+function criterionRelevanceTokens(criterion: string): ReadonlySet<string> {
+  const cached = criterionTokenCache.get(criterion);
+  if (cached) {
+    return cached;
+  }
+  const value: ReadonlySet<string> = new Set(
+    normalizedEvidence(criterion).match(RELEVANCE_TOKEN_PATTERN) || [],
+  );
+  if (criterionTokenCache.size >= 64) {
+    criterionTokenCache.clear();
+  }
+  criterionTokenCache.set(criterion, value);
+  return value;
 }
 
 function evidenceCandidateRelevance(
@@ -334,12 +381,7 @@ function evidenceCandidateRelevance(
         score += 16;
       }
     }
-    const tokens = new Set(
-      normalizedEvidence(criterion).match(
-        /[A-Za-z_][A-Za-z0-9_.]{2,}|\d+(?:\.\d+)?|[\p{Script=Hangul}]{2,}/gu,
-      ) || [],
-    );
-    for (const token of tokens) {
+    for (const token of criterionRelevanceTokens(criterion)) {
       if (!haystack.includes(token)) {
         continue;
       }
@@ -347,12 +389,7 @@ function evidenceCandidateRelevance(
     }
     best = Math.max(best, score);
   }
-  // AC labels describe routing, not product data. Leaving the label number in
-  // token scoring lets unrelated noise_1/noise_10 assertions outrank an exact
-  // contributor reference such as `aura` or `whiteout`.
-  const normalizedReference = normalizedEvidence(
-    referenceText.replace(/\bAC-\d+\b/giu, " "),
-  );
+  const { normalizedReference, referenceTokens } = relevanceReferenceContext(referenceText);
   if (normalizedReference) {
     const fileMentioned = normalizedReference.includes(normalizedEvidence(candidate.file));
     const testMentioned = normalizedReference.includes(normalizedEvidence(candidate.testName));
@@ -362,11 +399,6 @@ function evidenceCandidateRelevance(
     if (testMentioned) {
       best += 60;
     }
-    const referenceTokens = new Set(
-      normalizedReference.match(
-        /[A-Za-z_][A-Za-z0-9_.]{2,}|\d+(?:\.\d+)?|[\p{Script=Hangul}]{2,}/gu,
-      ) || [],
-    );
     for (const token of referenceTokens) {
       if (haystack.includes(token)) {
         best += /^\d/u.test(token) ? 4 : token.includes("_") ? 8 : 2;
@@ -1489,6 +1521,30 @@ function godotDirectCallContext(
  * This connects semantic paths such as `system.settings` to an assertion that
  * calls normalizeSettings(), without asking the model to fabricate that link.
  */
+const strippedSourceLinesCache = new WeakMap<
+  Readonly<Record<string, string>>,
+  Map<string, string[]>
+>();
+
+function strippedSourceLines(
+  currentHeadFileContents: Readonly<Record<string, string>>,
+  file: string,
+  source: string,
+): string[] {
+  let perFile = strippedSourceLinesCache.get(currentHeadFileContents);
+  if (!perFile) {
+    perFile = new Map();
+    strippedSourceLinesCache.set(currentHeadFileContents, perFile);
+  }
+  const cached = perFile.get(file);
+  if (cached) {
+    return cached;
+  }
+  const lines = stripCommentsFromLines(source.split(/\r?\n/gu));
+  perFile.set(file, lines);
+  return lines;
+}
+
 function localHelperCallContext(
   file: string,
   assertion: string,
@@ -1515,7 +1571,7 @@ function localHelperCallContext(
     return "";
   }
 
-  const lines = stripCommentsFromLines(source.split(/\r?\n/gu));
+  const lines = strippedSourceLines(currentHeadFileContents, file, source);
   const blocks: string[] = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index] || "";

@@ -1093,3 +1093,50 @@ test("fatal confirmation requires the exact same nonempty signature set", () => 
   );
   assert.equal(sameFatalBlockerSet([], []), false);
 });
+
+test("대형 테스트 인벤토리와 긴 reference에서도 evidence 후보 정렬이 이벤트 루프를 분 단위로 막지 않는다", () => {
+  // happy-farm#388 회귀: comparator 안에서 reference 전체를 재토큰화하면
+  // 정렬 한 번에 수 분이 걸려 liveness probe가 봇을 재시작시킨다.
+  const contents: Record<string, string> = {};
+  for (let fileIndex = 0; fileIndex < 30; fileIndex += 1) {
+    const lines = [`describe("suite ${fileIndex}", () => {`];
+    for (let testIndex = 0; testIndex < 20; testIndex += 1) {
+      lines.push(`test("sheet impression guard ${fileIndex}-${testIndex}", () => {`);
+      for (let assertIndex = 0; assertIndex < 4; assertIndex += 1) {
+        lines.push(
+          `  expect(trackAdRewardImpression_${fileIndex}_${testIndex}_${assertIndex}(gameState, sheetType)).toBe(${assertIndex});`,
+        );
+      }
+      lines.push("});");
+    }
+    lines.push("});");
+    contents[`apps/ait/src/__tests__/case${fileIndex}.test.tsx`] = lines.join("\n");
+  }
+  const referenceText = Array.from(
+    { length: 250 },
+    (_, index) =>
+      `- contributor_note_${index}: sheet impression collection_screen guard trackAdRewardImpression gameState 재발화 없음 검증 ${index}`,
+  ).join("\n");
+  const acceptanceCriteria = [
+    "같은 시트가 열려 있는 동안 gameState가 갱신되어도 `trackAdRewardImpression`이 추가 발화되지 않는다.",
+    "시트를 닫았다가 다시 열면 impression이 다시 1회 발화된다.",
+    "shop 시트 열림 1회당 impression은 정확히 2건 발화된다.",
+    "welcomeBack impression의 기존 가드 동작에 회귀가 없다.",
+    "재발화 없음을 검증하는 테스트를 추가한다.",
+  ];
+
+  const start = performance.now();
+  const candidates = buildReviewEvidenceCandidates(contents, {
+    acceptanceCriteria,
+    referenceText,
+  });
+  const elapsedMs = performance.now() - start;
+
+  assert.ok(candidates.length > 0);
+  // 수정 전 구현은 이 입력에서 분 단위로 걸린다. CPU가 느린 러너를 감안해
+  // 넉넉히 20초를 상한으로 둔다.
+  assert.ok(
+    elapsedMs < 20_000,
+    `evidence 후보 정렬이 ${Math.round(elapsedMs)}ms 걸렸습니다 (상한 20000ms)`,
+  );
+});
