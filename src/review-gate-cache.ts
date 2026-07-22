@@ -15,6 +15,33 @@ export type MiniMaxReviewGateCacheEnvelope = {
   verifications: MiniMaxCandidateVerification[];
 };
 
+/**
+ * Removes suppressed candidates while preserving the strict C-1..C-N
+ * candidate/verifier protocol expected by the Host pipeline.
+ */
+export function filterReviewGateCacheCandidates(
+  envelope: MiniMaxReviewGateCacheEnvelope,
+  keep: (candidate: MiniMaxReviewCandidate) => boolean,
+): MiniMaxReviewGateCacheEnvelope {
+  const retained = envelope.candidates.filter(keep);
+  const candidateIdMap = new Map(
+    retained.map((candidate, index) => [candidate.candidateId, `C-${index + 1}`]),
+  );
+  return {
+    ...envelope,
+    candidates: retained.map((candidate) => ({
+      ...candidate,
+      candidateId: candidateIdMap.get(candidate.candidateId)!,
+    })),
+    verifications: envelope.verifications
+      .filter((verification) => candidateIdMap.has(verification.candidateId))
+      .map((verification) => ({
+        ...verification,
+        candidateId: candidateIdMap.get(verification.candidateId)!,
+      })),
+  };
+}
+
 const ROOT_KEYS = [
   "acceptance_coverage",
   "candidates",

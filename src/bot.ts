@@ -89,6 +89,7 @@ import {
   REVIEW_GATE_CACHE_SCHEMA_VERSION,
   decodeReviewGateCache,
   encodeReviewGateCache,
+  filterReviewGateCacheCandidates,
   type MiniMaxReviewGateCacheEnvelope,
 } from "./review-gate-cache.js";
 import {
@@ -1886,20 +1887,14 @@ export class PrBot {
       effectiveAcceptanceCoverage,
     );
     const stickyGroundedCriteria = revalidatedPriorGroundedCriteria;
-    const effectiveCandidates = envelope.candidates.filter((candidate) =>
+    const filteredEnvelope = filterReviewGateCacheCandidates(envelope, (candidate) =>
       candidate.kind !== "missing_acceptance_test" ||
       !candidate.acceptanceCriterion ||
       !stickyGroundedCriteria.has(this.normalizedEvidence(candidate.acceptanceCriterion).toLowerCase()),
     );
-    const effectiveCandidateIds = new Set(effectiveCandidates.map((candidate) => candidate.candidateId));
-    const effectiveVerifications = envelope.verifications.filter((verification) =>
-      effectiveCandidateIds.has(verification.candidateId),
-    );
     const evaluatedEnvelope: MiniMaxReviewGateCacheEnvelope = {
-      ...envelope,
+      ...filteredEnvelope,
       acceptanceCoverage: effectiveAcceptanceCoverage,
-      candidates: effectiveCandidates,
-      verifications: effectiveVerifications,
     };
     const pipeline = evaluateMiniMaxReviewGateCandidates({
       candidates: evaluatedEnvelope.candidates,

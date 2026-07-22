@@ -15,6 +15,7 @@ import {
   type ReviewGatePublicFinding,
 } from "./review-gate-format.js";
 import { buildChangedLineEvidence } from "./review-grounding.js";
+import { isExplicitlyManualAcceptanceCriterion } from "./review-acceptance-coverage.js";
 
 export const REVIEW_GATE_PIPELINE_MAX_FINDINGS = 2 as const;
 
@@ -78,9 +79,6 @@ type CandidateValidationResult =
 
 const SIMPLE_IDENTIFIER_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 const SYMBOL_MAX_DISTANCE = 200;
-const MANUAL_ACCEPTANCE_CRITERION_PATTERN =
-  /수동|시각\s*(?:검증|확인)|직접 확인|육안|실기기|실제 기기|manual|visual|real device/iu;
-
 /**
  * Turns parsed MiniMax candidate/verifier results into host-grounded findings.
  *
@@ -220,7 +218,7 @@ function validateMissingTestCandidate(
     );
   }
 
-  if (MANUAL_ACCEPTANCE_CRITERION_PATTERN.test(trustedCriterion)) {
+  if (isExplicitlyManualAcceptanceCriterion(trustedCriterion)) {
     return rejected(
       candidate,
       "manual_acceptance_criterion",
