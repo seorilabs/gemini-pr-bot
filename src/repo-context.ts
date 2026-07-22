@@ -73,6 +73,11 @@ const TEST_DISCOVERY_IGNORED_DIRECTORIES = new Set([
   "vendor",
 ]);
 const MAX_TEST_CONTENT_SCAN_FILES = 400;
+// Host-only evidence is intentionally independent from the much smaller model
+// prompt budget. Bound the aggregate checkout scan for resource safety without
+// silently dropping an otherwise valid test merely because one file exceeds
+// the former 200 KB per-file limit.
+const MAX_TEST_CONTENT_SCAN_BYTES = 64 * 1024 * 1024;
 const TEST_RELEVANCE_MIN_SCORE = 700;
 
 export type ChangeClass =
@@ -452,24 +457,35 @@ async function buildTestInventory(
     const scoreDifference = (cheapScores.get(right) || 0) - (cheapScores.get(left) || 0);
     return scoreDifference || left.localeCompare(right);
   });
-  const scanPaths = new Set(scanOrder.slice(0, MAX_TEST_CONTENT_SCAN_FILES));
+  const scanPaths = scanOrder.slice(0, MAX_TEST_CONTENT_SCAN_FILES);
   let contentScanComplete = discovery.paths.length <= MAX_TEST_CONTENT_SCAN_FILES;
-  const scored: ScoredTestCandidate[] = [];
   const fileContents: Record<string, string> = {};
+  const contentScores = new Map<string, number>();
+  let remainingScanBytes = MAX_TEST_CONTENT_SCAN_BYTES;
 
-  for (const candidate of discovery.paths) {
-    let score = cheapScores.get(candidate) || 0;
-    if (scanPaths.has(candidate)) {
-      const content = await readTextFile(path.join(checkoutDir, candidate), 200_000);
-      if (content === null) {
-        contentScanComplete = false;
-      } else {
-        fileContents[candidate] = content;
-        score += await scoreTestContent(checkoutDir, candidate, content, changedPaths);
-      }
+  // Read in relevance order so changed and path-related tests retain evidence
+  // even when an unusually large repository exhausts the aggregate Host cap.
+  for (const candidate of scanPaths) {
+    const content = await readTextFile(path.join(checkoutDir, candidate), remainingScanBytes);
+    if (content === null) {
+      contentScanComplete = false;
+      continue;
     }
-    scored.push({ path: candidate, score });
+    fileContents[candidate] = content;
+    remainingScanBytes = Math.max(
+      0,
+      remainingScanBytes - Buffer.byteLength(content, "utf8"),
+    );
+    contentScores.set(
+      candidate,
+      await scoreTestContent(checkoutDir, candidate, content, changedPaths),
+    );
   }
+
+  const scored: ScoredTestCandidate[] = discovery.paths.map((candidate) => ({
+    path: candidate,
+    score: (cheapScores.get(candidate) || 0) + (contentScores.get(candidate) || 0),
+  }));
 
   const relevant = scored
     .filter((candidate) => candidate.score >= TEST_RELEVANCE_MIN_SCORE)
