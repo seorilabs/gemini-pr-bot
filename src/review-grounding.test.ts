@@ -100,6 +100,41 @@ test("Contributor가 지정한 대형 Godot 테스트와 AC 주석은 prompt 파
   assert.match(selected.contextHint || "", /AC-2/);
 });
 
+test("이전에 host-grounded된 exact evidence는 후속 reference 재정렬에도 bounded 메뉴에 pin된다", () => {
+  const alphaFile = "src/alpha.test.ts";
+  const betaFile = "src/beta.test.ts";
+  const alphaQuote = "assert.equal(alphaResult, expectedAlpha);";
+  const betaQuote = "assert.equal(betaResult, expectedBeta);";
+  const contents = {
+    [alphaFile]: [
+      'test("alpha behavior", () => {',
+      `  ${alphaQuote}`,
+      "});",
+    ].join("\n"),
+    [betaFile]: [
+      'test("beta behavior", () => {',
+      `  ${betaQuote}`,
+      "});",
+    ].join("\n"),
+  };
+
+  const candidates = buildReviewEvidenceCandidates(contents, {
+    maxCandidates: 1,
+    acceptanceCriteria: ["alphaResult를 검증한다."],
+    referenceText: `${alphaFile} alpha assertion만 확인해 주세요.`,
+    pinnedEvidence: [{
+      file: betaFile,
+      line: 2,
+      testName: "beta behavior",
+      assertionQuote: betaQuote,
+    }],
+  });
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.file, betaFile);
+  assert.equal(candidates[0]?.quote, betaQuote);
+});
+
 test("로컬 테스트 helper 호출을 따라 설명용 dotted 설정 경로를 결속한다", () => {
   const file = "functions/src/saveSchema.test.ts";
   const source = [

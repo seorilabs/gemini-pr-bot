@@ -5,6 +5,7 @@ import {
   REVIEW_GATE_CACHE_SCHEMA_VERSION,
   decodeReviewGateCache,
   encodeReviewGateCache,
+  filterReviewGateCacheCandidates,
   type MiniMaxReviewGateCacheEnvelope,
 } from "./review-gate-cache.js";
 
@@ -157,4 +158,29 @@ test("non-JSON strings and non-object inputs are cache misses", () => {
   assert.equal(decodeReviewGateCache("not json", []), null);
   assert.equal(decodeReviewGateCache(null, []), null);
   assert.equal(decodeReviewGateCache([], []), null);
+});
+
+test("suppressed candidate 뒤의 후보와 verifier는 C-1부터 다시 결합한다", () => {
+  const envelope = validEnvelope();
+  const secondCandidate = {
+    ...envelope.candidates[0]!,
+    candidateId: "C-2",
+    titleKo: "두 번째 인수조건 테스트가 없습니다",
+  };
+  const secondVerification = {
+    ...envelope.verifications[0]!,
+    candidateId: "C-2",
+  };
+  const filtered = filterReviewGateCacheCandidates(
+    {
+      ...envelope,
+      candidates: [...envelope.candidates, secondCandidate],
+      verifications: [...envelope.verifications, secondVerification],
+    },
+    (candidate) => candidate.candidateId === "C-2",
+  );
+
+  assert.deepEqual(filtered.candidates.map((candidate) => candidate.candidateId), ["C-1"]);
+  assert.deepEqual(filtered.verifications.map((verification) => verification.candidateId), ["C-1"]);
+  assert.equal(filtered.candidates[0]?.titleKo, "두 번째 인수조건 테스트가 없습니다");
 });

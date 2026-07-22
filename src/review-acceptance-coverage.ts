@@ -23,8 +23,13 @@ export type GroundedAcceptanceTestEvidence = {
   kind: "test" | "source";
 };
 
+export type StickyAcceptanceCoverageHistory = {
+  coverage: readonly MiniMaxAcceptanceCoverage[];
+  groundedAcceptanceCriteria: ReadonlySet<string>;
+};
+
 const MANUAL_ACCEPTANCE_CRITERION_PATTERN =
-  /수동|시각\s*(?:검증|확인)|직접\s*확인|육안|실(?:제\s*)?기기|manual|visual|real\s+device/iu;
+  /수동|시각\s*(?:검증|확인)|직접\s*확인|육안|실(?:제\s*)?기기|\(\s*사람\s*\)|운영자\s*작업|코드\s*범위\s*밖|manual|visual|real\s+device|human\s+(?:check|verification)|out\s+of\s+code\s+scope/iu;
 
 /**
  * Evaluates MiniMax's acceptance-test coverage only against host-owned inputs.
@@ -243,6 +248,40 @@ export function normalizeReviewAcceptanceEvidence(value: string): string {
   return value.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase();
 }
 
+/**
+ * Reconstructs which AC rows a persisted review run actually passed at the
+ * Host boundary. A model-declared `covered` row with an AC-scoped validation
+ * error was never accepted and must not become sticky later.
+ */
+export function groundedAcceptanceCriteriaFromReviewRun(
+  explicitAcceptanceCriteria: readonly string[],
+  coverage: readonly MiniMaxAcceptanceCoverage[],
+  validationErrors: readonly string[],
+): Set<string> {
+  const invalidCriterionIds = new Set(
+    validationErrors
+      .map((error) => /^(AC-[1-9]\d*):/u.exec(error)?.[1])
+      .filter((criterionId): criterionId is string => Boolean(criterionId)),
+  );
+  const grounded = new Set<string>();
+  for (let index = 0; index < explicitAcceptanceCriteria.length; index += 1) {
+    const criterion = explicitAcceptanceCriteria[index]!;
+    const criterionId = `AC-${index + 1}`;
+    const item = coverage[index];
+    if (
+      !isExplicitlyManualAcceptanceCriterion(criterion) &&
+      !invalidCriterionIds.has(criterionId) &&
+      item?.criterionId === criterionId &&
+      item.acceptanceCriterion === criterion &&
+      item.status === "covered" &&
+      item.testEvidence
+    ) {
+      grounded.add(normalizeReviewAcceptanceEvidence(criterion));
+    }
+  }
+  return grounded;
+}
+
 function compositeAcceptanceValidationError(
   source: string,
   evidence: readonly ReviewGateTestEvidence[],
@@ -304,10 +343,9 @@ function localeCatalogCoverageValidationError(
 }
 
 /**
- * A grounded PASS for an unchanged HEAD is monotonic. A later model turn may
- * add better evidence, but it cannot erase host-validated evidence from an
- * earlier compatible-cache run of the same commit. Every carried quote is
- * re-grounded against the current Host evidence index before it is reused.
+ * Compatibility helper for a single prior review run. New code should prefer
+ * mergeStickyAcceptanceCoverageHistory so valid evidence can be accumulated
+ * from multiple completed review turns.
  */
 export function mergeStickyAcceptanceCoverage(
   explicitAcceptanceCriteria: readonly string[],
@@ -316,20 +354,42 @@ export function mergeStickyAcceptanceCoverage(
   prior: readonly MiniMaxAcceptanceCoverage[],
   priorGrounded: ReadonlySet<string>,
 ): MiniMaxAcceptanceCoverage[] {
+  return mergeStickyAcceptanceCoverageHistory(
+    explicitAcceptanceCriteria,
+    current,
+    currentGrounded,
+    [{ coverage: prior, groundedAcceptanceCriteria: priorGrounded }],
+  );
+}
+
+/**
+ * Keeps the newest current-HEAD evidence first, then falls back to the newest
+ * previously Host-grounded row whose exact evidence still revalidates on the
+ * current HEAD. History may span commits; changed or stale evidence simply
+ * fails current grounding and is not carried.
+ */
+export function mergeStickyAcceptanceCoverageHistory(
+  explicitAcceptanceCriteria: readonly string[],
+  current: readonly MiniMaxAcceptanceCoverage[],
+  currentGrounded: ReadonlySet<string>,
+  history: readonly StickyAcceptanceCoverageHistory[],
+): MiniMaxAcceptanceCoverage[] {
   return explicitAcceptanceCriteria.map((criterion, index) => {
     const normalized = normalizeReviewAcceptanceEvidence(criterion);
     const currentItem = current[index];
-    const priorItem = prior[index];
     if (currentItem && currentGrounded.has(normalized)) {
       return currentItem;
     }
-    if (
-      priorItem &&
-      priorItem.criterionId === `AC-${index + 1}` &&
-      priorItem.acceptanceCriterion === criterion &&
-      priorGrounded.has(normalized)
-    ) {
-      return priorItem;
+    for (const prior of history) {
+      const priorItem = prior.coverage[index];
+      if (
+        priorItem &&
+        priorItem.criterionId === `AC-${index + 1}` &&
+        priorItem.acceptanceCriterion === criterion &&
+        prior.groundedAcceptanceCriteria.has(normalized)
+      ) {
+        return priorItem;
+      }
     }
     return currentItem || {
       criterionId: `AC-${index + 1}`,

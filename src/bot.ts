@@ -74,7 +74,11 @@ import { buildReviewGateDisclosure } from "./review-gate-disclosure.js";
 import { resolveReviewTurnVerdict } from "./review-turn.js";
 import {
   evaluateReviewAcceptanceCoverage,
+  groundedAcceptanceCriteriaFromReviewRun,
   mergeStickyAcceptanceCoverage,
+  mergeStickyAcceptanceCoverageHistory,
+  normalizeReviewAcceptanceEvidence,
+  type StickyAcceptanceCoverageHistory,
 } from "./review-acceptance-coverage.js";
 import {
   buildReviewEvidenceCandidates,
@@ -85,6 +89,7 @@ import {
   REVIEW_GATE_CACHE_SCHEMA_VERSION,
   decodeReviewGateCache,
   encodeReviewGateCache,
+  filterReviewGateCacheCandidates,
   type MiniMaxReviewGateCacheEnvelope,
 } from "./review-gate-cache.js";
 import {
@@ -106,7 +111,7 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
-const REVIEW_GATE_PROMPT_VERSION = "host-evidence-index-v11-gemini";
+const REVIEW_GATE_PROMPT_VERSION = "sticky-evidence-history-v12-gemini";
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
@@ -210,11 +215,10 @@ export type WorkflowExecution = {
     promptVersion: string,
     contextSha256: string,
   ) => Promise<CachedReviewRun | null>;
-  findLatestReviewGateRun?: (
+  listLatestReviewGateRuns?: (
     repoFullName: string,
     prNumber: number,
-    headSha: string,
-  ) => Promise<CachedReviewRun | null>;
+  ) => Promise<CachedReviewRun[]>;
   recordReviewRun?: (record: ReviewRunRecord) => Promise<void>;
 };
 
@@ -1693,6 +1697,57 @@ export class PrBot {
       context,
       workflow?.reviewGateFindingStore,
     );
+    let priorAcceptanceHistory: StickyAcceptanceCoverageHistory[] = [];
+    try {
+      const priorRuns = await workflow?.listLatestReviewGateRuns?.(
+        repo.fullName,
+        prNumber,
+      ) || [];
+      priorAcceptanceHistory = priorRuns.flatMap((run) => {
+        const priorEnvelope = decodeReviewGateCache(
+          run.rawOutput,
+          explicitAcceptanceCriteria,
+        );
+        if (!priorEnvelope || !run.validationErrors) {
+          return [];
+        }
+        return [{
+          coverage: priorEnvelope.acceptanceCoverage,
+          groundedAcceptanceCriteria: groundedAcceptanceCriteriaFromReviewRun(
+            explicitAcceptanceCriteria,
+            priorEnvelope.acceptanceCoverage,
+            run.validationErrors,
+          ),
+        }];
+      });
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, prNumber, headSha: context.headSha },
+        "failed to load grounded acceptance history",
+      );
+    }
+    const stickyHistoryCoverage = mergeStickyAcceptanceCoverageHistory(
+      explicitAcceptanceCriteria,
+      [],
+      new Set<string>(),
+      priorAcceptanceHistory,
+    );
+    const previouslyGroundedCriteria = groundedAcceptanceCriteriaFromReviewRun(
+      explicitAcceptanceCriteria,
+      stickyHistoryCoverage,
+      [],
+    );
+    const pinnedEvidence = stickyHistoryCoverage.flatMap((item) => {
+      if (
+        !previouslyGroundedCriteria.has(
+          normalizeReviewAcceptanceEvidence(item.acceptanceCriterion),
+        ) ||
+        !item.testEvidence
+      ) {
+        return [];
+      }
+      return [item.testEvidence, ...(item.supportingTestEvidence || [])];
+    });
     const evidenceCandidates = buildReviewEvidenceCandidates(
       context.currentHeadFileContents,
       {
@@ -1701,6 +1756,7 @@ export class PrBot {
           context.acceptanceSourceText,
           context.reviewFollowUp.contributorResponses,
         ].filter(Boolean).join("\n"),
+        pinnedEvidence,
       },
     );
     const prompts = this.reviewGatePrompts(
@@ -1809,56 +1865,36 @@ export class PrBot {
       explicitAcceptanceCriteria,
       envelope.acceptanceCoverage,
     );
-    let priorEnvelope: MiniMaxReviewGateCacheEnvelope | null = null;
-    try {
-      const prior = await workflow?.findLatestReviewGateRun?.(
-        repo.fullName,
-        prNumber,
-        context.headSha,
-      );
-      priorEnvelope = prior
-        ? decodeReviewGateCache(prior.rawOutput, explicitAcceptanceCriteria)
-        : null;
-    } catch (error) {
-      this.logger.warn(
-        { error, repo: repo.fullName, prNumber, headSha: context.headSha },
-        "failed to load same-HEAD grounded acceptance history",
-      );
-    }
-    const priorCoverage = priorEnvelope
-      ? evaluateReviewAcceptanceCoverage(
-          groundingContext,
-          explicitAcceptanceCriteria,
-          priorEnvelope.acceptanceCoverage,
-        )
-      : null;
+    const priorCoverage = evaluateReviewAcceptanceCoverage(
+      groundingContext,
+      explicitAcceptanceCriteria,
+      stickyHistoryCoverage,
+    );
+    const revalidatedPriorGroundedCriteria = new Set(
+      [...priorCoverage.groundedAcceptanceCriteria].filter((criterion) =>
+        previouslyGroundedCriteria.has(criterion)),
+    );
     const effectiveAcceptanceCoverage = mergeStickyAcceptanceCoverage(
       explicitAcceptanceCriteria,
       envelope.acceptanceCoverage,
       currentCoverage.groundedAcceptanceCriteria,
-      priorEnvelope?.acceptanceCoverage || [],
-      priorCoverage?.groundedAcceptanceCriteria || new Set<string>(),
+      stickyHistoryCoverage,
+      revalidatedPriorGroundedCriteria,
     );
     const coverage = evaluateReviewAcceptanceCoverage(
       groundingContext,
       explicitAcceptanceCriteria,
       effectiveAcceptanceCoverage,
     );
-    const stickyGroundedCriteria = priorCoverage?.groundedAcceptanceCriteria || new Set<string>();
-    const effectiveCandidates = envelope.candidates.filter((candidate) =>
+    const stickyGroundedCriteria = revalidatedPriorGroundedCriteria;
+    const filteredEnvelope = filterReviewGateCacheCandidates(envelope, (candidate) =>
       candidate.kind !== "missing_acceptance_test" ||
       !candidate.acceptanceCriterion ||
       !stickyGroundedCriteria.has(this.normalizedEvidence(candidate.acceptanceCriterion).toLowerCase()),
     );
-    const effectiveCandidateIds = new Set(effectiveCandidates.map((candidate) => candidate.candidateId));
-    const effectiveVerifications = envelope.verifications.filter((verification) =>
-      effectiveCandidateIds.has(verification.candidateId),
-    );
     const evaluatedEnvelope: MiniMaxReviewGateCacheEnvelope = {
-      ...envelope,
+      ...filteredEnvelope,
       acceptanceCoverage: effectiveAcceptanceCoverage,
-      candidates: effectiveCandidates,
-      verifications: effectiveVerifications,
     };
     const pipeline = evaluateMiniMaxReviewGateCandidates({
       candidates: evaluatedEnvelope.candidates,
@@ -1969,6 +2005,7 @@ export class PrBot {
         ? "첫 검토에서 판정을 미루지 않습니다. 아래 항목에 답하거나 보정 커밋을 올리면 직전 요청 이후 변경만 좁혀서 다시 검토합니다."
         : "직전 Seori 요청 이후의 응답과 변경만 좁혀서 확인했습니다. 아래 남은 항목에 답하거나 보정 커밋을 올리면 그 이후 변경만 이어서 검토합니다.",
       coveredCriteria: disclosure.coveredCriteria,
+      manualCriteria: disclosure.manualCriteria,
       fatalCheckPassed: disclosure.fatalCheckPassed,
       abstainItems: disclosure.abstainItems,
     });

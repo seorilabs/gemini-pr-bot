@@ -146,6 +146,22 @@ test("통과 결과는 확인한 인수조건과 현재 HEAD 테스트 근거를
   assert.match(output.text, /`재실행 후 기존 세션을 복원한다`/);
 });
 
+test("사람 확인 AC는 자동화 PASS와 분리해 후속 handoff로 표시한다", () => {
+  const output = formatReviewGateCheckOutput({
+    headSha: "abc1234",
+    verdict: "PASS",
+    passSummaryKo: "자동 검증 대상 인수조건과 치명 결함 검사를 확인했습니다.",
+    manualCriteria: [{
+      criterionId: "AC-4",
+      acceptanceCriterion: "(사람) AIT 콘솔 승인 상태를 확인한다 — 코드 범위 밖 운영자 작업.",
+    }],
+  });
+
+  assert.match(output.text, /### 사람 확인 항목/);
+  assert.match(output.text, /AC-4/);
+  assert.match(output.text, /자동화 병합 게이트 대상이 아니며 사람 확인 결과를 별도로 남겨야 합니다/);
+});
+
 test("자동 판정 보류는 approval 부재와 사람 handoff를 명확히 알린다", () => {
   const output = formatReviewGateCheckOutput({
     headSha: "abc1234",

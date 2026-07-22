@@ -15,12 +15,14 @@ import type {
 import type {
   ReviewGateAbstainItem,
   ReviewGateCoveredCriterion,
+  ReviewGateManualCriterion,
 } from "./review-gate-format.js";
 import type { GroundedAcceptanceTestEvidence } from "./review-acceptance-coverage.js";
 import { isPeripheralAcceptanceCriterion } from "./review-turn.js";
 
 export type ReviewGateDisclosure = {
   coveredCriteria: ReviewGateCoveredCriterion[];
+  manualCriteria: ReviewGateManualCriterion[];
   fatalCheckPassed: boolean;
   abstainItems: ReviewGateAbstainItem[];
 };
@@ -46,6 +48,7 @@ export function buildReviewGateDisclosure(
   input: ReviewGateDisclosureInput,
 ): ReviewGateDisclosure {
   const coveredCriteria: ReviewGateCoveredCriterion[] = [];
+  const manualCriteria: ReviewGateManualCriterion[] = [];
   const abstainItems: ReviewGateAbstainItem[] = [];
   const coverageErrors = new Map(
     input.coverageValidationErrors.map((error) => {
@@ -57,6 +60,10 @@ export function buildReviewGateDisclosure(
   for (let index = 0; index < input.explicitAcceptanceCriteria.length; index += 1) {
     const criterion = input.explicitAcceptanceCriteria[index]!;
     if (isExplicitlyManualAcceptanceCriterion(criterion)) {
+      manualCriteria.push({
+        criterionId: `AC-${index + 1}`,
+        acceptanceCriterion: criterion,
+      });
       continue;
     }
     const criterionId = `AC-${index + 1}`;
@@ -150,6 +157,7 @@ export function buildReviewGateDisclosure(
 
   return {
     coveredCriteria,
+    manualCriteria,
     fatalCheckPassed,
     abstainItems: uniqueAbstainItems(abstainItems),
   };

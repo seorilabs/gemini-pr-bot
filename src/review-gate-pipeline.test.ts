@@ -79,6 +79,7 @@ test("수동·육안·실기기 확인을 명시한 인수조건은 자동화 �
     "실제 기기에서 직접 확인한다.",
     "시각 검증은 리뷰에 위임한다.",
     "Visual verification is required on a real device.",
+    "(사람) AIT 콘솔 승인 상태를 확인한다 — 코드 범위 밖 운영자 작업.",
   ]) {
     const result = evaluateMiniMaxReviewGateCandidates(input({
       candidates: [missingCandidate({ acceptanceCriterion: criterion })],
