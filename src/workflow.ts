@@ -79,8 +79,10 @@ type ReviewGateFindingHeadRow = RowDataPacket & {
 };
 
 type CachedReviewRunRow = RowDataPacket & {
+  head_sha: string;
   raw_output: string;
   verdict: string;
+  validation_errors_json: string;
 };
 
 export type ReviewFindingUpsert = {
@@ -120,8 +122,10 @@ export type ReviewGateFindingStore = {
 };
 
 export type CachedReviewRun = {
+  headSha: string;
   rawOutput: string;
   verdict: ReviewRunRecord["verdict"];
+  validationErrors: string[] | null;
 };
 
 export type ExpiredWorkflowRun = WorkflowRun & {
@@ -442,12 +446,12 @@ export class MysqlWorkflowStore {
   ): Promise<CachedReviewRun | null> {
     const [rows] = await this.pool.execute<CachedReviewRunRow[]>(
       `
-      SELECT runs.raw_output, runs.verdict
+      SELECT runs.head_sha, runs.raw_output, runs.verdict, runs.validation_errors_json
       FROM gemini_pr_bot_review_runs AS runs
       INNER JOIN gemini_pr_bot_workflows AS workflows
         ON workflows.id = runs.workflow_id
       WHERE runs.repo_full_name = ? AND runs.pr_number = ? AND runs.head_sha = ?
-        AND runs.provider = 'host' AND runs.prompt_version = ? AND runs.context_sha256 = ?
+        AND runs.provider = 'gemini' AND runs.prompt_version = ? AND runs.context_sha256 = ?
         AND runs.parse_valid = TRUE AND runs.verdict IN ('PASS', 'FAIL')
         AND workflows.status = 'completed'
       ORDER BY runs.id DESC
@@ -460,38 +464,39 @@ export class MysqlWorkflowStore {
       return null;
     }
     return {
+      headSha: row.head_sha,
       rawOutput: row.raw_output,
       verdict: row.verdict as ReviewRunRecord["verdict"],
+      validationErrors: parseValidationErrors(row.validation_errors_json),
     };
   }
 
-  async findLatestReviewGateRun(
+  async listLatestReviewGateRuns(
     repoFullName: string,
     prNumber: number,
-    headSha: string,
-  ): Promise<CachedReviewRun | null> {
+  ): Promise<CachedReviewRun[]> {
     const [rows] = await this.pool.execute<CachedReviewRunRow[]>(
       `
-      SELECT runs.raw_output, runs.verdict
+      SELECT runs.head_sha, runs.raw_output, runs.verdict, runs.validation_errors_json
       FROM gemini_pr_bot_review_runs AS runs
       INNER JOIN gemini_pr_bot_workflows AS workflows
         ON workflows.id = runs.workflow_id
-      WHERE runs.repo_full_name = ? AND runs.pr_number = ? AND runs.head_sha = ?
+      WHERE runs.repo_full_name = ? AND runs.pr_number = ?
         AND runs.provider = 'gemini'
         AND runs.parse_valid = TRUE AND workflows.status = 'completed'
       ORDER BY runs.id DESC
-      LIMIT 1
+      LIMIT 64
       `,
-      [repoFullName, prNumber, headSha],
+      [repoFullName, prNumber],
     );
-    const row = rows[0];
-    if (!row || !["PASS", "FAIL", "FOLLOW_UP", "ABSTAIN"].includes(row.verdict)) {
-      return null;
-    }
-    return {
-      rawOutput: row.raw_output,
-      verdict: row.verdict as ReviewRunRecord["verdict"],
-    };
+    return rows
+      .filter((row) => ["PASS", "FAIL", "FOLLOW_UP", "ABSTAIN"].includes(row.verdict))
+      .map((row) => ({
+        headSha: row.head_sha,
+        rawOutput: row.raw_output,
+        verdict: row.verdict as ReviewRunRecord["verdict"],
+        validationErrors: parseValidationErrors(row.validation_errors_json),
+      }));
   }
 
   async listOpenReviewFindings(repoFullName: string, prNumber: number): Promise<StoredFinding[]> {
@@ -1226,12 +1231,8 @@ export class WorkflowEngine {
             promptVersion,
             contextSha256,
           ),
-        findLatestReviewGateRun: (repoFullName, prNumber, headSha) =>
-          this.store.findLatestReviewGateRun(
-            repoFullName,
-            prNumber,
-            headSha,
-          ),
+        listLatestReviewGateRuns: (repoFullName, prNumber) =>
+          this.store.listLatestReviewGateRuns(repoFullName, prNumber),
         recordReviewRun: (record) => this.store.recordReviewRun(run.id, record),
       });
       await this.store.complete(run.id);
@@ -1405,6 +1406,17 @@ function parsePayload(payloadJson: string): any {
     return JSON.parse(payloadJson);
   } catch {
     return {};
+  }
+}
+
+function parseValidationErrors(value: string): string[] | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : null;
+  } catch {
+    return null;
   }
 }
 

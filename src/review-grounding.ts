@@ -31,6 +31,8 @@ export type ReviewEvidenceCandidateOptions = {
   acceptanceCriteria?: readonly string[];
   /** Latest contributor response; explicit file/test references outrank guesses. */
   referenceText?: string;
+  /** Previously Host-grounded rows that must remain in the bounded current menu if re-extracted. */
+  pinnedEvidence?: readonly ReviewGateTestEvidence[];
 };
 
 export type ChangedLineEvidence = Map<string, Map<number, string>>;
@@ -196,10 +198,15 @@ export function buildReviewEvidenceCandidates(
 
   const bounded: Omit<ReviewEvidenceCandidate, "id">[] = [];
   let serializedChars = 0;
-  const orderedCandidates = orderEvidenceCandidates(
-    [...testCandidates, ...sourceCandidates],
-    acceptanceCriteria,
-    referenceText,
+  const allCandidates = [...testCandidates, ...sourceCandidates];
+  const orderedCandidates = promotePinnedEvidence(
+    orderEvidenceCandidates(
+      allCandidates,
+      acceptanceCriteria,
+      referenceText,
+    ),
+    allCandidates,
+    options.pinnedEvidence || [],
   );
   for (const candidate of orderedCandidates) {
     if (bounded.length >= Math.max(0, maxCandidates)) {
@@ -218,6 +225,36 @@ export function buildReviewEvidenceCandidates(
     ...candidate,
     id: `E-${String(index + 1).padStart(3, "0")}`,
   }));
+}
+
+function promotePinnedEvidence(
+  ordered: Array<Omit<ReviewEvidenceCandidate, "id">>,
+  allCandidates: readonly Omit<ReviewEvidenceCandidate, "id">[],
+  pinnedEvidence: readonly ReviewGateTestEvidence[],
+): Array<Omit<ReviewEvidenceCandidate, "id">> {
+  if (pinnedEvidence.length === 0) {
+    return ordered;
+  }
+  const key = (candidate: Omit<ReviewEvidenceCandidate, "id">): string =>
+    `${candidate.file}:${candidate.line}:${candidate.testName}:${normalizedEvidence(candidate.quote)}`;
+  const pinned: Array<Omit<ReviewEvidenceCandidate, "id">> = [];
+  const selected = new Set<string>();
+  for (const evidence of pinnedEvidence) {
+    const matches = allCandidates.filter((candidate) =>
+      candidate.file === evidence.file &&
+      candidate.testName === evidence.testName &&
+      normalizedEvidence(candidate.quote) === normalizedEvidence(evidence.assertionQuote));
+    const candidate = matches.find((match) => match.line === evidence.line) ||
+      (matches.length === 1 ? matches[0] : undefined);
+    if (candidate && !selected.has(key(candidate))) {
+      selected.add(key(candidate));
+      pinned.push(candidate);
+    }
+  }
+  return [
+    ...pinned,
+    ...ordered.filter((candidate) => !selected.has(key(candidate))),
+  ];
 }
 
 function orderEvidenceCandidates(

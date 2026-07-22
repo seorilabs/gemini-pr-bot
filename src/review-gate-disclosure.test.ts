@@ -39,6 +39,28 @@ test("부분 보류 결과는 통과한 인수조건과 애매한 인수조건�
   assert.match(disclosure.abstainItems[0]?.requiredAction || "", /테스트의 파일/);
 });
 
+test("명시적 사람 확인 AC는 자동화 후속 요청에서 제외하되 공개 handoff로 유지한다", () => {
+  const manualCriterion = "(사람) AIT 콘솔 승인 상태를 확인한다 — 코드 범위 밖 운영자 작업.";
+  const disclosure = buildReviewGateDisclosure({
+    explicitAcceptanceCriteria: [manualCriterion],
+    acceptanceCoverage: [],
+    groundedAcceptanceCriteria: new Set(),
+    coverageValidationErrors: [],
+    fatalContextComplete: true,
+    pipeline: pipeline(),
+    candidates: [],
+    verifications: [],
+    unconfirmedOpenFindings: [],
+  });
+
+  assert.deepEqual(disclosure.coveredCriteria, []);
+  assert.deepEqual(disclosure.abstainItems, []);
+  assert.deepEqual(disclosure.manualCriteria, [{
+    criterionId: "AC-1",
+    acceptanceCriterion: manualCriterion,
+  }]);
+});
+
 test("복합 plan 근거에서 빠진 rollover assertion을 Contributor에게 정확히 요청한다", () => {
   const criterion = "plan 결과가 sim=28800, rollover=0이다.";
   const disclosure = buildReviewGateDisclosure({

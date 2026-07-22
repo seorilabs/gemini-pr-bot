@@ -3,7 +3,9 @@ import test from "node:test";
 import type { MiniMaxAcceptanceCoverage } from "./minimax-review.js";
 import {
   evaluateReviewAcceptanceCoverage,
+  groundedAcceptanceCriteriaFromReviewRun,
   mergeStickyAcceptanceCoverage,
+  mergeStickyAcceptanceCoverageHistory,
   normalizeReviewAcceptanceEvidence,
 } from "./review-acceptance-coverage.js";
 import {
@@ -31,6 +33,16 @@ function coverage(
   };
 }
 
+function evidence(label: string) {
+  return {
+    file: `src/${label}.test.ts`,
+    line: 2,
+    testName: `${label} behavior`,
+    assertionQuote: `assert.equal(${label}, expected);`,
+    explanationKo: `${label} 동작을 검증합니다.`,
+  };
+}
+
 test("명시적 인수조건이 없으면 테스트 근거 없이 완료된다", () => {
   const result = evaluateReviewAcceptanceCoverage(context(), [], []);
 
@@ -50,11 +62,21 @@ test("명시적으로 수동 검증을 요구하는 인수조건은 비차단이
     "Manual QA is required.",
     "Visual inspection is required.",
     "Check this on a real device.",
+    "(사람) AIT 콘솔에서 발급 상태를 확인한다 — 코드 범위 밖 운영자 작업.",
+    "Human verification in the console is out of code scope.",
   ]) {
     const result = evaluateReviewAcceptanceCoverage(context(), [criterion], []);
     assert.equal(result.complete, true, criterion);
     assert.deepEqual(result.validationErrors, [], criterion);
   }
+});
+
+test("운영자라는 단어만으로 자동화 가능한 제품 동작을 manual로 낮추지 않는다", () => {
+  const criterion = "운영자 확인 로그를 저장하고 다시 조회할 수 있다.";
+  const result = evaluateReviewAcceptanceCoverage(context(), [criterion], []);
+
+  assert.equal(result.complete, false);
+  assert.deepEqual(result.validationErrors, ["AC-1: acceptance_coverage_identity_mismatch"]);
 });
 
 test("missing과 unknown 커버리지는 완료로 판정하지 않는다", () => {
@@ -920,6 +942,62 @@ test("동일 HEAD에서 host가 검증한 AC PASS는 이후 모델의 unknown으
       new Set(),
     ),
     [current],
+  );
+});
+
+test("persisted covered 행은 해당 AC의 host validation error가 없을 때만 sticky 후보가 된다", () => {
+  const criteria = ["첫 동작을 저장한다.", "두 번째 동작을 복원한다."];
+  const persisted = [
+    coverage(criteria[0]!, { criterionId: "AC-1", testEvidence: evidence("first") }),
+    coverage(criteria[1]!, { criterionId: "AC-2", testEvidence: evidence("second") }),
+  ];
+
+  assert.deepEqual(
+    [...groundedAcceptanceCriteriaFromReviewRun(
+      criteria,
+      persisted,
+      ["AC-2: test_evidence_not_grounded", "fatal_context_incomplete"],
+    )],
+    [normalizeReviewAcceptanceEvidence(criteria[0]!)],
+  );
+});
+
+test("여러 review run의 newest host-grounded AC를 누적해 이전 PASS를 복원한다", () => {
+  const criteria = ["첫 동작을 저장한다.", "두 번째 동작을 복원한다."];
+  const firstEvidence = coverage(criteria[0]!, {
+    criterionId: "AC-1",
+    testEvidence: evidence("first"),
+  });
+  const secondEvidence = coverage(criteria[1]!, {
+    criterionId: "AC-2",
+    testEvidence: evidence("second"),
+  });
+  const current = [
+    coverage(criteria[0]!, { criterionId: "AC-1", status: "unknown" }),
+    coverage(criteria[1]!, { criterionId: "AC-2", status: "unknown" }),
+  ];
+
+  assert.deepEqual(
+    mergeStickyAcceptanceCoverageHistory(
+      criteria,
+      current,
+      new Set(),
+      [
+        {
+          coverage: [current[0]!, secondEvidence],
+          groundedAcceptanceCriteria: new Set([
+            normalizeReviewAcceptanceEvidence(criteria[1]!),
+          ]),
+        },
+        {
+          coverage: [firstEvidence, current[1]!],
+          groundedAcceptanceCriteria: new Set([
+            normalizeReviewAcceptanceEvidence(criteria[0]!),
+          ]),
+        },
+      ],
+    ),
+    [firstEvidence, secondEvidence],
   );
 });
 

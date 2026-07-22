@@ -49,6 +49,11 @@ export type ReviewGateCoveredCriterion = {
   evidenceKind?: "test" | "source";
 };
 
+export type ReviewGateManualCriterion = {
+  criterionId: string;
+  acceptanceCriterion: string;
+};
+
 export type ReviewGateAbstainItem = {
   label: string;
   reason: string;
@@ -67,6 +72,7 @@ export type ReviewGateFormatInput = {
   abstainSummaryKo?: string;
   followUpSummaryKo?: string;
   coveredCriteria?: readonly ReviewGateCoveredCriterion[];
+  manualCriteria?: readonly ReviewGateManualCriterion[];
   fatalCheckPassed?: boolean;
   abstainItems?: readonly ReviewGateAbstainItem[];
 };
@@ -148,6 +154,7 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
           "",
           summary,
           formatCoveredCriteria(input.coveredCriteria || []),
+          formatManualCriteria(input.manualCriteria || []),
           "",
           "_이 결과는 최소 병합 게이트의 판정이며 일반적인 품질 리뷰를 대체하지 않습니다._",
         ].join("\n"),
@@ -179,6 +186,8 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
           "",
           formatPassedChecks(input.coveredCriteria || [], input.fatalCheckPassed === true),
           "",
+          formatManualCriteria(input.manualCriteria || []),
+          "",
           formatFollowUpItems(followUpItems, "### Contributor 후속 대응"),
           "",
           "_코드 변경 없이 답하는 경우 같은 댓글에 `@seori /review`를 한 번 포함해 주세요. 보정 커밋을 push하면 자동 재검토되며, 직전 요청과 그 이후 변경만 좁혀서 판정합니다._",
@@ -209,6 +218,8 @@ export function formatReviewGateCheckOutput(input: ReviewGateFormatInput): Revie
         summary,
         "",
         formatPassedChecks(input.coveredCriteria || [], input.fatalCheckPassed === true),
+        "",
+        formatManualCriteria(input.manualCriteria || []),
         "",
         formatFollowUpItems(abstainItems, "### 남은 지엽적 항목"),
         "",
@@ -263,6 +274,30 @@ function formatCoveredCriteria(criteria: readonly ReviewGateCoveredCriterion[]):
     return "";
   }
   return ["### 확인한 인수조건 근거", ...formatCoveredCriterionLines(criteria)].join("\n");
+}
+
+function formatManualCriteria(criteria: readonly ReviewGateManualCriterion[]): string {
+  if (criteria.length === 0) {
+    return "";
+  }
+  if (criteria.length > 32) {
+    throw new TypeError("공개할 사람 확인 인수조건은 최대 32개입니다.");
+  }
+  return [
+    "### 사람 확인 항목",
+    ...criteria.map((criterion) =>
+      `- **${requiredText(criterion.criterionId, "manualCriterion.criterionId", 16, false)}** ${
+        publicProse(
+          requiredText(
+            criterion.acceptanceCriterion,
+            "manualCriterion.acceptanceCriterion",
+            MAX_PROSE_LENGTH,
+            false,
+          ),
+          MAX_PROSE_LENGTH,
+        )
+      } — 자동화 병합 게이트 대상이 아니며 사람 확인 결과를 별도로 남겨야 합니다.`),
+  ].join("\n");
 }
 
 function formatCoveredCriterionLines(
