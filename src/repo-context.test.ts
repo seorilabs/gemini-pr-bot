@@ -7,6 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import type { Config } from "./config.js";
 import { buildDeepRepoContext, classifyChange } from "./repo-context.js";
+import { buildReviewEvidenceCandidates } from "./review-grounding.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -24,7 +25,7 @@ test("product, config, and mixed changes receive stable host classifications", (
   assert.equal(classifyChange(["src/api.generated.ts"]), "docs_assets");
 });
 
-test("tracked symlinks do not make test discovery partial and all regular tests can be included", async () => {
+test("tracked symlinks and tests over 200 KB remain in the Host-only evidence inventory", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "seori-repo-context-test-"));
   const sourceRepo = path.join(root, "source");
   const bareRepo = path.join(root, "remote.git");
@@ -47,6 +48,16 @@ test("tracked symlinks do not make test discovery partial and all regular tests 
       path.join(sourceRepo, "tests", "network_test.gd"),
       "extends Node\nfunc test_network():\n\tassert_true(true)\n",
     );
+    const largeTestPath = "tests/large.test.ts";
+    const largeTestContent = [
+      "// Host-only evidence padding\n".repeat(8_000),
+      "test('large current-head evidence', () => {",
+      "  expect(scheduleHarvestReady).toHaveBeenCalledTimes(1);",
+      "});",
+      "",
+    ].join("\n");
+    assert.ok(Buffer.byteLength(largeTestContent, "utf8") > 200_000);
+    await fs.writeFile(path.join(sourceRepo, largeTestPath), largeTestContent);
     await fs.writeFile(path.join(sourceRepo, "vendor", "tests", "vendor_test.gd"), "generated\n");
     await fs.writeFile(path.join(sourceRepo, "generated", "tests", "generated_test.gd"), "generated\n");
 
@@ -88,15 +99,26 @@ test("tracked symlinks do not make test discovery partial and all regular tests 
     });
 
     assert.equal(result.testInventoryComplete, true);
-    assert.equal(result.testInventoryFileCount, 2);
+    assert.equal(result.testInventoryFileCount, 3);
     assert.match(result.markdown, /Test discovery complete: true/);
-    assert.match(result.markdown, /Test inventory discovered: 2/);
+    assert.match(result.markdown, /Test inventory discovered: 3/);
     assert.match(result.markdown, /Test inventory included: 2/);
     assert.match(result.markdown, /Test inventory complete: true/);
     assert.ok(result.fileContents["tests/player_test.gd"]);
     assert.ok(result.fileContents["tests/network_test.gd"]);
+    assert.equal(result.fileContents[largeTestPath], undefined);
     assert.ok(result.evidenceFileContents["tests/player_test.gd"]);
     assert.ok(result.evidenceFileContents["tests/network_test.gd"]);
+    assert.equal(result.evidenceFileContents[largeTestPath], largeTestContent);
+    const largeEvidenceCandidates = buildReviewEvidenceCandidates(result.evidenceFileContents, {
+      acceptanceCriteria: ["큰 테스트 파일의 수확 알림 호출 횟수를 검증한다."],
+    });
+    assert.ok(
+      largeEvidenceCandidates.some((candidate) =>
+        candidate.file === largeTestPath &&
+        candidate.testName === "large current-head evidence" &&
+        candidate.quote === "expect(scheduleHarvestReady).toHaveBeenCalledTimes(1);"),
+    );
     assert.equal(result.fileContents["vendor/tests/vendor_test.gd"], undefined);
     assert.equal(result.fileContents["generated/tests/generated_test.gd"], undefined);
     assert.ok(
@@ -119,10 +141,11 @@ test("tracked symlinks do not make test discovery partial and all regular tests 
       } as Config,
     });
     assert.equal(promptBounded.testInventoryComplete, true);
-    assert.equal(promptBounded.testInventoryFileCount, 2);
+    assert.equal(promptBounded.testInventoryFileCount, 3);
     assert.equal(promptBounded.fileContents["tests/player_test.gd"], undefined);
     assert.ok(promptBounded.evidenceFileContents["tests/player_test.gd"]);
     assert.ok(promptBounded.evidenceFileContents["tests/network_test.gd"]);
+    assert.equal(promptBounded.evidenceFileContents[largeTestPath], largeTestContent);
   } finally {
     if (previousGitConfigGlobal === undefined) {
       delete process.env.GIT_CONFIG_GLOBAL;
