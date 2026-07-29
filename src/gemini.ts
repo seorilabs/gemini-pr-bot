@@ -118,12 +118,14 @@ export class GeminiClient {
     systemPrompt: string,
     userPrompt: string,
     expectedAcceptanceCriteria: readonly string[],
+    options: { repairInvalidOutput?: boolean } = {},
   ): Promise<MiniMaxGateResult<MiniMaxReviewResult>> {
     return this.runGeminiGateRequest(
       () => buildMiniMaxReviewRequest({ systemPrompt, userPrompt }),
       (response: unknown) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria }),
       userPrompt,
       "후보 추출",
+      options.repairInvalidOutput ?? true,
     );
   }
 
@@ -653,12 +655,13 @@ export class GeminiClient {
       | { ok: false; errors: string[] },
     originalUserPrompt: string,
     phaseLabel: string,
+    repairInvalidOutput = true,
   ): Promise<MiniMaxGateResult<T>> {
     const request = buildRequest();
     const response = await this.callGeminiMessages(request, phaseLabel);
     let parsed = parseResponse(response);
 
-    if (!parsed.ok) {
+    if (!parsed.ok && repairInvalidOutput) {
       const repairPrompt = [
         originalUserPrompt,
         "",

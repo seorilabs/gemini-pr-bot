@@ -9,6 +9,7 @@ import {
   listExplicitAcceptanceCriteria,
   closePullRequest,
   completeCheck,
+  completeLatestOwnReviewCheck,
   completeLatestOwnReviewCheckAsSuccess,
   createInProgressCheck,
   getPullRequestStatus,
@@ -16,10 +17,12 @@ import {
   isPullRequestIssue,
   isTrustedAssociation,
   listReviewThreads,
+  postFileReviewComment,
   postPrComment,
   postReviewCommentReply,
   requestChangesPullRequest,
   resolveReviewThread,
+  pullRequestConversationHasMarker,
   REVIEW_AGENT_NAME,
   repoFromPayload,
   shouldHandleRepository,
@@ -101,6 +104,14 @@ import {
   botStatusMarker,
   isBotActionMarkerLine,
 } from "./identity.js";
+import {
+  ACCEPTANCE_GUIDE_INCOMPLETE_MARKER,
+  ACCEPTANCE_GUIDE_PUBLICATION_MARKER,
+  acceptanceGuideCheckState,
+  buildAcceptanceGuide,
+  formatAcceptanceGuideThread,
+  type AcceptanceGuideOutput,
+} from "./acceptance-guide.js";
 
 const NO_ACTION_REQUIRED_MARKER = botStatusMarker("no-action-required");
 const ACTION_REQUIRED_MARKER = botStatusMarker("action-required");
@@ -111,7 +122,7 @@ const AGENT_COMMENT_MARKER = botActionMarker("comment");
 const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
-const REVIEW_GATE_PROMPT_VERSION = "large-test-evidence-v13-gemini";
+const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v1-gemini";
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
 function delay(ms: number): Promise<void> {
@@ -269,6 +280,12 @@ export class PrBot {
     });
   }
 
+  schedulePullRequestReviewThread(event: any): void {
+    this.background("pull_request_review_thread", event.payload, async () => {
+      await this.handlePullRequestReviewThread(event.octokit, event.payload);
+    });
+  }
+
   schedulePullRequest(event: any): void {
     this.background("pull_request", event.payload, async () => {
       await this.handlePullRequest(event.octokit, event.payload);
@@ -307,6 +324,11 @@ export class PrBot {
 
     if (eventName === "pull_request_review") {
       await this.handlePullRequestReview(octokit, payload, workflow);
+      return;
+    }
+
+    if (eventName === "pull_request_review_thread") {
+      await this.handlePullRequestReviewThread(octokit, payload);
       return;
     }
 
@@ -433,6 +455,10 @@ export class PrBot {
     }
 
     if (command.mode === "approve" || command.mode === "force_approve") {
+      if (this.config.acceptanceGuideModeEnabled) {
+        await postPrComment(octokit, repo, issueNumber, this.acceptanceGuideApprovalDisabledText());
+        return;
+      }
       await this.runApprove(
         octokit,
         repo,
@@ -445,7 +471,7 @@ export class PrBot {
     }
 
     if (command.mode === "review") {
-      await this.runReview(octokit, repo, issueNumber, {
+      await this.runAcceptanceGuideOnce(octokit, repo, issueNumber, {
         source: "issue_comment",
         sender: payload.sender.login,
         request: command.request,
@@ -454,6 +480,13 @@ export class PrBot {
     }
 
     if (command.mode === "agent") {
+      if (this.config.acceptanceGuideModeEnabled) {
+        await this.runAnswer(octokit, repo, issueNumber, command.request, {
+          source: "issue_comment",
+          sender: payload.sender.login,
+        }, workflow);
+        return;
+      }
       await this.runAgent(octokit, repo, issueNumber, command.request, {
         source: "issue_comment",
         sender: payload.sender.login,
@@ -492,6 +525,16 @@ export class PrBot {
     }
 
     if (command.mode === "approve" || command.mode === "force_approve") {
+      if (this.config.acceptanceGuideModeEnabled) {
+        await postReviewCommentReply(
+          octokit,
+          repo,
+          prNumber,
+          payload.comment.id,
+          this.acceptanceGuideApprovalDisabledText(),
+        );
+        return;
+      }
       await this.runApprove(
         octokit,
         repo,
@@ -504,6 +547,35 @@ export class PrBot {
     }
 
     if (command.mode === "agent") {
+      if (this.config.acceptanceGuideModeEnabled) {
+        const generated = await this.createAnswerText(
+          octokit,
+          repo,
+          prNumber,
+          command.request,
+          {
+            source: "review_comment",
+            sender: payload.sender.login,
+          },
+          workflow,
+        );
+        if (await this.currentStatusForPublish(
+          octokit,
+          repo,
+          prNumber,
+          generated.headSha,
+          null,
+        )) {
+          await postReviewCommentReply(
+            octokit,
+            repo,
+            prNumber,
+            payload.comment.id,
+            generated.text,
+          );
+        }
+        return;
+      }
       await this.runAgent(octokit, repo, prNumber, command.request, {
         source: "review_comment",
         sender: payload.sender.login,
@@ -513,17 +585,28 @@ export class PrBot {
 
     const generated =
       command.mode === "review"
-        ? await this.createReviewText(octokit, repo, prNumber, {
-            source: "review_comment",
-            sender: payload.sender.login,
-            request: command.request,
-          }, workflow)
+        ? this.config.acceptanceGuideModeEnabled
+          ? null
+          : await this.createReviewText(octokit, repo, prNumber, {
+              source: "review_comment",
+              sender: payload.sender.login,
+              request: command.request,
+            }, workflow)
         : await this.createAnswerText(octokit, repo, prNumber, command.request, {
             source: "review_comment",
             sender: payload.sender.login,
           }, workflow);
 
-    if (!(await this.currentStatusForPublish(octokit, repo, prNumber, generated.headSha, null))) {
+    if (command.mode === "review" && this.config.acceptanceGuideModeEnabled) {
+      await this.runAcceptanceGuideOnce(octokit, repo, prNumber, {
+        source: "review_comment",
+        sender: payload.sender.login,
+        request: command.request,
+      }, workflow);
+      return;
+    }
+
+    if (!generated || !(await this.currentStatusForPublish(octokit, repo, prNumber, generated.headSha, null))) {
       return;
     }
 
@@ -548,7 +631,7 @@ export class PrBot {
     }
 
     if (command.mode === "review") {
-      await this.runReview(octokit, repo, prNumber, {
+      await this.runAcceptanceGuideOnce(octokit, repo, prNumber, {
         source: "pull_request_review",
         sender: payload.sender.login,
         request: command.request,
@@ -557,6 +640,10 @@ export class PrBot {
     }
 
     if (command.mode === "approve" || command.mode === "force_approve") {
+      if (this.config.acceptanceGuideModeEnabled) {
+        await postPrComment(octokit, repo, prNumber, this.acceptanceGuideApprovalDisabledText());
+        return;
+      }
       await this.runApprove(
         octokit,
         repo,
@@ -569,6 +656,13 @@ export class PrBot {
     }
 
     if (command.mode === "agent") {
+      if (this.config.acceptanceGuideModeEnabled) {
+        await this.runAnswer(octokit, repo, prNumber, command.request, {
+          source: "pull_request_review",
+          sender: payload.sender.login,
+        }, workflow);
+        return;
+      }
       await this.runAgent(octokit, repo, prNumber, command.request, {
         source: "pull_request_review",
         sender: payload.sender.login,
@@ -589,6 +683,33 @@ export class PrBot {
 
     const repo = repoFromPayload(payload);
     const action = payload.action;
+
+    if (
+      this.config.acceptanceGuideModeEnabled &&
+      ["opened", "reopened", "synchronize"].includes(action)
+    ) {
+      if (
+        (action === "synchronize" && !this.config.autoReviewOnSynchronize) ||
+        (["opened", "reopened"].includes(action) && !this.config.autoReviewOnOpen)
+      ) {
+        return;
+      }
+      if (isBotGithubAuthor(String(payload.sender?.login || ""))) {
+        return;
+      }
+      if (this.isAutoReviewIgnored(repo)) {
+        this.logger.info({ repo: repo.fullName, action }, "automatic acceptance guide ignored for repository");
+        return;
+      }
+      await this.runAcceptanceGuideOnce(
+        octokit,
+        repo,
+        payload.pull_request.number,
+        { source: `pull_request.${action}`, sender: payload.sender.login },
+        workflow,
+      );
+      return;
+    }
 
     if (payload.sender.type === "Bot") {
       if (
@@ -638,6 +759,18 @@ export class PrBot {
     }
   }
 
+  private async handlePullRequestReviewThread(octokit: Octokit, payload: any): Promise<void> {
+    if (!this.config.acceptanceGuideModeEnabled || !shouldHandleRepository(payload, this.config)) {
+      return;
+    }
+    const repo = repoFromPayload(payload);
+    const prNumber = Number(payload.pull_request?.number);
+    if (!Number.isFinite(prNumber) || await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) {
+      return;
+    }
+    await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber);
+  }
+
   private async handleStaleReviewSelfTrigger(
     octokit: Octokit,
     payload: any,
@@ -654,6 +787,10 @@ export class PrBot {
       return;
     }
     if (await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) {
+      return;
+    }
+    if (this.config.acceptanceGuideModeEnabled) {
+      await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber);
       return;
     }
 
@@ -702,6 +839,18 @@ export class PrBot {
     const request = this.ciRecheckRequest(payload);
     if (!request) {
       this.logger.warn({ repo: repo.fullName, payload }, "CI recheck payload missing required fields");
+      return;
+    }
+
+    if (this.config.acceptanceGuideModeEnabled) {
+      await completeCheck(
+        octokit,
+        repo,
+        request.checkRunId,
+        "neutral",
+        "승인 재확인 비활성화",
+        "Seori는 인수조건 안내 모드로 전환되어 CI 완료 후 approval을 제출하지 않습니다.",
+      );
       return;
     }
 
@@ -840,6 +989,177 @@ export class PrBot {
       "",
       NO_ACTIONABLE_FINDINGS_TEXT,
     ].join("\n");
+  }
+
+  private acceptanceGuideApprovalDisabledText(): string {
+    return [
+      "Seori는 현재 인수조건 안내 모드로 운영되어 GitHub approval을 제출하지 않습니다.",
+      "누락 또는 소명이 필요한 Seori review thread에 답한 뒤 Resolve하면 required check가 갱신됩니다.",
+    ].join("\n");
+  }
+
+  private async runAcceptanceGuideOnce(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    trigger: ReviewTrigger,
+    workflow?: WorkflowExecution,
+  ): Promise<void> {
+    if (!this.config.acceptanceGuideModeEnabled) {
+      await this.runReview(octokit, repo, prNumber, trigger, workflow);
+      return;
+    }
+
+    const published = await pullRequestConversationHasMarker(
+      octokit,
+      repo,
+      prNumber,
+      ACCEPTANCE_GUIDE_PUBLICATION_MARKER,
+    );
+    if (published) {
+      this.logger.info(
+        { repo: repo.fullName, prNumber, source: trigger.source },
+        "acceptance guide already published; refreshing thread check without AI",
+      );
+      await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber);
+      return;
+    }
+
+    await this.runReview(octokit, repo, prNumber, trigger, workflow);
+  }
+
+  private async refreshAcceptanceGuideCheck(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+  ): Promise<void> {
+    const status = await getPullRequestStatus(octokit, repo, prNumber);
+    if (this.isClosedPullRequest(status)) {
+      return;
+    }
+
+    try {
+      const incomplete = await pullRequestConversationHasMarker(
+        octokit,
+        repo,
+        prNumber,
+        ACCEPTANCE_GUIDE_INCOMPLETE_MARKER,
+      );
+      if (incomplete) {
+        await completeLatestOwnReviewCheck(
+          octokit,
+          repo,
+          status.headSha,
+          "neutral",
+          "인수조건 스레드 게시 불완전",
+          "최초 안내 일부를 resolvable review thread로 게시하지 못했습니다. 안내 기능의 오류만으로 병합을 막지 않습니다.",
+        );
+        return;
+      }
+      const threads = await listReviewThreads(octokit, repo, prNumber);
+      const state = acceptanceGuideCheckState(threads);
+      await completeLatestOwnReviewCheck(
+        octokit,
+        repo,
+        status.headSha,
+        state.conclusion,
+        state.title,
+        state.summary,
+      );
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, prNumber, headSha: status.headSha },
+        "acceptance guide thread refresh failed",
+      );
+      await completeLatestOwnReviewCheck(
+        octokit,
+        repo,
+        status.headSha,
+        "neutral",
+        "인수조건 스레드 상태 확인 불가",
+        "GitHub review thread 상태를 읽지 못했습니다. 안내 기능의 오류만으로 병합을 막지 않습니다.",
+      );
+    }
+  }
+
+  private async publishAcceptanceGuide(
+    octokit: Octokit,
+    repo: RepoRef,
+    prNumber: number,
+    context: PullRequestContext,
+    check: ActiveCheckRun | null,
+    guide: AcceptanceGuideOutput,
+    inconclusive = false,
+  ): Promise<void> {
+    if (!(await this.currentStatusForPublish(
+      octokit,
+      repo,
+      prNumber,
+      context.headSha,
+      check,
+    ))) {
+      return;
+    }
+    const paths = [...context.changedFilePaths];
+    let threadPublicationFailed = false;
+
+    if (guide.items.length > 0 && paths.length === 0) {
+      threadPublicationFailed = true;
+    } else {
+      for (let index = 0; index < guide.items.length; index += 1) {
+        const item = guide.items[index]!;
+        try {
+          await postFileReviewComment(
+            octokit,
+            repo,
+            prNumber,
+            context.headSha,
+            paths[index % paths.length]!,
+            formatAcceptanceGuideThread(item),
+          );
+        } catch (error) {
+          threadPublicationFailed = true;
+          this.logger.warn(
+            {
+              error,
+              repo: repo.fullName,
+              prNumber,
+              headSha: context.headSha,
+              itemId: item.id,
+            },
+            "acceptance guide file review comment failed",
+          );
+        }
+      }
+    }
+
+    const publicationNote = threadPublicationFailed
+      ? [
+          "",
+          ACCEPTANCE_GUIDE_INCOMPLETE_MARKER,
+          "일부 안내 항목을 resolvable review thread로 게시하지 못했습니다.",
+          "GitHub 스레드 생성 실패만으로 병합을 막지 않습니다.",
+        ].join("\n")
+      : "";
+    await postPrComment(octokit, repo, prNumber, `${guide.summary}${publicationNote}`);
+
+    if (inconclusive || threadPublicationFailed) {
+      await this.completeTrackedCheck(
+        check,
+        "neutral",
+        inconclusive ? "인수조건 가이드 생성 불가" : "인수조건 스레드 게시 불완전",
+        `${guide.summary}${publicationNote}`,
+      );
+      return;
+    }
+
+    const hasOpenItems = guide.items.length > 0;
+    await this.completeTrackedCheck(
+      check,
+      hasOpenItems ? "action_required" : "success",
+      hasOpenItems ? "인수조건 확인 필요" : "인수조건 가이드 완료",
+      guide.summary,
+    );
   }
 
   private async runReview(
@@ -1690,6 +2010,27 @@ export class PrBot {
       ...context.explicitAcceptanceCriteria,
       ...listExplicitAcceptanceCriteria(trustedRequest),
     ]);
+    if (
+      this.config.acceptanceGuideModeEnabled &&
+      explicitAcceptanceCriteria.length === 0
+    ) {
+      await this.publishAcceptanceGuide(
+        octokit,
+        repo,
+        prNumber,
+        context,
+        check,
+        buildAcceptanceGuide({
+          headSha: context.headSha,
+          explicitAcceptanceCriteria,
+          coveredCriteria: [],
+          manualCriteria: [],
+          abstainItems: [],
+          findings: [],
+        }),
+      );
+      return;
+    }
     const ledgerSnapshot = await this.loadReviewGateLedgerSnapshot(
       octokit,
       repo,
@@ -1802,21 +2143,26 @@ export class PrBot {
           prompts.candidateSystem,
           prompts.candidateUser,
           explicitAcceptanceCriteria,
+          {
+            repairInvalidOutput: !this.config.acceptanceGuideModeEnabled,
+          },
         );
-        const verificationResult = candidateResult.value.candidates.length === 0
+        const guideMode = this.config.acceptanceGuideModeEnabled;
+        const candidates = guideMode ? [] : candidateResult.value.candidates;
+        const verificationResult = candidates.length === 0
           ? { verifications: [] }
           : (await this.gemini.verifyReviewGateCandidates(
               prompts.verifierSystem,
               this.reviewGateVerifierPrompt(
                 prompts.candidateUser,
-                candidateResult.value.candidates,
+                candidates,
               ),
-              candidateResult.value.candidates,
+              candidates,
             )).value;
         envelope = {
           schemaVersion: REVIEW_GATE_CACHE_SCHEMA_VERSION,
           acceptanceCoverage: candidateResult.value.acceptanceCoverage,
-          candidates: candidateResult.value.candidates,
+          candidates,
           verifications: verificationResult.verifications,
         };
       }
@@ -1825,6 +2171,52 @@ export class PrBot {
         { error, repo: repo.fullName, prNumber, headSha: context.headSha },
         "Gemini conservative review gate could not produce validated evidence",
       );
+      if (this.config.acceptanceGuideModeEnabled) {
+        const guide: AcceptanceGuideOutput = {
+          items: [],
+          summary: [
+            ACCEPTANCE_GUIDE_PUBLICATION_MARKER,
+            "## Seori 인수조건 가이드",
+            "",
+            `초기 HEAD: \`${context.headSha}\``,
+            "",
+            "모델 또는 검증 처리 오류로 최초 인수조건 가이드를 생성하지 못했습니다.",
+            "",
+            "_안내 기능의 오류만으로 병합을 막지 않으며, 새 커밋이나 답글로 AI 리뷰를 다시 실행하지 않습니다._",
+          ].join("\n"),
+        };
+        await this.recordReviewGateRun(
+          workflow,
+          check,
+          repo,
+          prNumber,
+          context,
+          contextHash,
+          prompts,
+          null,
+          "ABSTAIN",
+          [error instanceof Error ? error.message : String(error)],
+        );
+        const latest = await this.currentStatusForPublish(
+          octokit,
+          repo,
+          prNumber,
+          context.headSha,
+          check,
+        );
+        if (latest) {
+          await this.publishAcceptanceGuide(
+            octokit,
+            repo,
+            prNumber,
+            context,
+            check,
+            guide,
+            true,
+          );
+        }
+        return;
+      }
       const output = formatReviewGateCheckOutput({
         headSha: context.headSha,
         verdict: "FOLLOW_UP",
@@ -1979,6 +2371,56 @@ export class PrBot {
       verifications: evaluatedEnvelope.verifications,
       unconfirmedOpenFindings,
     });
+    if (this.config.acceptanceGuideModeEnabled) {
+      const guide = buildAcceptanceGuide({
+        headSha: context.headSha,
+        explicitAcceptanceCriteria,
+        coveredCriteria: disclosure.coveredCriteria,
+        manualCriteria: disclosure.manualCriteria,
+        abstainItems: disclosure.abstainItems,
+        findings: publicFindings,
+      });
+      await this.recordReviewGateRun(
+        workflow,
+        check,
+        repo,
+        prNumber,
+        context,
+        contextHash,
+        prompts,
+        evaluatedEnvelope,
+        guide.items.length > 0 ? "FOLLOW_UP" : "PASS",
+        [
+          ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
+          ...coverage.validationErrors,
+        ],
+      );
+      if (await this.cancelTrackedCheckIfShuttingDown(
+        check,
+        "인수조건 가이드 취소",
+        "가이드 결과를 게시하기 전에 봇이 중지되었습니다.",
+      )) {
+        return;
+      }
+      const latest = await this.currentStatusForPublish(
+        octokit,
+        repo,
+        prNumber,
+        context.headSha,
+        check,
+      );
+      if (latest) {
+        await this.publishAcceptanceGuide(
+          octokit,
+          repo,
+          prNumber,
+          context,
+          check,
+          guide,
+        );
+      }
+      return;
+    }
     const verdict = resolveReviewTurnVerdict(
       baseVerdict,
       context.reviewFollowUp.reviewRound,
@@ -2204,7 +2646,18 @@ export class PrBot {
     candidateUser: string;
     verifierSystem: string;
   } {
-    const candidateSystem = [
+    const candidateSystem = this.config.acceptanceGuideModeEnabled ? [
+      "당신은 Seori의 최초 1회 인수조건 안내를 위한 근거 분류자입니다. 승인, 거절, 코드 품질 판정자는 아닙니다.",
+      "Host가 제공한 모든 인수조건을 AC-1부터 순서와 원문 그대로 acceptance_coverage에 한 번씩 제출하세요.",
+      "candidates는 항상 빈 배열로 제출하고 치명 결함, 일반 코드 결함, 스타일, 리팩터링 또는 개선 제안을 찾지 마세요.",
+      "covered는 Host Evidence Candidates에서 현재 HEAD의 직접적인 테스트 또는 소스 근거를 정확히 선택할 때만 사용하세요.",
+      "complete inventory에서 직접 근거가 없으면 missing, 인벤토리가 불완전하거나 판단이 애매하면 unknown입니다.",
+      "명시적으로 수동·육안·실기기 확인을 요구하는 조건만 manual로 분류하세요.",
+      "함수의 특정 테이블·프로필·API 사용처럼 소스 연결 자체가 조건이면 정확한 현재 HEAD 구현 한 줄을 근거로 사용할 수 있습니다.",
+      "복합 인수조건은 같은 실행 테스트의 supporting_test_evidence를 최대 3개까지 사용해 모든 필수 결과를 함께 증명하세요.",
+      "후보에 없는 파일, 테스트명, assertion 또는 line을 만들지 마세요.",
+      "모든 공개 설명 필드는 한글로 쓰고 정의된 submit_review 도구를 정확히 한 번 사용하세요.",
+    ].join("\n") : [
       "당신은 Seori의 보수적 PR 병합 게이트에서 후보만 찾는 조사자입니다. 최종 판정자는 host입니다.",
       "일반 코드 리뷰, 개선 제안, 스타일, 유지보수성, 잠재 위험, 검증 요청은 출력하지 마세요.",
       "허용 후보는 최대 2개이며 fatal_defect 또는 missing_acceptance_test뿐입니다.",
@@ -2281,7 +2734,9 @@ export class PrBot {
       context.reviewGateMarkdown,
       "",
       "## 수행할 작업",
-      "위 현재 HEAD 근거만으로 허용된 후보를 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
+      this.config.acceptanceGuideModeEnabled
+        ? "각 인수조건의 현재 HEAD 근거 상태만 분류하고 candidates는 빈 배열로 submit_review 도구에 제출하세요."
+        : "위 현재 HEAD 근거만으로 허용된 후보를 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
     ].join("\n");
     return { candidateSystem, candidateUser, verifierSystem };
   }
@@ -3466,6 +3921,17 @@ export class PrBot {
   }
 
   private helpText(): string {
+    if (this.config.acceptanceGuideModeEnabled) {
+      return [
+        "Seori는 현재 인수조건 안내 모드입니다.",
+        "",
+        "- PR 최초 생성 시 인수조건 가이드를 한 번만 게시합니다.",
+        "- `/review`는 AI를 다시 호출하지 않고 기존 가이드 스레드의 Resolve 상태만 갱신합니다.",
+        "- 누락 또는 소명이 필요한 review thread에 답한 뒤 Resolve해 주세요.",
+        "- Seori는 GitHub approval, REQUEST_CHANGES 또는 자동 병합을 수행하지 않습니다.",
+        "- 일반 질문에는 PR 맥락을 바탕으로 답변만 남깁니다.",
+      ].join("\n");
+    }
     return [
       "사용 가능한 명령:",
       "",

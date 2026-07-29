@@ -44,6 +44,7 @@ export type Config = {
   autoReviewOnOpen: boolean;
   autoReviewOnSynchronize: boolean;
   autoReviewIgnoredRepositories: Set<string>;
+  acceptanceGuideModeEnabled: boolean;
   autoSquashMergeEnabled: boolean;
   approvalTelegramNotifyEnabled: boolean;
   quotaTelegramNotifyEnabled: boolean;
@@ -268,6 +269,7 @@ export function loadConfig(): Config {
     autoReviewOnOpen: optionalBool("AUTO_REVIEW_ON_OPEN", true),
     autoReviewOnSynchronize: optionalBool("AUTO_REVIEW_ON_SYNCHRONIZE", false),
     autoReviewIgnoredRepositories: optionalRepositorySet("AUTO_REVIEW_IGNORED_REPOSITORIES", []),
+    acceptanceGuideModeEnabled: optionalBool("ACCEPTANCE_GUIDE_MODE_ENABLED", true),
     autoSquashMergeEnabled: optionalBool("AUTO_SQUASH_MERGE_ENABLED", false),
     approvalTelegramNotifyEnabled: optionalBool("APPROVAL_TELEGRAM_NOTIFY_ENABLED", false),
     quotaTelegramNotifyEnabled: optionalBool("QUOTA_TELEGRAM_NOTIFY_ENABLED", false),

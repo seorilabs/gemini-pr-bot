@@ -25,6 +25,7 @@ Create this as an organization-owned GitHub App under `seorilabs`.
 - Pull request
 - Pull request review
 - Pull request review comment
+- Pull request review thread
 
 ## Installation
 

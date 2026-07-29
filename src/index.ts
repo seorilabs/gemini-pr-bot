@@ -70,6 +70,14 @@ app.webhooks.on("pull_request_review.submitted", async (event) => {
   await handleWebhookEvent("pull_request_review", event, () => bot.schedulePullRequestReview(event));
 });
 
+app.webhooks.on("pull_request_review_thread.resolved", async (event) => {
+  await handleWebhookEvent(
+    "pull_request_review_thread",
+    event,
+    () => bot.schedulePullRequestReviewThread(event),
+  );
+});
+
 app.webhooks.on(["pull_request.opened", "pull_request.reopened", "pull_request.synchronize"], async (event) => {
   await handleWebhookEvent("pull_request", event, () => bot.schedulePullRequest(event));
 });
