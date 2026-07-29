@@ -15,6 +15,12 @@ flowchart LR
 
 ## Behavior
 
+- `ACCEPTANCE_GUIDE_MODE_ENABLED=true`에서는 Draft/일반 PR의 최초 이벤트에만 AI 인수조건 가이드를 한 번 게시합니다.
+- 최초 가이드는 인수조건 근거 분류 호출을 최대 한 번만 사용하며, 후보 verifier나 형식 보정 재호출을 실행하지 않습니다.
+- 누락되거나 소명이 필요한 항목은 변경 파일 단위의 resolvable review thread로 남깁니다. `Seori Review` required check는 이 스레드가 남아 있으면 `action_required`, 모두 Resolve되면 `success`입니다.
+- 새 커밋과 추가 `/review` 요청은 AI를 다시 호출하지 않습니다. `pull_request.synchronize`와 `pull_request_review_thread.resolved`는 현재 미해결 Seori 가이드 스레드만 다시 집계합니다.
+- 인수조건 가이드는 GitHub approval, `REQUEST_CHANGES`, 자동 병합을 제출하지 않습니다. 모델/API/스레드 조회 오류도 안내 기능 자체의 실패로 처리해 병합을 막지 않습니다.
+- `ACCEPTANCE_GUIDE_MODE_ENABLED=false`일 때만 아래의 기존 보수적 merge-gate/approval 동작을 사용합니다.
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
 - Runs a conservative structured merge gate (`STRUCTURED_REVIEW_ENABLED`) instead of a general-purpose code review.
 - Maps only host-recognized checklist items or bullets under acceptance/requirements/definition-of-done/behavior headings (`동작`, `기대 동작` 포함) to a bounded host-extracted menu of exact current-HEAD test or source evidence. The Host builds its test evidence index from the shallow clone independently from prompt-rendered file bodies, then round-robins AC-specific candidates using AC comments, PR validation mappings, and Contributor file/test references. Its Host-only scan uses a separate 64 MiB aggregate safety budget, reads changed and path-related tests first, and does not discard an individual test merely because it exceeds 200 KB. Large smoke files and later ACs therefore cannot be starved by a product-first prompt byte budget. If the aggregate scan limit is exhausted, the inventory is marked partial and the gate continues to fail closed. Unchanged tests count when they exist in the Host index; the model selects evidence IDs but cannot invent their identity. Validation-result sections such as `검증` are not acceptance criteria.
@@ -54,6 +60,11 @@ flowchart LR
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default.
 
 ## Commands
+
+`ACCEPTANCE_GUIDE_MODE_ENABLED=true`에서는 `/review`가 새 AI 리뷰를 시작하지 않고 기존
+가이드 스레드 상태만 갱신합니다. `/approve`, `/force-approve`, 자동 approval과 자동 병합은
+비활성화됩니다. 일반 멘션은 PR 맥락에 대한 답변만 남깁니다. 아래 approval 명령은
+legacy mode에서만 사용할 수 있습니다.
 
 ```text
 @gemini-cli /review

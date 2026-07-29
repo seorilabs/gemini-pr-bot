@@ -82,6 +82,7 @@ export type PullRequestContext = PullRequestStatus & {
   markdown: string;
   reviewGateMarkdown: string;
   acceptanceSourceText: string;
+  changedFilePaths: readonly string[];
   testInventoryComplete: boolean;
   testInventoryFileCount: number;
   currentHeadFileContents: Readonly<Record<string, string>>;
@@ -568,6 +569,9 @@ export async function buildPullRequestContext(
     markdown: truncate(markdown, config.maxContextChars),
     reviewGateMarkdown: truncatedReviewGateMarkdown,
     acceptanceSourceText: truncate(acceptanceSourceText, config.maxContextChars),
+    changedFilePaths: files
+      .map((file: any) => String(file.filename || ""))
+      .filter(Boolean),
     testInventoryComplete: deepRepoContextResult.testInventoryComplete,
     testInventoryFileCount,
     currentHeadFileContents: hostCurrentHeadFileContents,
@@ -1605,10 +1609,11 @@ export async function completeCheck(
   });
 }
 
-export async function completeLatestOwnReviewCheckAsSuccess(
+export async function completeLatestOwnReviewCheck(
   octokit: Octokit,
   repo: RepoRef,
   headSha: string,
+  conclusion: CheckConclusion,
   title: string,
   summary: string,
 ): Promise<number | null> {
@@ -1635,7 +1640,7 @@ export async function completeLatestOwnReviewCheckAsSuccess(
       name: REVIEW_CHECK_NAME,
       head_sha: headSha,
       status: "completed",
-      conclusion: "success",
+      conclusion,
       completed_at: new Date().toISOString(),
       output: {
         title,
@@ -1651,7 +1656,7 @@ export async function completeLatestOwnReviewCheckAsSuccess(
     repo: repo.repo,
     check_run_id: checkRunId,
     status: "completed",
-    conclusion: "success",
+    conclusion,
     completed_at: new Date().toISOString(),
     output: {
       title,
@@ -1659,6 +1664,23 @@ export async function completeLatestOwnReviewCheckAsSuccess(
     },
   });
   return checkRunId;
+}
+
+export async function completeLatestOwnReviewCheckAsSuccess(
+  octokit: Octokit,
+  repo: RepoRef,
+  headSha: string,
+  title: string,
+  summary: string,
+): Promise<number | null> {
+  return completeLatestOwnReviewCheck(
+    octokit,
+    repo,
+    headSha,
+    "success",
+    title,
+    summary,
+  );
 }
 
 export async function approvePullRequest(
@@ -1751,6 +1773,60 @@ export async function postReviewCommentReply(
     comment_id: commentId,
     body: githubCommentBody(body),
   });
+}
+
+export async function postFileReviewComment(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+  headSha: string,
+  path: string,
+  body: string,
+): Promise<number | null> {
+  const { data } = await octokit.request(
+    "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments",
+    {
+      owner: repo.owner,
+      repo: repo.repo,
+      pull_number: prNumber,
+      body: githubCommentBody(body),
+      commit_id: headSha,
+      path,
+      subject_type: "file",
+    },
+  );
+  return Number.isFinite(Number(data?.id)) ? Number(data.id) : null;
+}
+
+export async function pullRequestConversationHasMarker(
+  octokit: Octokit,
+  repo: RepoRef,
+  prNumber: number,
+  marker: string,
+): Promise<boolean> {
+  const [comments, reviews, reviewComments] = await Promise.all([
+    octokit.paginate(octokit.rest.issues.listComments, {
+      owner: repo.owner,
+      repo: repo.repo,
+      issue_number: prNumber,
+      per_page: 100,
+    }),
+    octokit.paginate(octokit.rest.pulls.listReviews, {
+      owner: repo.owner,
+      repo: repo.repo,
+      pull_number: prNumber,
+      per_page: 100,
+    }),
+    octokit.paginate(octokit.rest.pulls.listReviewComments, {
+      owner: repo.owner,
+      repo: repo.repo,
+      pull_number: prNumber,
+      per_page: 100,
+    }),
+  ]);
+  return [...comments, ...reviews, ...reviewComments].some((entry: any) =>
+    String(entry.body || "").includes(marker)
+  );
 }
 
 export type InlineReviewComment = {

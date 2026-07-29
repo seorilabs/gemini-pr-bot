@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { completeLatestOwnReviewCheckAsSuccess, type RepoRef } from "./github.js";
+import {
+  completeLatestOwnReviewCheck,
+  completeLatestOwnReviewCheckAsSuccess,
+  postFileReviewComment,
+  pullRequestConversationHasMarker,
+  type RepoRef,
+} from "./github.js";
 
 const REPO: RepoRef = {
   owner: "seorilabs",
@@ -127,5 +133,90 @@ test("a successful own review check is created when none exists", async () => {
         summary: "현재 HEAD를 검증했습니다.",
       },
     },
+  );
+});
+
+test("latest own review check can remain action_required while guide threads are open", async () => {
+  const updateCalls: any[] = [];
+  const octokit = {
+    rest: {
+      checks: {
+        listForRef: async () => ({
+          data: {
+            check_runs: [
+              { id: 91, name: "Seori Review", status: "completed" },
+            ],
+          },
+        }),
+        update: async (params: any) => {
+          updateCalls.push(params);
+        },
+      },
+    },
+  };
+
+  const updatedId = await completeLatestOwnReviewCheck(
+    octokit,
+    REPO,
+    "head-sha",
+    "action_required",
+    "인수조건 확인 필요",
+    "미해결 스레드가 2건 있습니다.",
+  );
+
+  assert.equal(updatedId, 91);
+  assert.equal(updateCalls.length, 1);
+  assert.equal(updateCalls[0].conclusion, "action_required");
+  assert.equal(updateCalls[0].output.title, "인수조건 확인 필요");
+});
+
+test("acceptance guide item is posted as a resolvable file-level review comment", async () => {
+  const calls: any[] = [];
+  const octokit = {
+    request: async (route: string, params: any) => {
+      calls.push({ route, params });
+      return { data: { id: 123 } };
+    },
+  };
+
+  const commentId = await postFileReviewComment(
+    octokit,
+    REPO,
+    7,
+    "head-sha",
+    "src/example.ts",
+    "인수조건을 확인해 주세요.",
+  );
+
+  assert.equal(commentId, 123);
+  assert.equal(calls[0].route, "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments");
+  assert.equal(calls[0].params.subject_type, "file");
+  assert.equal(calls[0].params.path, "src/example.ts");
+  assert.equal(calls[0].params.commit_id, "head-sha");
+});
+
+test("published marker is recovered from review comments as well as PR comments", async () => {
+  const marker = "<!-- seorilabs-seori-pr-bot:acceptance-guide=published -->";
+  const octokit = {
+    paginate: async (method: unknown) => {
+      if (method === "review-comments") {
+        return [{ body: marker }];
+      }
+      return [];
+    },
+    rest: {
+      issues: {
+        listComments: "issue-comments",
+      },
+      pulls: {
+        listReviews: "reviews",
+        listReviewComments: "review-comments",
+      },
+    },
+  };
+
+  assert.equal(
+    await pullRequestConversationHasMarker(octokit, REPO, 7, marker),
+    true,
   );
 });
