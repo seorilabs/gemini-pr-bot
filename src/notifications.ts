@@ -54,6 +54,23 @@ function singleLine(value: string, maxLength: number): string {
   return normalized.length <= maxLength ? normalized : `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+export function notificationErrorMessage(value: string, natsServerUrl: string, maxLength = 300): string {
+  let redacted = value;
+  for (const configuredServer of natsServerUrl.split(",").map((server) => server.trim()).filter(Boolean)) {
+    redacted = redacted.replaceAll(configuredServer, "[REDACTED]");
+    try {
+      const serverUrl = new URL(configuredServer);
+      if (serverUrl.host) redacted = redacted.replaceAll(serverUrl.host, "[REDACTED]");
+    } catch {
+      // connect() will report malformed server URLs; the exact value was already removed above.
+    }
+  }
+  redacted = redacted
+    .replace(/\b(?:nats|tls|ws|wss):\/\/[^\s,;]+/gi, "[REDACTED]")
+    .replace(/\b[^\s/:@]+:[^\s/@]+@[^\s,;]+/g, "[REDACTED]");
+  return singleLine(redacted, maxLength);
+}
+
 function stableId(...parts: string[]): string {
   return createHash("sha256").update(parts.join("\u0000")).digest("hex");
 }
@@ -80,6 +97,7 @@ export class OperationsNotifier {
     this.recordQuotaEvent(event);
     const now = Date.parse(event.occurredAt);
     if (this.lastQuotaSummaryAt > 0 && now - this.lastQuotaSummaryAt < this.config.quotaDiscordSummaryIntervalMs) return;
+    this.lastQuotaSummaryAt = now;
     const accepted = await this.publishText(
       stableId("quota", event.provider, event.kind, event.occurredAt),
       this.quotaMessage(event),
@@ -88,7 +106,6 @@ export class OperationsNotifier {
     );
     if (accepted) {
       this.quotaSummary.clear();
-      this.lastQuotaSummaryAt = now;
     }
   }
 
@@ -111,7 +128,9 @@ export class OperationsNotifier {
     try {
       await nc.drain();
     } catch (error) {
-      this.logger.warn({ error: singleLine(error instanceof Error ? error.message : String(error), 300) }, "NATS notification connection close failed");
+      this.logger.warn({
+        error: notificationErrorMessage(error instanceof Error ? error.message : String(error), this.config.natsServerUrl),
+      }, "NATS notification connection close failed");
     }
   }
 
@@ -134,7 +153,7 @@ export class OperationsNotifier {
     } catch (error) {
       await this.resetConnection();
       this.logger.warn({
-        error: singleLine(error instanceof Error ? error.message : String(error), 300),
+        error: notificationErrorMessage(error instanceof Error ? error.message : String(error), this.config.natsServerUrl),
         subject: SUBJECT,
         id,
         ...context,
