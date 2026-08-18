@@ -9,8 +9,9 @@ flowchart LR
   Bot --> GitHubAPI["GitHub App Installation API"]
   Bot --> Providers["Gemini API merge gate / optional Cursor fallback"]
   Bot --> Comment["PR comments / inline replies / check runs"]
-  Bot --> NATS["NATS telegram subject"]
-  NATS --> Telegram["Telegram"]
+  Bot --> NATS["ops.notification.v1.seori-review"]
+  NATS --> Backoffice["Backoffice notification worker"]
+  Backoffice --> Discord["Discord seori-review channel"]
 ```
 
 ## Behavior
@@ -52,8 +53,7 @@ flowchart LR
 - Ignores resolved inline review threads.
 - Runs as a daemon with a MySQL-backed workflow queue in Kubernetes. Webhooks are durably enqueued, then a worker leases and processes jobs.
 - Persists active check-run IDs so a restarted worker can resume a job instead of leaving stale pending checks.
-- Publishes a best-effort Telegram notification through NATS after the bot successfully submits an approval review.
-- Publishes a throttled Telegram quota summary when provider errors look like quota or rate-limit failures.
+- Publishes approval and throttled provider-quota notifications through the acknowledged Backoffice NATS contract.
 - Periodically closes stale PRs when a bot action-required review/comment has had no new commit or human response for more than 24 hours.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
 - Allows selected public repositories with `PUBLIC_REPOSITORY_ALLOWLIST`, currently `seorilabs/.github` for organization-level governance PRs.
@@ -256,15 +256,13 @@ When `AUTO_SQUASH_MERGE_ENABLED=true`, eligible non-gate approvals are followed 
 Providers with weight `0` are disabled for normal random selection and fallback attempts. The explicitly configured second-opinion provider may still be called directly when it has credentials and is not cooling down.
 If every enabled provider is already in cooldown before a provider command is started, the workflow is requeued until the earliest cooldown expires instead of consuming retry attempts and failing immediately.
 
-Optional approval Telegram notifications use the same NATS message contract as `fundevel/cronjobs`: publish `{ "text": "..." }` to `telegram.<bot>.<channel>`.
+Discord operations notifications are accepted durably by Backoffice before this service treats delivery as successful. The subject is `ops.notification.v1.seori-review` and each request carries a stable event ID.
 
 ```text
-APPROVAL_TELEGRAM_NOTIFY_ENABLED=true
-QUOTA_TELEGRAM_NOTIFY_ENABLED=true
-QUOTA_TELEGRAM_SUMMARY_INTERVAL_MS=3600000
+APPROVAL_DISCORD_NOTIFY_ENABLED=true
+QUOTA_DISCORD_NOTIFY_ENABLED=true
+QUOTA_DISCORD_SUMMARY_INTERVAL_MS=3600000
 NATS_SERVER_URL=nats://nats.data.svc.cluster.local:4222
-APPROVAL_TELEGRAM_BOT=seori_review_bot
-APPROVAL_TELEGRAM_CHANNEL=syous
 ```
 
 Quota summaries and Grafana provider health are based on provider error text, credential presence, routing config, and cooldown state. The Gemini API and Cursor CLI do not expose exact remaining prepaid credit through this service, so the bot reports detected quota-like failures, provider routing, weights, fallback order, and cooldown release time instead of exact remaining credits.

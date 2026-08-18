@@ -51,7 +51,7 @@ import {
   type ClassifiedFinding,
   type StoredFinding,
 } from "./review.js";
-import { ApprovalTelegramNotifier, type ApprovalNotificationMode } from "./telegram.js";
+import { OperationsNotifier, type ApprovalNotificationMode } from "./notifications.js";
 import { parseBotCommand, truncate } from "./text.js";
 import type { ReviewRunRecord } from "./review-run.js";
 import { type MiniMaxReviewCandidate } from "./minimax-review.js";
@@ -248,7 +248,7 @@ type CiRecheckRequest = {
 
 export class PrBot {
   private readonly gemini: GeminiClient;
-  private readonly approvalNotifier: ApprovalTelegramNotifier;
+  private readonly operationsNotifier: OperationsNotifier;
   private readonly activeTasks = new Set<Promise<void>>();
   private readonly activeChecks = new Map<number, ActiveCheckRun>();
   private nextActiveCheckKey = 1;
@@ -258,8 +258,8 @@ export class PrBot {
     private readonly config: Config,
     private readonly logger: Logger,
   ) {
-    this.approvalNotifier = new ApprovalTelegramNotifier(config, logger);
-    this.gemini = new GeminiClient(config, logger, (event) => this.approvalNotifier.notifyQuotaEvent(event));
+    this.operationsNotifier = new OperationsNotifier(config, logger);
+    this.gemini = new GeminiClient(config, logger, (event) => this.operationsNotifier.notifyQuotaEvent(event));
   }
 
   scheduleIssueComment(event: any): void {
@@ -417,7 +417,7 @@ export class PrBot {
         ),
       ),
     );
-    await this.approvalNotifier.close();
+    await this.operationsNotifier.close();
 
     const failed = results.filter((result) => result.status === "rejected").length;
     this.logger.warn(
@@ -3725,7 +3725,7 @@ export class PrBot {
     },
   ): Promise<void> {
     await approvePullRequest(octokit, repo, prNumber, body, status.headSha);
-    await this.approvalNotifier.notifyApproval({
+    await this.operationsNotifier.notifyApproval({
       repoFullName: repo.fullName,
       prNumber,
       prTitle: status.title,

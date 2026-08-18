@@ -287,7 +287,7 @@ server.listen(config.port, () => {
       deepRepoContextMode: config.deepRepoContextMode,
       deepRepoContextMaxFiles: config.deepRepoContextMaxFiles,
       deepRepoContextMaxBytes: config.deepRepoContextMaxBytes,
-      quotaTelegramNotifyEnabled: config.quotaTelegramNotifyEnabled,
+      quotaDiscordNotifyEnabled: config.quotaDiscordNotifyEnabled,
       staleReviewCloseEnabled: config.staleReviewCloseEnabled,
       staleReviewThresholdMs: config.staleReviewThresholdMs,
       staleReviewScanIntervalMs: config.staleReviewScanIntervalMs,
