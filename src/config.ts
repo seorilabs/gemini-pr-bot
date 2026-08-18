@@ -46,17 +46,15 @@ export type Config = {
   autoReviewIgnoredRepositories: Set<string>;
   acceptanceGuideModeEnabled: boolean;
   autoSquashMergeEnabled: boolean;
-  approvalTelegramNotifyEnabled: boolean;
-  quotaTelegramNotifyEnabled: boolean;
-  quotaTelegramSummaryIntervalMs: number;
+  approvalDiscordNotifyEnabled: boolean;
+  quotaDiscordNotifyEnabled: boolean;
+  quotaDiscordSummaryIntervalMs: number;
   staleReviewCloseEnabled: boolean;
   staleReviewThresholdMs: number;
   staleReviewScanIntervalMs: number;
   staleReviewMaxPrsPerScan: number;
   staleReviewIgnoredRepositories: Set<string>;
   natsServerUrl: string;
-  approvalTelegramBot: string;
-  approvalTelegramChannel: string;
   deliveryTtlMs: number;
   shutdownGraceMs: number;
   metricsAllowForwarded: boolean;
@@ -271,17 +269,15 @@ export function loadConfig(): Config {
     autoReviewIgnoredRepositories: optionalRepositorySet("AUTO_REVIEW_IGNORED_REPOSITORIES", []),
     acceptanceGuideModeEnabled: optionalBool("ACCEPTANCE_GUIDE_MODE_ENABLED", true),
     autoSquashMergeEnabled: optionalBool("AUTO_SQUASH_MERGE_ENABLED", false),
-    approvalTelegramNotifyEnabled: optionalBool("APPROVAL_TELEGRAM_NOTIFY_ENABLED", false),
-    quotaTelegramNotifyEnabled: optionalBool("QUOTA_TELEGRAM_NOTIFY_ENABLED", false),
-    quotaTelegramSummaryIntervalMs: optionalInt("QUOTA_TELEGRAM_SUMMARY_INTERVAL_MS", 60 * 60 * 1000),
+    approvalDiscordNotifyEnabled: optionalBool("APPROVAL_DISCORD_NOTIFY_ENABLED", false),
+    quotaDiscordNotifyEnabled: optionalBool("QUOTA_DISCORD_NOTIFY_ENABLED", false),
+    quotaDiscordSummaryIntervalMs: optionalInt("QUOTA_DISCORD_SUMMARY_INTERVAL_MS", 60 * 60 * 1000),
     staleReviewCloseEnabled: optionalBool("STALE_REVIEW_CLOSE_ENABLED", false),
     staleReviewThresholdMs: optionalInt("STALE_REVIEW_THRESHOLD_MS", 24 * 60 * 60 * 1000),
     staleReviewScanIntervalMs: optionalInt("STALE_REVIEW_SCAN_INTERVAL_MS", 30 * 60 * 1000),
     staleReviewMaxPrsPerScan: optionalInt("STALE_REVIEW_MAX_PRS_PER_SCAN", 100),
     staleReviewIgnoredRepositories: optionalRepositorySet("STALE_REVIEW_IGNORED_REPOSITORIES", []),
     natsServerUrl: process.env.NATS_SERVER_URL?.trim() || "nats://localhost:4222",
-    approvalTelegramBot: process.env.APPROVAL_TELEGRAM_BOT?.trim() || "seori_review_bot",
-    approvalTelegramChannel: process.env.APPROVAL_TELEGRAM_CHANNEL?.trim() || "syous",
     deliveryTtlMs: optionalInt("DELIVERY_TTL_MS", 60 * 60 * 1000),
     shutdownGraceMs: optionalInt("SHUTDOWN_GRACE_MS", 25_000),
     metricsAllowForwarded: optionalBool("METRICS_ALLOW_FORWARDED", false),

@@ -126,11 +126,11 @@ spec:
               value: "dependabot[bot],dependabot-preview[bot],renovate[bot],renovate"
             - name: DEPENDENCY_FASTPATH_LABELS
               value: "dependencies"
-            - name: APPROVAL_TELEGRAM_NOTIFY_ENABLED
-              value: "false"
-            - name: QUOTA_TELEGRAM_NOTIFY_ENABLED
+            - name: APPROVAL_DISCORD_NOTIFY_ENABLED
               value: "true"
-            - name: QUOTA_TELEGRAM_SUMMARY_INTERVAL_MS
+            - name: QUOTA_DISCORD_NOTIFY_ENABLED
+              value: "true"
+            - name: QUOTA_DISCORD_SUMMARY_INTERVAL_MS
               value: "3600000"
             - name: STALE_REVIEW_CLOSE_ENABLED
               value: "false"
@@ -144,10 +144,6 @@ spec:
               value: seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
             - name: NATS_SERVER_URL
               value: nats://nats.data.svc.cluster.local:4222
-            - name: APPROVAL_TELEGRAM_BOT
-              value: seori_review_bot
-            - name: APPROVAL_TELEGRAM_CHANNEL
-              value: syous
             - name: LOG_LEVEL
               value: info
             - name: MYSQL_USER
