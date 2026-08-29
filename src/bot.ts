@@ -689,7 +689,7 @@ export class PrBot {
     const repo = repoFromPayload(payload);
     const action = payload.action;
 
-    if (!shouldAutomaticallyReviewPullRequest(payload, this.config)) {
+    if (!(await shouldAutomaticallyReviewPullRequest(octokit, payload, this.config))) {
       this.logger.info(
         { repo: repo.fullName, action },
         "automatic pull request review rejected by public repository trust boundary",

@@ -169,7 +169,11 @@ export function shouldHandleRepository(payload: any, config: Config): boolean {
  * an explicit trusted comment; only the automatic opened/reopened/synchronize path uses
  * this stricter same-repository boundary.
  */
-export function shouldAutomaticallyReviewPullRequest(payload: any, config: Config): boolean {
+export async function shouldAutomaticallyReviewPullRequest(
+  octokit: Octokit,
+  payload: any,
+  config: Config,
+): Promise<boolean> {
   if (!shouldHandleRepository(payload, config)) {
     return false;
   }
@@ -184,9 +188,33 @@ export function shouldAutomaticallyReviewPullRequest(payload: any, config: Confi
   const headRepository = String(pullRequest?.head?.repo?.full_name || "").toLowerCase();
   const baseRepository = String(pullRequest?.base?.repo?.full_name || "").toLowerCase();
 
-  return headRepository === expectedRepository
-    && baseRepository === expectedRepository
-    && isTrustedAssociation(pullRequest?.author_association, config);
+  if (headRepository !== expectedRepository || baseRepository !== expectedRepository) {
+    return false;
+  }
+
+  if (isTrustedAssociation(pullRequest?.author_association, config)) {
+    return true;
+  }
+
+  const prNumber = Number(pullRequest?.number);
+  if (!Number.isSafeInteger(prNumber) || prNumber <= 0) {
+    return false;
+  }
+
+  // GitHub can deliver a stale author_association in the webhook payload. Re-read the
+  // current public PR before rejecting it, while retaining the same-repository boundary.
+  // API failures are intentionally allowed to surface so the durable workflow can retry.
+  const { data: currentPullRequest } = await octokit.rest.pulls.get({
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: prNumber,
+  });
+  const currentHeadRepository = String(currentPullRequest?.head?.repo?.full_name || "").toLowerCase();
+  const currentBaseRepository = String(currentPullRequest?.base?.repo?.full_name || "").toLowerCase();
+
+  return currentHeadRepository === expectedRepository
+    && currentBaseRepository === expectedRepository
+    && isTrustedAssociation(currentPullRequest?.author_association, config);
 }
 
 export function isTrustedAssociation(value: string | undefined, config: Config): boolean {
