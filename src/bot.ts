@@ -25,6 +25,7 @@ import {
   pullRequestConversationHasMarker,
   REVIEW_AGENT_NAME,
   repoFromPayload,
+  shouldAutomaticallyReviewPullRequest,
   shouldHandleRepository,
   squashMergePullRequest,
   submitReviewWithInlineComments,
@@ -687,6 +688,14 @@ export class PrBot {
 
     const repo = repoFromPayload(payload);
     const action = payload.action;
+
+    if (!shouldAutomaticallyReviewPullRequest(payload, this.config)) {
+      this.logger.info(
+        { repo: repo.fullName, action },
+        "automatic pull request review rejected by public repository trust boundary",
+      );
+      return;
+    }
 
     if (
       this.config.acceptanceGuideModeEnabled &&

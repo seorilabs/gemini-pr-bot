@@ -163,6 +163,32 @@ export function shouldHandleRepository(payload: any, config: Config): boolean {
   return true;
 }
 
+/**
+ * Public repositories are readable by anyone, so their allowlist alone must not turn an
+ * untrusted fork PR into an automatic AI job. Maintainers can still request a review with
+ * an explicit trusted comment; only the automatic opened/reopened/synchronize path uses
+ * this stricter same-repository boundary.
+ */
+export function shouldAutomaticallyReviewPullRequest(payload: any, config: Config): boolean {
+  if (!shouldHandleRepository(payload, config)) {
+    return false;
+  }
+
+  const repo = repoFromPayload(payload);
+  if (repo.isPrivate) {
+    return true;
+  }
+
+  const pullRequest = payload.pull_request;
+  const expectedRepository = repo.fullName.toLowerCase();
+  const headRepository = String(pullRequest?.head?.repo?.full_name || "").toLowerCase();
+  const baseRepository = String(pullRequest?.base?.repo?.full_name || "").toLowerCase();
+
+  return headRepository === expectedRepository
+    && baseRepository === expectedRepository
+    && isTrustedAssociation(pullRequest?.author_association, config);
+}
+
 export function isTrustedAssociation(value: string | undefined, config: Config): boolean {
   return Boolean(value && config.trustedAssociations.has(value.toUpperCase()));
 }

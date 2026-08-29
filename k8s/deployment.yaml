@@ -109,7 +109,7 @@ spec:
             - name: ALLOW_PUBLIC_REPOS
               value: "false"
             - name: PUBLIC_REPOSITORY_ALLOWLIST
-              value: seorilabs/.github
+              value: seorilabs/.github,seorilabs/platform,seorilabs/seorilabs-backoffice
             - name: AUTO_REVIEW_ON_OPEN
               value: "true"
             - name: AUTO_REVIEW_ON_SYNCHRONIZE
