@@ -19,7 +19,7 @@ concurrency:
 jobs:
   pr-lint-and-tests:
     name: PR lint and tests
-    runs-on: seorilabs-rpi-arm64
+    runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:

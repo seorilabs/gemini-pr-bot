@@ -315,7 +315,7 @@ BUILD_WORKTREE=1 TAG="review-gate-local" PUSH_LATEST=1 ./scripts/build-and-push.
 
 `PUSH_LATEST=1` is also the explicit override when an operator intentionally needs to publish `latest` while local `main` does not exactly match `origin/main`.
 
-The same ARM64 build and push remains available as a manual GitHub Actions workflow. A non-`main` run publishes only its requested/SHA tag; only `main` updates `latest`.
+The same ARM64 build and push remains available as a manual GitHub Actions workflow. It runs on the GitHub-hosted `ubuntu-latest` runner, which is `x86_64`, so `linux/arm64` is built under QEMU emulation and takes considerably longer than the local Colima build. A non-`main` run publishes only its requested/SHA tag; only `main` updates `latest`.
 
 ```bash
 gh workflow run build-image.yml --ref main
