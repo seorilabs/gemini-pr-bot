@@ -16,6 +16,7 @@ import {
   isReviewThreadResolved,
   isPullRequestIssue,
   isTrustedAssociation,
+  isTrustedRepositoryActor,
   listReviewThreads,
   postFileReviewComment,
   postPrComment,
@@ -441,11 +442,20 @@ export class PrBot {
     }
 
     const command = parseBotCommand(payload.comment.body || "", this.config);
-    if (!command || !isTrustedAssociation(payload.comment.author_association, this.config)) {
+    const repo = repoFromPayload(payload);
+    if (
+      !command ||
+      !(await isTrustedRepositoryActor(
+        octokit,
+        repo,
+        String(payload.sender?.login || ""),
+        payload.comment.author_association,
+        this.config,
+      ))
+    ) {
       return;
     }
 
-    const repo = repoFromPayload(payload);
     const issueNumber = payload.issue.number;
     if (!payload.issue.pull_request && !(await isPullRequestIssue(octokit, repo, issueNumber))) {
       return;
@@ -511,11 +521,20 @@ export class PrBot {
     }
 
     const command = parseBotCommand(payload.comment.body || "", this.config);
-    if (!command || !isTrustedAssociation(payload.comment.author_association, this.config)) {
+    const repo = repoFromPayload(payload);
+    if (
+      !command ||
+      !(await isTrustedRepositoryActor(
+        octokit,
+        repo,
+        String(payload.sender?.login || ""),
+        payload.comment.author_association,
+        this.config,
+      ))
+    ) {
       return;
     }
 
-    const repo = repoFromPayload(payload);
     const prNumber = payload.pull_request.number;
     if (
       (await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) ||
@@ -625,11 +644,20 @@ export class PrBot {
 
     const body = payload.review.body || "";
     const command = parseBotCommand(body, this.config);
-    if (!command || !isTrustedAssociation(payload.review.author_association, this.config)) {
+    const repo = repoFromPayload(payload);
+    if (
+      !command ||
+      !(await isTrustedRepositoryActor(
+        octokit,
+        repo,
+        String(payload.sender?.login || ""),
+        payload.review.author_association,
+        this.config,
+      ))
+    ) {
       return;
     }
 
-    const repo = repoFromPayload(payload);
     const prNumber = payload.pull_request.number;
     if (await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) {
       return;

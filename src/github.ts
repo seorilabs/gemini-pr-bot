@@ -192,10 +192,6 @@ export async function shouldAutomaticallyReviewPullRequest(
     return false;
   }
 
-  if (isTrustedAssociation(pullRequest?.author_association, config)) {
-    return true;
-  }
-
   const prNumber = Number(pullRequest?.number);
   if (!Number.isSafeInteger(prNumber) || prNumber <= 0) {
     return false;
@@ -212,13 +208,49 @@ export async function shouldAutomaticallyReviewPullRequest(
   const currentHeadRepository = String(currentPullRequest?.head?.repo?.full_name || "").toLowerCase();
   const currentBaseRepository = String(currentPullRequest?.base?.repo?.full_name || "").toLowerCase();
 
-  return currentHeadRepository === expectedRepository
-    && currentBaseRepository === expectedRepository
-    && isTrustedAssociation(currentPullRequest?.author_association, config);
+  if (currentHeadRepository !== expectedRepository || currentBaseRepository !== expectedRepository) {
+    return false;
+  }
+
+  return isTrustedRepositoryActor(
+    octokit,
+    repo,
+    String(currentPullRequest?.user?.login || ""),
+    currentPullRequest?.author_association,
+    config,
+  );
 }
 
 export function isTrustedAssociation(value: string | undefined, config: Config): boolean {
   return Boolean(value && config.trustedAssociations.has(value.toUpperCase()));
+}
+
+const TRUSTED_REPOSITORY_PERMISSIONS = new Set(["admin", "maintain", "write"]);
+
+export async function isTrustedRepositoryActor(
+  octokit: Octokit,
+  repo: RepoRef,
+  username: string,
+  association: string | undefined,
+  config: Config,
+): Promise<boolean> {
+  if (repo.isPrivate) {
+    return isTrustedAssociation(association, config);
+  }
+
+  if (!username) {
+    return false;
+  }
+
+  // GitHub App installations can observe CONTRIBUTOR through pull request APIs even when
+  // the same actor currently has admin/write access. Repository permission is the live,
+  // authorization-relevant source of truth for allowlisted public repositories.
+  const { data } = await octokit.rest.repos.getCollaboratorPermissionLevel({
+    owner: repo.owner,
+    repo: repo.repo,
+    username,
+  });
+  return TRUSTED_REPOSITORY_PERMISSIONS.has(String(data?.permission || "").toLowerCase());
 }
 
 export async function isPullRequestIssue(octokit: Octokit, repo: RepoRef, issueNumber: number): Promise<boolean> {
