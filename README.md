@@ -56,7 +56,7 @@ flowchart LR
 - Publishes approval and throttled provider-quota notifications through the acknowledged Backoffice NATS contract.
 - Periodically closes stale PRs when a bot action-required review/comment has had no new commit or human response for more than 24 hours.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
-- Allows selected public repositories with `PUBLIC_REPOSITORY_ALLOWLIST`, currently `seorilabs/.github` for organization-level governance PRs.
+- Allows selected public repositories with `PUBLIC_REPOSITORY_ALLOWLIST`, currently `seorilabs/.github`, `seorilabs/platform`, and `seorilabs/seorilabs-backoffice` for central governance PRs. Automatic review on an allowlisted public repository still requires a same-repository PR whose author association is `OWNER`, `MEMBER`, or `COLLABORATOR`; a trusted maintainer must explicitly request review for external forks.
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default.
 
 ## Commands
@@ -241,7 +241,7 @@ AI_REVIEW_PROVIDER_FALLBACK_ORDER=gemini
 AI_REVIEW_TIEBREAKER_ENABLED=false
 GEMINI_MODEL=gemini-3-flash-preview
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
-PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github
+PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github,seorilabs/platform,seorilabs/seorilabs-backoffice
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
