@@ -37,6 +37,7 @@ function pullRequestPayload(input: {
       private: input.isPrivate ?? false,
     },
     pull_request: {
+      number: 110,
       author_association: input.authorAssociation ?? "MEMBER",
       head: {
         repo: input.headRepository === null
@@ -48,35 +49,63 @@ function pullRequestPayload(input: {
   };
 }
 
-test("allowlisted public central repository의 trusted same-repo PR만 자동 리뷰한다", () => {
+test("allowlisted public central repository의 trusted same-repo PR만 자동 리뷰한다", async () => {
   const payload = pullRequestPayload();
   assert.equal(shouldHandleRepository(payload, config()), true);
-  assert.equal(shouldAutomaticallyReviewPullRequest(payload, config()), true);
+  assert.equal(await shouldAutomaticallyReviewPullRequest({}, payload, config()), true);
 });
 
-test("allowlisted public repository의 external fork와 untrusted author는 자동 리뷰하지 않는다", () => {
+test("allowlisted public repository의 external fork와 untrusted author는 자동 리뷰하지 않는다", async () => {
   const fork = pullRequestPayload({ headRepository: "external/platform" });
   const contributor = pullRequestPayload({ authorAssociation: "CONTRIBUTOR" });
   const missingHead = pullRequestPayload({ headRepository: null });
+  const octokit = {
+    rest: {
+      pulls: {
+        get: async () => ({ data: {
+          author_association: "CONTRIBUTOR",
+          head: { repo: { full_name: "seorilabs/platform" } },
+          base: { repo: { full_name: "seorilabs/platform" } },
+        } }),
+      },
+    },
+  };
 
   assert.equal(shouldHandleRepository(fork, config()), true);
-  assert.equal(shouldAutomaticallyReviewPullRequest(fork, config()), false);
-  assert.equal(shouldAutomaticallyReviewPullRequest(contributor, config()), false);
-  assert.equal(shouldAutomaticallyReviewPullRequest(missingHead, config()), false);
+  assert.equal(await shouldAutomaticallyReviewPullRequest(octokit, fork, config()), false);
+  assert.equal(await shouldAutomaticallyReviewPullRequest(octokit, contributor, config()), false);
+  assert.equal(await shouldAutomaticallyReviewPullRequest(octokit, missingHead, config()), false);
 });
 
-test("allowlist 밖 public repository는 명시적 명령을 포함한 모든 경로에서 거부한다", () => {
+test("webhook association이 stale이면 현재 same-repo PR의 trusted association을 readback한다", async () => {
+  const payload = pullRequestPayload({ authorAssociation: "CONTRIBUTOR" });
+  const octokit = {
+    rest: {
+      pulls: {
+        get: async () => ({ data: {
+          author_association: "MEMBER",
+          head: { repo: { full_name: "seorilabs/platform" } },
+          base: { repo: { full_name: "seorilabs/platform" } },
+        } }),
+      },
+    },
+  };
+
+  assert.equal(await shouldAutomaticallyReviewPullRequest(octokit, payload, config()), true);
+});
+
+test("allowlist 밖 public repository는 명시적 명령을 포함한 모든 경로에서 거부한다", async () => {
   const payload = pullRequestPayload({ repository: "seorilabs/public-product" });
   assert.equal(shouldHandleRepository(payload, config()), false);
-  assert.equal(shouldAutomaticallyReviewPullRequest(payload, config()), false);
+  assert.equal(await shouldAutomaticallyReviewPullRequest({}, payload, config()), false);
 });
 
-test("private organization repository의 기존 자동 리뷰 동작은 유지한다", () => {
+test("private organization repository의 기존 자동 리뷰 동작은 유지한다", async () => {
   const payload = pullRequestPayload({
     repository: "seorilabs/private-product",
     isPrivate: true,
     headRepository: "external/fork",
     authorAssociation: "CONTRIBUTOR",
   });
-  assert.equal(shouldAutomaticallyReviewPullRequest(payload, config()), true);
+  assert.equal(await shouldAutomaticallyReviewPullRequest({}, payload, config()), true);
 });
