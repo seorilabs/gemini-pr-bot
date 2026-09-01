@@ -1,9 +1,14 @@
-import { GoogleGenAI, ThinkingLevel } from "@google/genai";
-import { spawn } from "node:child_process";
 import { AI_REVIEW_PROVIDER_NAMES, type AiReviewProviderName, type Config } from "./config.js";
 import { botActionMarker } from "./identity.js";
 import { metrics, type GaugeSample } from "./metrics.js";
 import {
+  buildMiniMaxTextRequest,
+  callMiniMaxMessages,
+  extractMiniMaxText,
+  type MiniMaxHttpOptions,
+} from "./minimax-client.js";
+import {
+  MINIMAX_REVIEW_MODEL,
   buildMiniMaxReviewRequest,
   buildMiniMaxVerificationRequest,
   parseMiniMaxReviewResponse,
@@ -63,22 +68,29 @@ export function isAiProviderCooldownError(error: unknown): error is AiProviderCo
   return error instanceof AiProviderCooldownError;
 }
 
-export class GeminiClient {
-  private readonly ai: GoogleGenAI;
+export class AiClient {
   private readonly providerCooldownUntil = new Map<AiReviewProviderName, number>();
   private readonly providerLastSuccessAt = new Map<AiReviewProviderName, number>();
   private readonly providerLastFailureAt = new Map<AiReviewProviderName, number>();
   private readonly providerLastQuotaResetAt = new Map<AiReviewProviderName, number>();
+  private readonly fetchImpl?: typeof fetch;
 
   constructor(
     private readonly config: Config,
     private readonly logger?: Logger,
     private readonly quotaReporter?: (event: AiProviderQuotaEvent) => Promise<void> | void,
+    options?: { fetchImpl?: typeof fetch },
   ) {
-    this.ai = new GoogleGenAI({
-      apiKey: config.geminiApiKey,
-      httpOptions: { timeout: config.geminiTimeoutMs },
-    });
+    this.fetchImpl = options?.fetchImpl;
+  }
+
+  private minimaxHttpOptions(): MiniMaxHttpOptions {
+    return {
+      apiKey: this.config.minimaxApiKey,
+      baseUrl: this.config.minimaxBaseUrl,
+      timeoutMs: this.config.minimaxTimeoutMs,
+      fetchImpl: this.fetchImpl,
+    };
   }
 
   async review(prompt: string): Promise<string> {
@@ -120,7 +132,7 @@ export class GeminiClient {
     expectedAcceptanceCriteria: readonly string[],
     options: { repairInvalidOutput?: boolean } = {},
   ): Promise<MiniMaxGateResult<MiniMaxReviewResult>> {
-    return this.runGeminiGateRequest(
+    return this.runMiniMaxGateRequest(
       () => buildMiniMaxReviewRequest({ systemPrompt, userPrompt }),
       (response: unknown) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria }),
       userPrompt,
@@ -135,7 +147,7 @@ export class GeminiClient {
     candidates: readonly MiniMaxReviewCandidate[],
   ): Promise<MiniMaxGateResult<MiniMaxVerificationResult>> {
     const expectedCandidates = candidates.map(({ candidateId, kind }) => ({ candidateId, kind }));
-    return this.runGeminiGateRequest(
+    return this.runMiniMaxGateRequest(
       () => buildMiniMaxVerificationRequest({ systemPrompt, userPrompt }),
       (response: unknown) => parseMiniMaxVerificationResponse(response, { expectedCandidates }),
       userPrompt,
@@ -555,19 +567,12 @@ export class GeminiClient {
     return Math.max(0, (this.providerCooldownUntil.get(provider) || 0) - Date.now());
   }
 
-  private providerModel(provider: AiReviewProviderName): string {
-    if (provider === "gemini") {
-      return this.config.geminiModel;
-    }
-    return this.config.cursorModel || "default";
+  private providerModel(_provider: AiReviewProviderName): string {
+    return MINIMAX_REVIEW_MODEL;
   }
 
-  private hasProviderCredential(provider: AiReviewProviderName): boolean {
-    if (provider === "gemini") {
-      return Boolean(this.config.geminiApiKey);
-    }
-
-    return Boolean(process.env.CURSOR_API_KEY);
+  private hasProviderCredential(_provider: AiReviewProviderName): boolean {
+    return Boolean(this.config.minimaxApiKey);
   }
 
   private cooldownProvider(provider: AiReviewProviderName, cooldownMs: number): number {
@@ -590,54 +595,29 @@ export class GeminiClient {
   }
 
   private runProvider(
-    provider: AiReviewProviderName,
+    _provider: AiReviewProviderName,
     kind: AiTaskKind,
     prompt: string,
     options: AiRunOptions = {},
   ): Promise<string> {
-    if (provider === "gemini") {
-      return this.runGemini(kind, prompt, options);
-    }
-
-    return this.runCursorCli(prompt);
+    return this.runMiniMaxFreeform(kind, prompt, options);
   }
 
-  private async runGemini(kind: AiTaskKind, prompt: string, options: AiRunOptions = {}): Promise<string> {
-    const generationConfig = this.geminiGenerationConfig(kind, options);
-    const response = await this.ai.models.generateContent({
-      model: this.config.geminiModel,
-      contents: truncate(prompt, this.config.maxContextChars),
-      config: generationConfig,
-    });
-
-    return response.text?.trim() || this.emptyResponseText(kind);
-  }
-
-  private geminiGenerationConfig(
+  private async runMiniMaxFreeform(
     kind: AiTaskKind,
+    prompt: string,
     options: AiRunOptions = {},
-  ): {
-    temperature: number;
-    maxOutputTokens: number;
-    thinkingConfig: { thinkingLevel: ThinkingLevel };
-    responseMimeType?: string;
-  } {
-    const jsonConfig = options.jsonOutput ? { responseMimeType: "application/json" } : {};
-    if (kind === "answer") {
-      return {
-        temperature: 0.3,
-        maxOutputTokens: 3072,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        ...jsonConfig,
-      };
-    }
-
-    return {
-      temperature: 0.2,
-      maxOutputTokens: 4096,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      ...jsonConfig,
-    };
+  ): Promise<string> {
+    const userPrompt = options.jsonOutput
+      ? `${truncate(prompt, this.config.maxContextChars)}\n\n출력은 단일 JSON 객체만 허용됩니다. 산문과 코드 펜스를 금지합니다.`
+      : truncate(prompt, this.config.maxContextChars);
+    const request = buildMiniMaxTextRequest({
+      systemPrompt: "",
+      userPrompt,
+      maxTokens: kind === "answer" ? 3072 : 4096,
+    });
+    const response = await callMiniMaxMessages(request, this.minimaxHttpOptions());
+    return extractMiniMaxText(response) || this.emptyResponseText(kind);
   }
 
   private emptyResponseText(kind: AiTaskKind): string {
@@ -648,7 +628,7 @@ export class GeminiClient {
     return "응답을 생성하지 못했습니다.";
   }
 
-  private async runGeminiGateRequest<T>(
+  private async runMiniMaxGateRequest<T>(
     buildRequest: () => MiniMaxMessagesRequest,
     parseResponse: (response: unknown) =>
       | { ok: true; value: T; source: "tool_use" | "text" }
@@ -658,7 +638,7 @@ export class GeminiClient {
     repairInvalidOutput = true,
   ): Promise<MiniMaxGateResult<T>> {
     const request = buildRequest();
-    const response = await this.callGeminiMessages(request, phaseLabel);
+    const response = await this.callGateMessages(request, phaseLabel);
     let parsed = parseResponse(response);
 
     if (!parsed.ok && repairInvalidOutput) {
@@ -673,267 +653,41 @@ export class GeminiClient {
         ...request,
         messages: [{ role: "user" as const, content: [{ type: "text" as const, text: repairPrompt }] }],
       };
-      const repairResponse = await this.callGeminiMessages(repairRequest, `${phaseLabel} 형식 보정`);
+      const repairResponse = await this.callGateMessages(repairRequest, `${phaseLabel} 형식 보정`);
       parsed = parseResponse(repairResponse);
     }
 
     if (!parsed.ok) {
-      throw new Error(`Gemini ${phaseLabel} output failed validation: ${parsed.errors.join(" | ")}`);
+      throw new Error(`MiniMax ${phaseLabel} output failed validation: ${parsed.errors.join(" | ")}`);
     }
 
     return {
-      selectedProvider: "gemini",
-      provider: "gemini",
-      model: this.config.geminiModel,
+      selectedProvider: "minimax",
+      provider: "minimax",
+      model: MINIMAX_REVIEW_MODEL,
       text: JSON.stringify(parsed.value),
       value: parsed.value,
     };
   }
 
-  private async callGeminiMessages(
-    request: MiniMaxMessagesRequest,
-    phaseLabel: string,
-  ): Promise<unknown> {
-    const systemPrompt = request.system;
-    const userPrompt = request.messages[0].content[0].text;
-    const responseJsonSchema = toGeminiResponseJsonSchema(request.tools[0].input_schema);
-
+  private async callGateMessages(request: MiniMaxMessagesRequest, phaseLabel: string): Promise<unknown> {
     const startedAt = Date.now();
-    const model = this.config.geminiModel;
-
-    const response = await this.ai.models.generateContent({
-      model,
-      contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-      config: {
-        systemInstruction: systemPrompt,
-        temperature: 0.2,
-        maxOutputTokens: request.max_tokens,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: "application/json",
-        responseJsonSchema,
-      },
-    });
-
-    const text = response.text?.trim() || "{}";
-    let parsedJson: unknown;
-    try {
-      parsedJson = JSON.parse(text);
-    } catch {
-      throw new Error(`Gemini returned invalid JSON: ${truncate(text, 600)}`);
-    }
-
-    // Keep the existing host-side strict parser as the final trust boundary.
-    const mockedResponse = {
-      type: "message",
-      role: "assistant",
-      stop_reason: "tool_use",
-      content: [
-        {
-          type: "tool_use",
-          name: "submit_review",
-          input: parsedJson,
-        },
-      ],
-      usage: {
-        input_tokens: response.usageMetadata?.promptTokenCount || 0,
-        output_tokens: response.usageMetadata?.candidatesTokenCount || 0,
-      },
-    };
+    const response = await callMiniMaxMessages(request, this.minimaxHttpOptions());
+    const usage = (response as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
 
     this.logger?.info(
       {
         phase: phaseLabel,
-        model,
-        inputTokens: response.usageMetadata?.promptTokenCount || 0,
-        outputTokens: response.usageMetadata?.candidatesTokenCount || 0,
+        model: MINIMAX_REVIEW_MODEL,
+        inputTokens: usage?.input_tokens || 0,
+        outputTokens: usage?.output_tokens || 0,
         elapsedMs: Date.now() - startedAt,
       },
-      "Gemini review gate request completed",
+      "MiniMax review gate request completed",
     );
 
-    return mockedResponse;
+    return response;
   }
-
-  private runCursorCli(prompt: string): Promise<string> {
-    if (!process.env.CURSOR_API_KEY) {
-      throw new Error("Cursor API key is not configured");
-    }
-
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      CI: "true",
-      NO_COLOR: "1",
-      TERM: process.env.TERM || "xterm-256color",
-    };
-
-    const args = ["--trust", "--mode", "ask", "--output-format", "text"];
-    if (this.config.cursorModel) {
-      args.push("--model", this.config.cursorModel);
-    }
-    args.push("-p", truncate(prompt, this.config.maxContextChars));
-
-    return this.runCommand({
-      label: "Cursor CLI",
-      command: this.config.cursorCliCommand,
-      args,
-      env,
-      timeoutMs: this.config.cursorCliTimeoutMs,
-      parseOutput: (stdout, stderr) => stdout.trim() || stderr.trim() || "응답을 생성하지 못했습니다.",
-    });
-  }
-
-  private runCommand(options: {
-    label: string;
-    command: string;
-    args: string[];
-    env: NodeJS.ProcessEnv;
-    stdin?: string;
-    timeoutMs: number;
-    parseOutput: (stdout: string, stderr: string) => string;
-  }): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const child = spawn(options.command, options.args, {
-        env: options.env,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-
-      let settled = false;
-      let stdout = "";
-      let stderr = "";
-      const fail = (error: Error) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        reject(error);
-      };
-      const timer = setTimeout(() => {
-        child.kill("SIGTERM");
-        fail(new Error(`${options.label} timed out after ${options.timeoutMs}ms`));
-      }, options.timeoutMs);
-
-      child.stdout.setEncoding("utf8");
-      child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk) => {
-        stdout += chunk;
-      });
-      child.stderr.on("data", (chunk) => {
-        stderr += chunk;
-      });
-      child.on("error", (error) => {
-        fail(error);
-      });
-      child.on("close", (code) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        if (code !== 0) {
-          reject(new Error(`${options.label} exited with code ${code}: ${stderr || stdout}`));
-          return;
-        }
-
-        try {
-          resolve(options.parseOutput(stdout, stderr));
-        } catch (error) {
-          reject(error);
-        }
-      });
-
-      child.stdin.end(options.stdin);
-    });
-  }
-}
-
-/**
- * Gemini 3 Flash accepts the review gate's structural schema and numeric value
- * bounds, but rejects its nested array bounds and string pattern/length keywords.
- * The host-side parser still enforces every original constraint after generation.
- */
-export function toGeminiResponseJsonSchema(schema: unknown): unknown {
-  if (Array.isArray(schema)) {
-    return schema.map((item) => toGeminiResponseJsonSchema(item));
-  }
-  if (!schema || typeof schema !== "object") {
-    return schema;
-  }
-
-  const source = schema as Record<string, unknown>;
-  if (Array.isArray(source.type)) {
-    return {
-      anyOf: source.type.map((type) =>
-        type === "null"
-          ? { type: "null" }
-          : toGeminiResponseJsonSchema({ ...source, type }),
-      ),
-    };
-  }
-
-  const result: Record<string, unknown> = {};
-  for (const key of [
-    "$id",
-    "$anchor",
-    "$ref",
-    "type",
-    "format",
-    "title",
-    "description",
-    "enum",
-    "minimum",
-    "maximum",
-    "required",
-  ]) {
-    if (source[key] !== undefined) {
-      result[key] = source[key];
-    }
-  }
-
-  if (!result.type && Array.isArray(source.enum) && source.enum.length > 0) {
-    const values = source.enum;
-    if (values.every((value) => typeof value === "string")) {
-      result.type = "string";
-    } else if (values.every((value) => typeof value === "number")) {
-      result.type = "number";
-    }
-  }
-
-  if (source.items !== undefined) {
-    result.items = toGeminiResponseJsonSchema(source.items);
-  }
-  if (Array.isArray(source.prefixItems)) {
-    result.prefixItems = source.prefixItems.map((item) => toGeminiResponseJsonSchema(item));
-  }
-  if (Array.isArray(source.anyOf)) {
-    result.anyOf = source.anyOf.map((item) => toGeminiResponseJsonSchema(item));
-  }
-  if (Array.isArray(source.oneOf)) {
-    result.oneOf = source.oneOf.map((item) => toGeminiResponseJsonSchema(item));
-  }
-  if (source.properties && typeof source.properties === "object" && !Array.isArray(source.properties)) {
-    result.properties = Object.fromEntries(
-      Object.entries(source.properties as Record<string, unknown>).map(([key, value]) => [
-        key,
-        toGeminiResponseJsonSchema(value),
-      ]),
-    );
-  }
-  if (source.additionalProperties !== undefined) {
-    result.additionalProperties = typeof source.additionalProperties === "boolean"
-      ? source.additionalProperties
-      : toGeminiResponseJsonSchema(source.additionalProperties);
-  }
-  if (source.$defs && typeof source.$defs === "object" && !Array.isArray(source.$defs)) {
-    result.$defs = Object.fromEntries(
-      Object.entries(source.$defs as Record<string, unknown>).map(([key, value]) => [
-        key,
-        toGeminiResponseJsonSchema(value),
-      ]),
-    );
-  }
-
-  return result;
 }
 
 function isQuotaLikeError(message: string): boolean {

@@ -93,3 +93,26 @@ test("required check는 Seori 가이드 스레드의 Resolve 상태만 집계한
   assert.equal(passed.conclusion, "success");
   assert.match(passed.summary, /approval이나 코드 품질 승인이 아닙니다/u);
 });
+
+test("치명 결함 finding은 가이드 항목과 check 계산에 섞이지 않는다", () => {
+  const guide = buildAcceptanceGuide({
+    headSha: "abc1234",
+    explicitAcceptanceCriteria: ["- [ ] 저장이 동작한다"],
+    coveredCriteria: [],
+    manualCriteria: [],
+    abstainItems: [],
+    findings: [
+      {
+        kind: "fatal_defect",
+        title: "저장 시 크래시",
+        problem: "저장 경로에서 예외가 발생합니다.",
+        trigger: "저장 버튼",
+        impact: "저장 불가",
+        requiredAction: "가드를 추가하세요.",
+        evidence: { file: "src/save.ts", line: 42, code: "throw new Error()" },
+      },
+    ],
+  });
+  assert.equal(guide.items.some((item) => item.label.includes("크래시")), false);
+  assert.equal(guide.summary.includes("크래시"), false);
+});

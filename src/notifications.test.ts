@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Config } from "./config.js";
-import type { AiProviderQuotaEvent } from "./gemini.js";
+import type { AiProviderQuotaEvent } from "./ai-client.js";
 import { notificationErrorMessage, OperationsNotifier } from "./notifications.js";
 
 const config = {
   quotaDiscordNotifyEnabled: true,
   quotaDiscordSummaryIntervalMs: 60 * 60 * 1000,
   natsServerUrl: "nats://operator:secret@nats.private.example:4222",
-  aiReviewProviders: ["gemini"],
-  aiReviewProviderWeights: { gemini: 100, cursor: 0 },
-  aiReviewProviderFallbackOrder: ["gemini"],
+  aiReviewProviders: ["minimax"],
+  aiReviewProviderWeights: { minimax: 100 },
+  aiReviewProviderFallbackOrder: ["minimax"],
 } as Config;
 
 const logger = {
@@ -20,8 +20,8 @@ const logger = {
 
 function quotaEvent(occurredAt: string): AiProviderQuotaEvent {
   return {
-    provider: "gemini",
-    selectedProvider: "gemini",
+    provider: "minimax",
+    selectedProvider: "minimax",
     kind: "review",
     occurredAt,
     cooldownMs: 60 * 60 * 1000,

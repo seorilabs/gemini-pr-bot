@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AiReviewProviderName, Config } from "./config.js";
 import { CI_RECHECK_EVENT, STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
-import { GeminiClient, isAiProviderCooldownError } from "./gemini.js";
+import { AiClient, isAiProviderCooldownError } from "./ai-client.js";
 import { metrics, type GaugeSample } from "./metrics.js";
 import {
   approvePullRequest,
@@ -56,7 +56,7 @@ import {
 import { OperationsNotifier, type ApprovalNotificationMode } from "./notifications.js";
 import { parseBotCommand, truncate } from "./text.js";
 import type { ReviewRunRecord } from "./review-run.js";
-import { type MiniMaxReviewCandidate } from "./minimax-review.js";
+import { MINIMAX_REVIEW_MODEL, type MiniMaxReviewCandidate } from "./minimax-review.js";
 import {
   REVIEW_GATE_PROMPT_VERSION,
   buildReviewGateCandidateSystemPrompt,
@@ -75,8 +75,10 @@ import {
   type StoredReviewFinding,
 } from "./review-finding-ledger.js";
 import {
+  formatJansoreeSummary,
   formatReviewGateCheckOutput,
   formatReviewGateFinding,
+  type ReviewGatePublicFatalFinding,
   type ReviewGatePublicFinding,
   type ReviewGatePublicVerdict,
 } from "./review-gate-format.js";
@@ -102,8 +104,10 @@ import {
   filterReviewGateCacheCandidates,
   type MiniMaxReviewGateCacheEnvelope,
 } from "./review-gate-cache.js";
+import { JansoreeClient } from "./jansoree.js";
 import {
   BOT_GITHUB_LOGIN,
+  JANSOREE_ADVISORY_MARKER_PREFIX,
   isBotGithubAuthor,
   bodyIncludesBotActionMarker,
   botActionMarker,
@@ -253,7 +257,8 @@ type CiRecheckRequest = {
 };
 
 export class PrBot {
-  private readonly gemini: GeminiClient;
+  private readonly ai: AiClient;
+  private readonly jansoree: JansoreeClient;
   private readonly operationsNotifier: OperationsNotifier;
   private readonly activeTasks = new Set<Promise<void>>();
   private readonly activeChecks = new Map<number, ActiveCheckRun>();
@@ -265,7 +270,14 @@ export class PrBot {
     private readonly logger: Logger,
   ) {
     this.operationsNotifier = new OperationsNotifier(config, logger);
-    this.gemini = new GeminiClient(config, logger, (event) => this.operationsNotifier.notifyQuotaEvent(event));
+    this.ai = new AiClient(config, logger, (event) => this.operationsNotifier.notifyQuotaEvent(event));
+    this.jansoree = new JansoreeClient(config, logger);
+    if (config.defectReviewEnabled && !this.jansoree.available()) {
+      logger.warn(
+        {},
+        "DEFECT_REVIEW_ENABLED but REVIEW_GITHUB_APP_ID/REVIEW_GITHUB_PRIVATE_KEY are missing; Jansoree advisory will be skipped",
+      );
+    }
   }
 
   scheduleIssueComment(event: any): void {
@@ -308,7 +320,7 @@ export class PrBot {
         name: "seori_pr_bot_active_check_runs",
         value: this.activeChecks.size,
       },
-      ...this.gemini.metricSamples(),
+      ...this.ai.metricSamples(),
     ];
   }
 
@@ -2032,7 +2044,7 @@ export class PrBot {
       context.markdown,
     ].join("\n");
 
-    return this.gemini.review(prompt);
+    return this.ai.review(prompt);
   }
 
   // Conservative merge gate. The model extracts evidence; strict parsing,
@@ -2053,6 +2065,7 @@ export class PrBot {
     ]);
     if (
       this.config.acceptanceGuideModeEnabled &&
+      !this.config.defectReviewEnabled &&
       explicitAcceptanceCriteria.length === 0
     ) {
       await this.publishAcceptanceGuide(
@@ -2180,19 +2193,20 @@ export class PrBot {
           "reused completed Gemini review gate extraction",
         );
       } else {
-        const candidateResult = await this.gemini.reviewGateCandidates(
+        const candidateResult = await this.ai.reviewGateCandidates(
           prompts.candidateSystem,
           prompts.candidateUser,
           explicitAcceptanceCriteria,
           {
-            repairInvalidOutput: !this.config.acceptanceGuideModeEnabled,
+            repairInvalidOutput: true,
           },
         );
         const guideMode = this.config.acceptanceGuideModeEnabled;
-        const candidates = guideMode ? [] : candidateResult.value.candidates;
+        const candidates =
+          guideMode && !this.config.defectReviewEnabled ? [] : candidateResult.value.candidates;
         const verificationResult = candidates.length === 0
           ? { verifications: [] }
-          : (await this.gemini.verifyReviewGateCandidates(
+          : (await this.ai.verifyReviewGateCandidates(
               prompts.verifierSystem,
               this.reviewGateVerifierPrompt(
                 prompts.candidateUser,
@@ -2430,7 +2444,11 @@ export class PrBot {
         contextHash,
         prompts,
         evaluatedEnvelope,
-        guide.items.length > 0 ? "FOLLOW_UP" : "PASS",
+        publicFindings.some((finding) => finding.kind === "fatal_defect")
+          ? "FAIL"
+          : guide.items.length > 0
+            ? "FOLLOW_UP"
+            : "PASS",
         [
           ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
           ...coverage.validationErrors,
@@ -2459,6 +2477,15 @@ export class PrBot {
           check,
           guide,
         );
+        if (this.config.defectReviewEnabled) {
+          await this.publishJansoreeAdvisory(
+            repo,
+            prNumber,
+            context.headSha,
+            publicFindings,
+            ledgerSnapshot.publishedFingerprints,
+          );
+        }
       }
       return;
     }
@@ -2814,8 +2841,8 @@ export class PrBot {
       prNumber,
       headSha: context.headSha,
       checkRunId: check?.checkRunId ?? workflow?.checkRunId ?? null,
-      provider: "gemini",
-      model: `${this.config.geminiModel}-candidate-verifier`,
+      provider: "minimax",
+      model: `${MINIMAX_REVIEW_MODEL}-candidate-verifier`,
       promptVersion: REVIEW_GATE_PROMPT_VERSION,
       promptSha256: createHash("sha256").update(promptDigestInput).digest("hex"),
       contextSha256: contextHash,
@@ -3308,6 +3335,56 @@ export class PrBot {
     }
   }
 
+  /**
+   * Advisory defect publication under the Jansoree app identity. Never touches
+   * the Seori Review check; failures degrade to a warn log so the acceptance
+   * guide flow stays intact. The summary posts on every gate run, including
+   * zero-finding runs.
+   */
+  private async publishJansoreeAdvisory(
+    repo: RepoRef,
+    prNumber: number,
+    headSha: string,
+    findings: readonly ReviewGatePublicFinding[],
+    publishedFingerprints: ReadonlySet<string>,
+  ): Promise<void> {
+    try {
+      if (!this.jansoree.available()) {
+        return;
+      }
+      const octokit = await this.jansoree.octokitFor(repo);
+      if (!octokit) {
+        return;
+      }
+      const fatalFindings = findings.filter(
+        (finding): finding is ReviewGatePublicFatalFinding => finding.kind === "fatal_defect",
+      );
+      const summary = formatJansoreeSummary({
+        headSha,
+        findings: fatalFindings,
+        markerPrefix: JANSOREE_ADVISORY_MARKER_PREFIX,
+      });
+      const newFindings = fatalFindings.filter(
+        (finding) => !finding.fingerprint || !publishedFingerprints.has(finding.fingerprint),
+      );
+      if (newFindings.length === 0) {
+        await postPrComment(octokit, repo, prNumber, summary);
+        return;
+      }
+      const inlineComments: InlineReviewComment[] = newFindings.map((finding, index) => ({
+        path: finding.evidence.file,
+        line: finding.evidence.line,
+        body: formatReviewGateFinding(finding, index + 1),
+      }));
+      await this.safeSubmitReview(octokit, repo, prNumber, headSha, "COMMENT", summary, inlineComments);
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, prNumber, headSha },
+        "Jansoree advisory publication failed",
+      );
+    }
+  }
+
   private async tryResolveThread(octokit: Octokit, threadNodeId: string): Promise<void> {
     try {
       await resolveReviewThread(octokit, threadNodeId);
@@ -3616,7 +3693,7 @@ export class PrBot {
       context.markdown,
     ].join("\n");
 
-    return this.gemini.agent(prompt);
+    return this.ai.agent(prompt);
   }
 
   private async createAnswerText(
@@ -3640,7 +3717,7 @@ export class PrBot {
       context.markdown,
     ].join("\n");
 
-    return { text: await this.gemini.answer(prompt), headSha: context.headSha };
+    return { text: await this.ai.answer(prompt), headSha: context.headSha };
   }
 
   private contextOptions(workflow: WorkflowExecution | undefined, request: string | undefined): PullRequestContextOptions {
@@ -3648,7 +3725,7 @@ export class PrBot {
       installationToken: workflow?.installationToken,
       deepContextRequested: Boolean(request && /\bdeep\b|전체\s*맥락|전체\s*코드|full\s*context/iu.test(request)),
       reviewGatePromptReserveChars:
-        this.gemini.structuredReviewInstructionChars() + REVIEW_GATE_METADATA_RESERVE_CHARS,
+        this.ai.structuredReviewInstructionChars() + REVIEW_GATE_METADATA_RESERVE_CHARS,
     };
   }
 

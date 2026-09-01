@@ -68,22 +68,22 @@ spec:
               value: "3306"
             - name: MYSQL_DATABASE
               value: base
-            - name: GEMINI_MODEL
-              value: gemini-3-flash-preview
-            - name: GEMINI_TIMEOUT_MS
+            - name: MINIMAX_TIMEOUT_MS
               value: "180000"
+            - name: DEFECT_REVIEW_ENABLED
+              value: "true"
             - name: AI_REVIEW_PROVIDERS
-              value: gemini
+              value: minimax
             - name: AI_REVIEW_PROVIDER_WEIGHTS
-              value: gemini:100
+              value: minimax:100
             - name: AI_REVIEW_PROVIDER_FALLBACK_ORDER
-              value: gemini
+              value: minimax
             - name: AI_REVIEW_PROVIDER_COOLDOWN_MS
               value: "300000"
             - name: AI_REVIEW_TIEBREAKER_ENABLED
               value: "false"
             - name: AI_REVIEW_TIEBREAKER_PROVIDER
-              value: gemini
+              value: minimax
             - name: DEEP_REPO_CONTEXT_MODE
               value: auto
             - name: DEEP_REPO_CONTEXT_TIMEOUT_MS
@@ -171,11 +171,21 @@ spec:
                 secretKeyRef:
                   name: seori-pr-bot-secrets
                   key: GITHUB_WEBHOOK_SECRET
-            - name: GEMINI_API_KEY
+            - name: MINIMAX_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: seori-pr-bot-provider-secrets
-                  key: GEMINI_API_KEY
+                  key: MINIMAX_API_KEY
+            - name: REVIEW_GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: seori-pr-bot-review-app-secrets
+                  key: REVIEW_GITHUB_APP_ID
+            - name: REVIEW_GITHUB_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: seori-pr-bot-review-app-secrets
+                  key: REVIEW_GITHUB_PRIVATE_KEY
           readinessProbe:
             httpGet:
               path: /readyz

@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { App } from "octokit";
 import pino from "pino";
 import { loadConfig } from "./config.js";
+import { MINIMAX_REVIEW_MODEL } from "./minimax-review.js";
 import { TtlSet } from "./dedupe.js";
 import { STALE_REVIEW_SELF_TRIGGER_EVENT } from "./events.js";
 import { PrBot } from "./bot.js";
@@ -123,7 +124,7 @@ async function renderMetrics(): Promise<string> {
   return metrics.render({
     infoLabels: {
       workflow_store: config.workflowStore,
-      gemini_provider: "api",
+      ai_provider: "api",
     },
     gauges: bot.metricSamples(),
     workflowQueue,
@@ -274,11 +275,10 @@ server.listen(config.port, () => {
       port: config.port,
       org: config.githubOrg,
       provider: "api",
-      model: config.geminiModel,
+      model: MINIMAX_REVIEW_MODEL,
       reviewProviders: config.aiReviewProviders,
       reviewProviderWeights: config.aiReviewProviderWeights,
       reviewProviderFallbackOrder: config.aiReviewProviderFallbackOrder,
-      cursorModel: config.cursorModel || "default",
       workflowStore: config.workflowStore,
       allowPublicRepos: config.allowPublicRepos,
       autoReviewOnOpen: config.autoReviewOnOpen,

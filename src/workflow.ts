@@ -9,7 +9,7 @@ import mysql, {
 import type { App } from "octokit";
 import type { Config } from "./config.js";
 import type { PrBot, WorkflowCheckRecord } from "./bot.js";
-import { isAiProviderCooldownError } from "./gemini.js";
+import { isAiProviderCooldownError } from "./ai-client.js";
 import { completeCheck, type RepoRef } from "./github.js";
 import type { StoredFinding } from "./review.js";
 import type { ReviewRunRecord } from "./review-run.js";
@@ -451,7 +451,7 @@ export class MysqlWorkflowStore {
       INNER JOIN gemini_pr_bot_workflows AS workflows
         ON workflows.id = runs.workflow_id
       WHERE runs.repo_full_name = ? AND runs.pr_number = ? AND runs.head_sha = ?
-        AND runs.provider = 'gemini' AND runs.prompt_version = ? AND runs.context_sha256 = ?
+        AND runs.provider = 'minimax' AND runs.prompt_version = ? AND runs.context_sha256 = ?
         AND runs.parse_valid = TRUE AND runs.verdict IN ('PASS', 'FAIL')
         AND workflows.status = 'completed'
       ORDER BY runs.id DESC
@@ -482,7 +482,7 @@ export class MysqlWorkflowStore {
       INNER JOIN gemini_pr_bot_workflows AS workflows
         ON workflows.id = runs.workflow_id
       WHERE runs.repo_full_name = ? AND runs.pr_number = ?
-        AND runs.provider = 'gemini'
+        AND runs.provider IN ('gemini', 'minimax')
         AND runs.parse_valid = TRUE AND workflows.status = 'completed'
       ORDER BY runs.id DESC
       LIMIT 64

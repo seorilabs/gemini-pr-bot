@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { connect, type NatsConnection } from "@nats-io/transport-node";
 import type { AiReviewProviderName, Config } from "./config.js";
-import type { AiProviderQuotaEvent } from "./gemini.js";
+import type { AiProviderQuotaEvent } from "./ai-client.js";
 
 type Logger = {
   info: (value: unknown, message?: string) => void;

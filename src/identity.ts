@@ -1,9 +1,12 @@
 export const BOT_GITHUB_LOGIN = "seorilabs-seori-pr-bot";
 export const LEGACY_BOT_GITHUB_LOGIN = "seorilabs-gemini-pr-bot";
+export const JANSOREE_BOT_GITHUB_LOGIN = "jansoree";
+export const JANSOREE_ADVISORY_MARKER_PREFIX = "jansoree:advisory";
 const BOT_GITHUB_AUTHOR_LOGINS = new Set([
   BOT_GITHUB_LOGIN,
   LEGACY_BOT_GITHUB_LOGIN,
   "seori-bot",
+  JANSOREE_BOT_GITHUB_LOGIN,
 ]);
 
 export function isBotGithubAuthor(login: string): boolean {
