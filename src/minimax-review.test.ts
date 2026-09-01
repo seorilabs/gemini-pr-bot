@@ -167,7 +167,7 @@ test("candidate request uses MiniMax-M3 conservative Anthropic Messages defaults
   assert.equal(request.top_p, 0.95);
   assert.equal(request.service_tier, "standard");
   assert.equal(request.stream, false);
-  assert.equal(request.max_tokens, 16_384);
+  assert.equal(request.max_tokens, 24_576);
   assert.deepEqual(request.tool_choice, { type: "auto" });
   assert.equal(request.tools.length, 1);
   assert.equal(request.tools[0]?.name, MINIMAX_REVIEW_TOOL_NAME);
@@ -515,14 +515,17 @@ test("fatal candidate requires exact root evidence and rejects test-gap-only fie
     assert.ok(parsed.errors.some((error) => error.includes("exact root")));
   }
 
+  // M3가 습관적으로 채우는 잉여 AC 연결은 오류가 아니라 드롭 대상이다.
   const polluted = fatalCandidate();
   polluted.criterion_id = "AC-1";
   polluted.acceptance_criterion = "저장한다.";
   polluted.test_search_summary_ko = "테스트가 없습니다.";
   const pollutedResult = parseMiniMaxReviewPayload(reviewPayload([polluted]));
-  assert.equal(pollutedResult.ok, false);
-  if (!pollutedResult.ok) {
-    assert.ok(pollutedResult.errors.some((error) => error.includes("criterion_id: must be null")));
+  assert.equal(pollutedResult.ok, true);
+  if (pollutedResult.ok) {
+    assert.equal(pollutedResult.value.candidates[0]?.criterionId, null);
+    assert.equal(pollutedResult.value.candidates[0]?.acceptanceCriterion, null);
+    assert.equal(pollutedResult.value.candidates[0]?.testSearchSummaryKo, null);
   }
 });
 
@@ -776,5 +779,38 @@ test("비-covered 행에 실제 내용이 있는 test_evidence는 여전히 거�
   assert.equal(parsed.ok, false);
   if (!parsed.ok) {
     assert.ok(parsed.errors.some((error) => error.includes("requires null")));
+  }
+});
+
+test("비-covered 행의 누락·비정형 evidence 키는 계약 기본값으로 정규화된다", () => {
+  const absentKeys = { ...acceptanceCoverage("unknown") } as Record<string, unknown>;
+  delete absentKeys.test_evidence;
+  delete absentKeys.supporting_test_evidence;
+  const junkShapes = {
+    ...acceptanceCoverage("unknown"),
+    test_evidence: "없음",
+    supporting_test_evidence: "없음",
+  };
+  for (const entry of [absentKeys, junkShapes]) {
+    const parsed = parseMiniMaxReviewResponse(
+      messagesResponse(reviewPayload([], [entry])),
+      { expectedAcceptanceCriteria: ["저장 후 다시 열어도 값이 유지된다."] },
+    );
+    assert.equal(parsed.ok, true);
+    if (parsed.ok) {
+      assert.equal(parsed.value.acceptanceCoverage[0]?.testEvidence, null);
+      assert.deepEqual(parsed.value.acceptanceCoverage[0]?.supportingTestEvidence, []);
+    }
+  }
+});
+
+test("candidates 키가 통째로 빠지면 빈 배열로 정규화된다", () => {
+  const payload = { acceptance_coverage: [acceptanceCoverage("unknown")] };
+  const parsed = parseMiniMaxReviewResponse(messagesResponse(payload), {
+    expectedAcceptanceCriteria: ["저장 후 다시 열어도 값이 유지된다."],
+  });
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.deepEqual(parsed.value.candidates, []);
   }
 });

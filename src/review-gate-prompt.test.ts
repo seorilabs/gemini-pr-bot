@@ -55,7 +55,7 @@ test("검증자 프롬프트는 반증 우선 규칙을 유지한다", () => {
   assert.match(prompt, /전달된 후보는 신뢰하지 마세요/u);
 });
 
-test("프롬프트 버전은 가이드 모드 v4 MiniMax를 가리킨다", () => {
+test("프롬프트 버전은 가이드 모드 v5 MiniMax를 가리킨다", () => {
   // 버전 문자열은 review_runs 테이블의 회귀 측정 단위이자 게이트 캐시 격리 키다.
-  assert.equal(REVIEW_GATE_PROMPT_VERSION, "acceptance-guide-v4-minimax");
+  assert.equal(REVIEW_GATE_PROMPT_VERSION, "acceptance-guide-v5-minimax");
 });
