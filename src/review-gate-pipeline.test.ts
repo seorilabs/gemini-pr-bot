@@ -418,3 +418,67 @@ function codeEvidence(line: number, codeQuote: string) {
     explanationKo: "현재 HEAD의 실행 경로를 직접 보여주는 코드입니다.",
   };
 }
+
+test("인덱스 접근 root는 서명 키워드 없이도 deterministic_crash로 인정한다", () => {
+  const source = [
+    "const TIERS = [10, 20, 30];",
+    "export function rewardForTier(tier: number) {",
+    "  return TIERS[tier];",
+    "}",
+  ].join("\n");
+  const candidate = fatalCandidate({
+    fatalOutcome: "deterministic_crash",
+    symbol: "rewardForTier",
+    line: 3,
+    codeQuote: "return TIERS[tier];",
+    evidence: [codeEvidence(1, "const TIERS = [10, 20, 30];"), codeEvidence(3, "return TIERS[tier];")],
+  });
+  const result = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [candidate],
+    verifications: [fatalVerification({ evidence: [codeEvidence(3, "return TIERS[tier];")] })],
+    currentHeadFileContents: { [FATAL_FILE]: source },
+    visibleChangedPatches: { [FATAL_FILE]: addedLinePatch(3, "return TIERS[tier];") },
+  }));
+  assert.equal(result.accepted.length, 1);
+});
+
+test("나눗셈 root는 deterministic_crash로 인정하고, 일반 호출 root는 계속 거부한다", () => {
+  const divisionSource = [
+    "export function average(total: number, count: number) {",
+    "  return total / count;",
+    "}",
+  ].join("\n");
+  const division = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({
+      fatalOutcome: "deterministic_crash",
+      symbol: "average",
+      line: 2,
+      codeQuote: "return total / count;",
+      evidence: [codeEvidence(1, "export function average(total: number, count: number) {"), codeEvidence(2, "return total / count;")],
+    })],
+    verifications: [fatalVerification({ evidence: [codeEvidence(2, "return total / count;")] })],
+    currentHeadFileContents: { [FATAL_FILE]: divisionSource },
+    visibleChangedPatches: { [FATAL_FILE]: addedLinePatch(2, "return total / count;") },
+  }));
+  assert.equal(division.accepted.length, 1);
+
+  const plainSource = [
+    "export function run(value: string) {",
+    "  return doWork(value);",
+    "}",
+  ].join("\n");
+  const plain = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({
+      fatalOutcome: "deterministic_crash",
+      symbol: "run",
+      line: 2,
+      codeQuote: "return doWork(value);",
+      evidence: [codeEvidence(1, "export function run(value: string) {"), codeEvidence(2, "return doWork(value);")],
+    })],
+    verifications: [fatalVerification({ evidence: [codeEvidence(2, "return doWork(value);")] })],
+    currentHeadFileContents: { [FATAL_FILE]: plainSource },
+    visibleChangedPatches: { [FATAL_FILE]: addedLinePatch(2, "return doWork(value);") },
+  }));
+  assert.equal(plain.accepted.length, 0);
+  assert.equal(plain.rejected[0]?.code, "fatal_outcome_not_direct");
+});

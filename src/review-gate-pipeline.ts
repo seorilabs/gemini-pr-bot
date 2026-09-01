@@ -516,7 +516,12 @@ function hasDirectOutcomeSignature(
   const line = executableCode(sourceLine);
   const crash = /\b(?:throw|panic!?|fatalerror|abort|raise)\b|assert\s*\(\s*false/iu;
   if (outcome === "deterministic_crash") {
-    return crash.test(line);
+    // 서명 키워드 없이도 결정적 크래시를 직접 일으키는 관용구:
+    // 인덱스 접근(범위 초과), 나눗셈·나머지(0 나눗셈). 정확한 line·quote
+    // grounding과 verifier 확인이 오탐을 계속 막는다.
+    const subscriptAccess = /\w\s*\[[^\]]+\]/u;
+    const divisionOrModulo = /[^\s/*]\s*[/%]\s*[^\s/*=]/u;
+    return crash.test(line) || subscriptAccess.test(line) || divisionOrModulo.test(line);
   }
   if (outcome === "permanent_data_loss_or_corruption") {
     const destructive =
