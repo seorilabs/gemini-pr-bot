@@ -814,3 +814,18 @@ test("candidates 키가 통째로 빠지면 빈 배열로 정규화된다", () =
     assert.deepEqual(parsed.value.candidates, []);
   }
 });
+
+test("무의미 키만 든 test_evidence 객체도 null로 정규화된다", () => {
+  const garbage = {
+    ...acceptanceCoverage("unknown"),
+    test_evidence: { $text: "근거를 찾지 못했습니다." },
+  };
+  const parsed = parseMiniMaxReviewResponse(
+    messagesResponse(reviewPayload([], [garbage])),
+    { expectedAcceptanceCriteria: ["저장 후 다시 열어도 값이 유지된다."] },
+  );
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.value.acceptanceCoverage[0]?.testEvidence, null);
+  }
+});

@@ -1224,15 +1224,22 @@ function requireNull(value: unknown, path: string, errors: string[]): void {
   }
 }
 
+const EVIDENCE_CLAIM_KEYS = ["file", "line", "test_name", "assertion_quote"] as const;
+
+/**
+ * An evidence object counts as a claim only when at least one contractual
+ * evidence key carries content. Empty shells and garbage-key objects (for
+ * example M3's `{"$text": ...}` artifacts) normalize to the contractual null.
+ */
 function normalizeEmptyEvidenceToNull(value: unknown): unknown {
   if (!isRecord(value)) {
     return value;
   }
-  const values = Object.values(value);
-  if (values.length === 0 || values.every((item) => item === null || item === "")) {
-    return null;
-  }
-  return value;
+  const hasClaim = EVIDENCE_CLAIM_KEYS.some((key) => {
+    const item = value[key];
+    return item !== undefined && item !== null && item !== "";
+  });
+  return hasClaim ? value : null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
