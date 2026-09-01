@@ -197,7 +197,7 @@ test("verification request has its own strict verifier schema and smaller defaul
     systemPrompt: "반증을 우선하는 검증 규칙",
     userPrompt: "후보와 현재 HEAD 근거",
   });
-  assert.equal(request.max_tokens, 8_192);
+  assert.equal(request.max_tokens, 16_384);
   const schema = request.tools[0]?.input_schema as any;
   assert.deepEqual(schema.required, ["verifications"]);
   assert.equal(schema.properties.verifications.maxItems, 2);
