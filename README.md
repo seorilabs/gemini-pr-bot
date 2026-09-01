@@ -218,9 +218,12 @@ export GITHUB_APP_ID="..."
 export GITHUB_PRIVATE_KEY_FILE="/path/to/seorilabs-seori-pr-bot.private-key.pem"
 export GITHUB_WEBHOOK_SECRET="..."
 export MINIMAX_API_KEY="..."
+export REVIEW_GITHUB_APP_ID="4792283"
+export REVIEW_GITHUB_PRIVATE_KEY_FILE="/path/to/jansoree.private-key.pem"
 
 ./scripts/create-k8s-secret.sh
 ./scripts/create-provider-secrets.sh
+./scripts/create-review-app-secret.sh
 ./scripts/copy-mysql-app-secret.sh
 ```
 
