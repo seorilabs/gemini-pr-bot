@@ -7,7 +7,7 @@ flowchart LR
   GitHub["GitHub App Webhook"] --> Ingress["K8s Ingress"]
   Ingress --> Bot["seori-pr-bot"]
   Bot --> GitHubAPI["GitHub App Installation API"]
-  Bot --> Providers["Gemini API merge gate / optional Cursor fallback"]
+  Bot --> Providers["MiniMax Anthropic-compatible Messages API merge gate"]
   Bot --> Comment["PR comments / inline replies / check runs"]
   Bot --> NATS["ops.notification.v1.seori-review"]
   NATS --> Backoffice["Backoffice notification worker"]
@@ -44,7 +44,7 @@ flowchart LR
 - Marks `Seori Review` as `success` after a gate pass or explicit current-HEAD approval. Confirmed blockers and early-turn follow-up requests complete as `action_required`; only later-turn peripheral uncertainty may complete as `neutral`.
 - Every completed non-approval review is visible in the PR conversation. Follow-up reviews retain the latest Seori result and Contributor responses, compare the previous reviewed HEAD with the current HEAD, and limit investigation to that incremental diff plus resolution of the previous request.
 - Adds selected deep repository context from a shallow PR clone when changed files need surrounding code or config context.
-- Routes production AI jobs through the Gemini API. Cursor remains an optional separately configured fallback; paid second-opinion calls are disabled by default. GitHub Copilot is not a bot review provider — use GitHub's native Copilot review separately.
+- Routes production AI jobs through the MiniMax-M3 Anthropic-compatible Messages API (Coding Plan quota). GitHub Copilot is not a bot review provider.
 - Cancels stale review check runs when a PR is merged, closed, or updated while a review is running.
 - Blocks normal approval while tests, build, lint, typecheck, or status checks are failing.
 - Holds approval silently while CI is pending, then rechecks the current HEAD before approving.
@@ -217,7 +217,7 @@ Then create the K8s secrets.
 export GITHUB_APP_ID="..."
 export GITHUB_PRIVATE_KEY_FILE="/path/to/seorilabs-seori-pr-bot.private-key.pem"
 export GITHUB_WEBHOOK_SECRET="..."
-export GEMINI_API_KEY="..."
+export MINIMAX_API_KEY="..."
 
 ./scripts/create-k8s-secret.sh
 ./scripts/create-provider-secrets.sh
@@ -235,17 +235,16 @@ Use a dedicated automation account for these credentials. Personal tokens are ac
 The production routing is:
 
 ```text
-AI_REVIEW_PROVIDERS=gemini
-AI_REVIEW_PROVIDER_WEIGHTS=gemini:100
-AI_REVIEW_PROVIDER_FALLBACK_ORDER=gemini
+AI_REVIEW_PROVIDERS=minimax
+AI_REVIEW_PROVIDER_WEIGHTS=minimax:100
+AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax
 AI_REVIEW_TIEBREAKER_ENABLED=false
-GEMINI_MODEL=gemini-3-flash-preview
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
 PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github,seorilabs/platform,seorilabs/seorilabs-backoffice
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
-The conservative gate uses the Gemini API with low thinking and JSON-schema-constrained output. It runs two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
+The conservative gate uses MiniMax-M3's Anthropic-compatible Messages API with a strict submit_review tool contract. It runs two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
 
 Structured PR reviews use the bounded Gemini candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable. Incomplete or ambiguous evidence on the first two review turns becomes `FOLLOW_UP`, posts a PR comment with a host-owned reason and concrete Contributor response, and completes the check as `action_required`. From the third turn, `neutral` is permitted only when every remaining item is peripheral; it still posts the unresolved scope and required response, submits no approval, and hands merge authorization to a current-HEAD human review.
 

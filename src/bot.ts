@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AiReviewProviderName, Config } from "./config.js";
 import { CI_RECHECK_EVENT, STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
-import { GeminiClient, isAiProviderCooldownError } from "./gemini.js";
+import { AiClient, isAiProviderCooldownError } from "./ai-client.js";
 import { metrics, type GaugeSample } from "./metrics.js";
 import {
   approvePullRequest,
@@ -56,7 +56,7 @@ import {
 import { OperationsNotifier, type ApprovalNotificationMode } from "./notifications.js";
 import { parseBotCommand, truncate } from "./text.js";
 import type { ReviewRunRecord } from "./review-run.js";
-import { type MiniMaxReviewCandidate } from "./minimax-review.js";
+import { MINIMAX_REVIEW_MODEL, type MiniMaxReviewCandidate } from "./minimax-review.js";
 import {
   REVIEW_GATE_PROMPT_VERSION,
   buildReviewGateCandidateSystemPrompt,
@@ -253,7 +253,7 @@ type CiRecheckRequest = {
 };
 
 export class PrBot {
-  private readonly gemini: GeminiClient;
+  private readonly ai: AiClient;
   private readonly operationsNotifier: OperationsNotifier;
   private readonly activeTasks = new Set<Promise<void>>();
   private readonly activeChecks = new Map<number, ActiveCheckRun>();
@@ -265,7 +265,7 @@ export class PrBot {
     private readonly logger: Logger,
   ) {
     this.operationsNotifier = new OperationsNotifier(config, logger);
-    this.gemini = new GeminiClient(config, logger, (event) => this.operationsNotifier.notifyQuotaEvent(event));
+    this.ai = new AiClient(config, logger, (event) => this.operationsNotifier.notifyQuotaEvent(event));
   }
 
   scheduleIssueComment(event: any): void {
@@ -308,7 +308,7 @@ export class PrBot {
         name: "seori_pr_bot_active_check_runs",
         value: this.activeChecks.size,
       },
-      ...this.gemini.metricSamples(),
+      ...this.ai.metricSamples(),
     ];
   }
 
@@ -2032,7 +2032,7 @@ export class PrBot {
       context.markdown,
     ].join("\n");
 
-    return this.gemini.review(prompt);
+    return this.ai.review(prompt);
   }
 
   // Conservative merge gate. The model extracts evidence; strict parsing,
@@ -2180,7 +2180,7 @@ export class PrBot {
           "reused completed Gemini review gate extraction",
         );
       } else {
-        const candidateResult = await this.gemini.reviewGateCandidates(
+        const candidateResult = await this.ai.reviewGateCandidates(
           prompts.candidateSystem,
           prompts.candidateUser,
           explicitAcceptanceCriteria,
@@ -2192,7 +2192,7 @@ export class PrBot {
         const candidates = guideMode ? [] : candidateResult.value.candidates;
         const verificationResult = candidates.length === 0
           ? { verifications: [] }
-          : (await this.gemini.verifyReviewGateCandidates(
+          : (await this.ai.verifyReviewGateCandidates(
               prompts.verifierSystem,
               this.reviewGateVerifierPrompt(
                 prompts.candidateUser,
@@ -2814,8 +2814,8 @@ export class PrBot {
       prNumber,
       headSha: context.headSha,
       checkRunId: check?.checkRunId ?? workflow?.checkRunId ?? null,
-      provider: "gemini",
-      model: `${this.config.geminiModel}-candidate-verifier`,
+      provider: "minimax",
+      model: `${MINIMAX_REVIEW_MODEL}-candidate-verifier`,
       promptVersion: REVIEW_GATE_PROMPT_VERSION,
       promptSha256: createHash("sha256").update(promptDigestInput).digest("hex"),
       contextSha256: contextHash,
@@ -3616,7 +3616,7 @@ export class PrBot {
       context.markdown,
     ].join("\n");
 
-    return this.gemini.agent(prompt);
+    return this.ai.agent(prompt);
   }
 
   private async createAnswerText(
@@ -3640,7 +3640,7 @@ export class PrBot {
       context.markdown,
     ].join("\n");
 
-    return { text: await this.gemini.answer(prompt), headSha: context.headSha };
+    return { text: await this.ai.answer(prompt), headSha: context.headSha };
   }
 
   private contextOptions(workflow: WorkflowExecution | undefined, request: string | undefined): PullRequestContextOptions {
@@ -3648,7 +3648,7 @@ export class PrBot {
       installationToken: workflow?.installationToken,
       deepContextRequested: Boolean(request && /\bdeep\b|전체\s*맥락|전체\s*코드|full\s*context/iu.test(request)),
       reviewGatePromptReserveChars:
-        this.gemini.structuredReviewInstructionChars() + REVIEW_GATE_METADATA_RESERVE_CHARS,
+        this.ai.structuredReviewInstructionChars() + REVIEW_GATE_METADATA_RESERVE_CHARS,
     };
   }
 

@@ -1,4 +1,4 @@
-export const AI_REVIEW_PROVIDER_NAMES = ["gemini", "cursor"] as const;
+export const AI_REVIEW_PROVIDER_NAMES = ["minimax"] as const;
 
 export type AiReviewProviderName = (typeof AI_REVIEW_PROVIDER_NAMES)[number];
 export type AiReviewProviderWeights = Record<AiReviewProviderName, number>;
@@ -18,9 +18,9 @@ export type Config = {
   ciInitialWaitMs: number;
   ciRecheckIntervalMs: number;
   ciRecheckTimeoutMs: number;
-  geminiApiKey: string;
-  geminiModel: string;
-  geminiTimeoutMs: number;
+  minimaxApiKey: string;
+  minimaxBaseUrl: string;
+  minimaxTimeoutMs: number;
   aiReviewProviders: AiReviewProviderName[];
   aiReviewProviderWeights: AiReviewProviderWeights;
   aiReviewProviderFallbackOrder: AiReviewProviderName[];
@@ -29,9 +29,6 @@ export type Config = {
   // review to a separately configured provider to break the loop.
   aiReviewTiebreakerEnabled: boolean;
   aiReviewTiebreakerProvider: AiReviewProviderName;
-  cursorCliCommand: string;
-  cursorCliTimeoutMs: number;
-  cursorModel?: string;
   mysqlHost?: string;
   mysqlPort: number;
   mysqlUser?: string;
@@ -157,8 +154,7 @@ function optionalProviderWeights(
   fallback: Partial<AiReviewProviderWeights>,
 ): AiReviewProviderWeights {
   const weights: AiReviewProviderWeights = {
-    gemini: 0,
-    cursor: 0,
+    minimax: 0,
     ...fallback,
   };
   const raw = process.env[name];
@@ -197,11 +193,11 @@ export function loadConfig(): Config {
     throw new Error("MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, and MYSQL_DATABASE are required when WORKFLOW_STORE=mysql");
   }
 
-  const geminiApiKey = requiredEnv("GEMINI_API_KEY");
+  const minimaxApiKey = requiredEnv("MINIMAX_API_KEY");
 
-  const aiReviewProviders = optionalProviderList("AI_REVIEW_PROVIDERS", ["gemini"]);
+  const aiReviewProviders = optionalProviderList("AI_REVIEW_PROVIDERS", ["minimax"]);
   const aiReviewProviderWeights = optionalProviderWeights("AI_REVIEW_PROVIDER_WEIGHTS", {
-    gemini: 100,
+    minimax: 100,
   });
   if (aiReviewProviders.every((provider) => aiReviewProviderWeights[provider] <= 0)) {
     throw new Error("AI_REVIEW_PROVIDER_WEIGHTS must give at least one enabled provider a positive weight");
@@ -228,22 +224,19 @@ export function loadConfig(): Config {
     ciInitialWaitMs: optionalInt("CI_INITIAL_WAIT_MS", 60_000),
     ciRecheckIntervalMs: optionalInt("CI_RECHECK_INTERVAL_MS", 60_000),
     ciRecheckTimeoutMs: optionalInt("CI_RECHECK_TIMEOUT_MS", 20 * 60 * 1000),
-    geminiApiKey,
-    geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-3-flash-preview",
-    geminiTimeoutMs: optionalInt("GEMINI_TIMEOUT_MS", 180_000),
+    minimaxApiKey,
+    minimaxBaseUrl: process.env.MINIMAX_BASE_URL?.trim() || "https://api.minimax.io",
+    minimaxTimeoutMs: optionalInt("MINIMAX_TIMEOUT_MS", 180_000),
     aiReviewProviders,
     aiReviewProviderWeights,
-    aiReviewProviderFallbackOrder: optionalProviderList("AI_REVIEW_PROVIDER_FALLBACK_ORDER", ["gemini"]),
+    aiReviewProviderFallbackOrder: optionalProviderList("AI_REVIEW_PROVIDER_FALLBACK_ORDER", ["minimax"]),
     aiReviewProviderCooldownMs: optionalInt("AI_REVIEW_PROVIDER_COOLDOWN_MS", 5 * 60 * 1000),
     aiReviewTiebreakerEnabled: optionalBool("AI_REVIEW_TIEBREAKER_ENABLED", false),
     aiReviewTiebreakerProvider: optionalChoice<AiReviewProviderName>(
       "AI_REVIEW_TIEBREAKER_PROVIDER",
-      "gemini",
+      "minimax",
       AI_REVIEW_PROVIDER_NAMES,
     ),
-    cursorCliCommand: process.env.CURSOR_CLI_COMMAND?.trim() || "/usr/local/bin/agent",
-    cursorCliTimeoutMs: optionalInt("CURSOR_CLI_TIMEOUT_MS", 180_000),
-    cursorModel: process.env.CURSOR_MODEL?.trim(),
     mysqlHost,
     mysqlPort: optionalInt("MYSQL_PORT", 3306),
     mysqlUser,
