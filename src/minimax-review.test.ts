@@ -739,3 +739,42 @@ test("verifier rejects English public reasons, unknown fields, and invalid enums
     assert.ok(invalidVerdictResult.errors.some((error) => error.includes("verdict: unexpected enum")));
   }
 });
+
+test("비-covered 행의 빈 test_evidence 객체는 null로 정규화되어 통과한다", () => {
+  const emptyObject = { ...acceptanceCoverage("unknown"), test_evidence: {} };
+  const emptyValues = {
+    ...acceptanceCoverage("unknown"),
+    test_evidence: { file: "", line: null, test_name: "", assertion_quote: "", explanation_ko: null },
+  };
+  for (const entry of [emptyObject, emptyValues]) {
+    const parsed = parseMiniMaxReviewResponse(
+      messagesResponse(reviewPayload([], [entry])),
+      { expectedAcceptanceCriteria: ["저장 후 다시 열어도 값이 유지된다."] },
+    );
+    assert.equal(parsed.ok, true);
+    if (parsed.ok) {
+      assert.equal(parsed.value.acceptanceCoverage[0]?.testEvidence, null);
+    }
+  }
+});
+
+test("비-covered 행에 실제 내용이 있는 test_evidence는 여전히 거부된다", () => {
+  const withContent = {
+    ...acceptanceCoverage("unknown"),
+    test_evidence: {
+      file: "src/save.test.ts",
+      line: 28,
+      test_name: "저장값을 다시 복원한다",
+      assertion_quote: "assert.equal(restored.value, expected)",
+      explanation_ko: "단언입니다.",
+    },
+  };
+  const parsed = parseMiniMaxReviewResponse(
+    messagesResponse(reviewPayload([], [withContent])),
+    { expectedAcceptanceCriteria: ["저장 후 다시 열어도 값이 유지된다."] },
+  );
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.ok(parsed.errors.some((error) => error.includes("requires null")));
+  }
+});

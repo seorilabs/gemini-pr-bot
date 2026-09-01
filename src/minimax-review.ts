@@ -666,8 +666,12 @@ function validateAcceptanceCoverage(
     // differences (quotes, whitespace, or paraphrasing).
     const acceptanceCriterion = expectedSource ?? echoedAcceptanceCriterion;
     const status = readEnum(entry.status, COVERAGE_STATUS_SET, `${entryPath}.status`, errors);
+    // MiniMax-M3 habitually submits an empty evidence object instead of the
+    // contractual null for uncovered rows. Normalize the clearly empty shape
+    // before strict validation; any real content keeps the full checks.
+    const rawTestEvidence = normalizeEmptyEvidenceToNull(entry.test_evidence);
     const testEvidence = readAcceptanceTestEvidence(
-      entry.test_evidence,
+      rawTestEvidence,
       `${entryPath}.test_evidence`,
       errors,
     );
@@ -680,7 +684,7 @@ function validateAcceptanceCoverage(
     if (status === "covered" && testEvidence === null) {
       errors.push(`${entryPath}.test_evidence: covered status requires test evidence`);
     }
-    if ((status === "missing" || status === "unknown") && entry.test_evidence !== null) {
+    if ((status === "missing" || status === "unknown") && rawTestEvidence !== null) {
       errors.push(`${entryPath}.test_evidence: ${status} status requires null`);
     }
     if (
@@ -1193,6 +1197,17 @@ function requireNull(value: unknown, path: string, errors: string[]): void {
   if (value !== null) {
     errors.push(`${path}: must be null for this candidate kind`);
   }
+}
+
+function normalizeEmptyEvidenceToNull(value: unknown): unknown {
+  if (!isRecord(value)) {
+    return value;
+  }
+  const values = Object.values(value);
+  if (values.length === 0 || values.every((item) => item === null || item === "")) {
+    return null;
+  }
+  return value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
