@@ -5,7 +5,7 @@
  * 근거를 만들어내지 않도록 복사 규칙을 명시한다. v1은 이 규칙이 없어
  * test_evidence_not_in_host_inventory 비율이 크게 높았다.
  */
-export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v3-minimax";
+export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v4-minimax";
 
 const ACCEPTANCE_GUIDE_CANDIDATE_RULES = [
   "당신은 Seori의 최초 1회 인수조건 안내와 치명 결함 후보 조사를 위한 근거 분류자입니다. 승인·거절 판정자는 아닙니다.",
@@ -26,6 +26,7 @@ const ACCEPTANCE_GUIDE_CANDIDATE_RULES = [
   "context_hint는 후보를 찾기 위한 검색 보조 정보입니다. assertion_quote에는 후보의 quote 값만 정확히 복사하고 context_hint 문구를 섞지 마세요.",
   "`npm test`, `pnpm check:*`, `actionlint` 같은 실행 명령 자체를 assertion_quote로 만들지 마세요. 인수조건의 동작을 확인하는 후보를 선택하세요.",
   "complete inventory에서 직접 근거가 없으면 missing, 인벤토리가 불완전하거나 판단이 애매하면 unknown입니다.",
+  "coverage가 covered가 아니면 test_evidence는 객체가 아니라 반드시 null이고 supporting_test_evidence는 빈 배열입니다.",
   "명시적으로 수동·육안·실기기 확인을 요구하는 조건만 manual로 분류하세요.",
   "복합 인수조건은 같은 실행 테스트의 supporting_test_evidence를 최대 3개까지 사용해 모든 필수 결과를 함께 증명하세요.",
   "모든 공개 설명 필드는 한글로 쓰고 정의된 submit_review 도구를 정확히 한 번 사용하세요.",
