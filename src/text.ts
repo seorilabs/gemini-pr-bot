@@ -2,7 +2,7 @@ import type { Config } from "./config.js";
 
 export type BotCommand = {
   mention: string;
-  mode: "review" | "chat" | "help" | "approve" | "force_approve" | "agent";
+  mode: "review" | "reconcile_status" | "chat" | "help" | "approve" | "force_approve" | "agent";
   request: string;
 };
 
@@ -18,6 +18,9 @@ export function escapeRegExp(value: string): string {
 }
 
 function parseRequest(mention: string, rawRequest: string): BotCommand {
+  if (/^\/?reconcile-status(?:\s|$)/iu.test(rawRequest)) {
+    return { mention, mode: "reconcile_status", request: "" };
+  }
   const reviewMatch = rawRequest.match(/^\/?review(?:\s+([\s\S]*))?$/iu);
   if (reviewMatch) {
     return {
@@ -81,6 +84,13 @@ export function parseBotCommand(body: string, config: Config): BotCommand | null
   }
 
   return null;
+}
+
+export function isStatusReconciliationEvent(eventName: string, payload: any, config: Config): boolean {
+  if (eventName === "pull_request_review_thread") return ["resolved", "unresolved"].includes(payload.action);
+  const body = eventName === "issue_comment" || eventName === "pull_request_review_comment"
+    ? payload.comment?.body : eventName === "pull_request_review" ? payload.review?.body : undefined;
+  return typeof body === "string" && parseBotCommand(body, config)?.mode === "reconcile_status";
 }
 
 export function githubCommentBody(body: string, maxChars = 60_000): string {

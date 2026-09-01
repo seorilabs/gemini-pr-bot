@@ -1661,7 +1661,7 @@ function buildConversationState(headSha: string, issueComments: any[], reviewCom
   ].join("\n");
 }
 
-function isOwnReviewCheck(name: string | undefined): boolean {
+export function isOwnReviewCheck(name: string | undefined): boolean {
   return name === REVIEW_CHECK_NAME || name === LEGACY_REVIEW_CHECK_NAME;
 }
 
@@ -1968,11 +1968,13 @@ export async function listReviewThreads(
   octokit: Octokit,
   repo: RepoRef,
   prNumber: number,
+  expectedHeadSha?: string,
 ): Promise<ReviewThreadInfo[]> {
   const query = `
     query($owner: String!, $repo: String!, $prNumber: Int!, $after: String) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $prNumber) {
+          headRefOid
           reviewThreads(first: 100, after: $after) {
             nodes {
               id
@@ -1999,6 +2001,7 @@ export async function listReviewThreads(
 
   const threads: ReviewThreadInfo[] = [];
   let after: string | null = null;
+  const cursors = new Set<string>();
   do {
     const result: any = await octokit.graphql(query, {
       owner: repo.owner,
@@ -2007,6 +2010,16 @@ export async function listReviewThreads(
       after,
     });
     const reviewThreads = result.repository?.pullRequest?.reviewThreads;
+    if (expectedHeadSha !== undefined) {
+      if (result.repository?.pullRequest?.headRefOid !== expectedHeadSha) {
+        throw new Error("SEORI_STATUS_HEAD_CHANGED");
+      }
+      if (!Array.isArray(reviewThreads?.nodes) || typeof reviewThreads?.pageInfo?.hasNextPage !== "boolean" ||
+          reviewThreads.nodes.some((thread: any) => !thread || typeof thread.id !== "string" ||
+            typeof thread.isResolved !== "boolean" || !Array.isArray(thread.comments?.nodes) || thread.comments.nodes.length === 0)) {
+        throw new Error("SEORI_STATUS_THREAD_READBACK_INVALID");
+      }
+    }
     for (const thread of reviewThreads?.nodes || []) {
       const comments = thread.comments?.nodes || [];
       threads.push({
@@ -2026,6 +2039,12 @@ export async function listReviewThreads(
       });
     }
     after = reviewThreads?.pageInfo?.hasNextPage ? reviewThreads.pageInfo.endCursor : null;
+    if (expectedHeadSha !== undefined && reviewThreads.pageInfo.hasNextPage) {
+      if (typeof after !== "string" || after.length === 0 || cursors.has(after)) {
+        throw new Error("SEORI_STATUS_THREAD_READBACK_INVALID");
+      }
+      cursors.add(after);
+    }
   } while (after);
 
   return threads;

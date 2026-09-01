@@ -71,7 +71,7 @@ app.webhooks.on("pull_request_review.submitted", async (event) => {
   await handleWebhookEvent("pull_request_review", event, () => bot.schedulePullRequestReview(event));
 });
 
-app.webhooks.on("pull_request_review_thread.resolved", async (event) => {
+app.webhooks.on(["pull_request_review_thread.resolved", "pull_request_review_thread.unresolved"], async (event) => {
   await handleWebhookEvent(
     "pull_request_review_thread",
     event,

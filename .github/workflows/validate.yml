@@ -21,6 +21,19 @@ jobs:
     name: PR lint and tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: seori_status_reconciliation_test
+        ports:
+          - "127.0.0.1:33306:3306"
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
 
     steps:
       - name: Checkout
@@ -37,6 +50,8 @@ jobs:
         run: npm ci
 
       - name: Typecheck
+        env:
+          SEORI_STATUS_TEST_MYSQL_PORT: "33306"
         run: npm run check
 
       - name: Build

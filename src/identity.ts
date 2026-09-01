@@ -13,6 +13,10 @@ export function isBotGithubAuthor(login: string): boolean {
   return BOT_GITHUB_AUTHOR_LOGINS.has(login.toLowerCase().replace(/\[bot\]$/u, ""));
 }
 
+export function isSeoriGithubAuthor(login: string): boolean {
+  return isBotGithubAuthor(login) && login.toLowerCase().replace(/\[bot\]$/u, "") !== JANSOREE_BOT_GITHUB_LOGIN;
+}
+
 export type BotActionMarker = "approve" | "comment" | "close";
 export type BotStatusMarker =
   | "action-required"
