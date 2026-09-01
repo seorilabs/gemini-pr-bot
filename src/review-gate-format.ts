@@ -560,3 +560,37 @@ function formatHtmlMarker(payload: string): string {
 function joinSections(sections: readonly string[]): string {
   return sections.map((section) => section.trim()).filter(Boolean).join("\n\n");
 }
+
+export const JANSOREE_SUMMARY_HEADER = "## 잔소리";
+
+/**
+ * Advisory summary posted under the Jansoree app identity. Never feeds the
+ * Seori Review check; posted on every gate run, including zero-finding runs.
+ */
+export function formatJansoreeSummary(input: {
+  headSha: string;
+  findings: readonly ReviewGatePublicFinding[];
+  markerPrefix: string;
+}): string {
+  const fatalFindings = input.findings.filter(
+    (finding): finding is ReviewGatePublicFatalFinding => finding.kind === "fatal_defect",
+  );
+  const lines = [
+    `<!-- ${input.markerPrefix} head=${input.headSha} -->`,
+    JANSOREE_SUMMARY_HEADER,
+    "",
+    `검토 HEAD: \`${input.headSha}\``,
+    "",
+  ];
+  if (fatalFindings.length === 0) {
+    lines.push("지적할 결함을 찾지 못했습니다.");
+  } else {
+    lines.push(`발견한 결함: ${fatalFindings.length}건`, "");
+    fatalFindings.forEach((finding, index) => {
+      lines.push(`${index + 1}. ${finding.title} — \`${finding.evidence.file}:${finding.evidence.line}\``);
+    });
+    lines.push("", "세부 내용은 인라인 코멘트를 참고하세요.");
+  }
+  lines.push("", "_이 코멘트는 advisory이며 병합을 막지 않습니다. Seori Review check와 무관합니다._");
+  return lines.join("\n");
+}

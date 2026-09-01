@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  formatJansoreeSummary,
   formatReviewGateCheckOutput,
   formatReviewGateFinding,
   type ReviewGatePublicFatalFinding,
@@ -308,4 +309,38 @@ test("코드 fence와 HTML 표식에 포함된 종료 문자열을 안전하게 
   assert.doesNotMatch(output.text, /<!-- marker-->injected/);
   assert.doesNotMatch(output.text, /<!-- seori-finding:fp-->injected/);
   assert.match(output.text, /<!-- marker-injected next -->/);
+});
+
+test("잔소리 요약은 결함이 없어도 항상 게시 형식을 만든다", () => {
+  const empty = formatJansoreeSummary({
+    headSha: "abc1234",
+    findings: [],
+    markerPrefix: "jansoree:advisory",
+  });
+  assert.match(empty, /^<!-- jansoree:advisory head=abc1234 -->/u);
+  assert.match(empty, /## 잔소리/u);
+  assert.match(empty, /지적할 결함을 찾지 못했습니다\./u);
+  assert.match(empty, /advisory이며 병합을 막지 않습니다/u);
+});
+
+test("잔소리 요약은 치명 결함만 세어 위치와 함께 나열한다", () => {
+  const summary = formatJansoreeSummary({
+    headSha: "abc1234",
+    findings: [
+      fatalFinding(),
+      {
+        kind: "missing_acceptance_test",
+        title: "AC-1 테스트 없음",
+        problem: "테스트가 없습니다.",
+        trigger: "-",
+        impact: "-",
+        requiredAction: "-",
+        evidence: { acceptanceCriterion: "AC-1", testInventoryComplete: true },
+      },
+    ],
+    markerPrefix: "jansoree:advisory",
+  });
+  assert.match(summary, /발견한 결함: 1건/u);
+  assert.match(summary, /`src\/save\.ts:42`/u);
+  assert.doesNotMatch(summary, /AC-1 테스트 없음/u);
 });

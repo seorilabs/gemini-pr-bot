@@ -75,8 +75,10 @@ import {
   type StoredReviewFinding,
 } from "./review-finding-ledger.js";
 import {
+  formatJansoreeSummary,
   formatReviewGateCheckOutput,
   formatReviewGateFinding,
+  type ReviewGatePublicFatalFinding,
   type ReviewGatePublicFinding,
   type ReviewGatePublicVerdict,
 } from "./review-gate-format.js";
@@ -102,8 +104,10 @@ import {
   filterReviewGateCacheCandidates,
   type MiniMaxReviewGateCacheEnvelope,
 } from "./review-gate-cache.js";
+import { JansoreeClient } from "./jansoree.js";
 import {
   BOT_GITHUB_LOGIN,
+  JANSOREE_ADVISORY_MARKER_PREFIX,
   isBotGithubAuthor,
   bodyIncludesBotActionMarker,
   botActionMarker,
@@ -254,6 +258,7 @@ type CiRecheckRequest = {
 
 export class PrBot {
   private readonly ai: AiClient;
+  private readonly jansoree: JansoreeClient;
   private readonly operationsNotifier: OperationsNotifier;
   private readonly activeTasks = new Set<Promise<void>>();
   private readonly activeChecks = new Map<number, ActiveCheckRun>();
@@ -266,6 +271,13 @@ export class PrBot {
   ) {
     this.operationsNotifier = new OperationsNotifier(config, logger);
     this.ai = new AiClient(config, logger, (event) => this.operationsNotifier.notifyQuotaEvent(event));
+    this.jansoree = new JansoreeClient(config, logger);
+    if (config.defectReviewEnabled && !this.jansoree.available()) {
+      logger.warn(
+        {},
+        "DEFECT_REVIEW_ENABLED but REVIEW_GITHUB_APP_ID/REVIEW_GITHUB_PRIVATE_KEY are missing; Jansoree advisory will be skipped",
+      );
+    }
   }
 
   scheduleIssueComment(event: any): void {
@@ -2053,6 +2065,7 @@ export class PrBot {
     ]);
     if (
       this.config.acceptanceGuideModeEnabled &&
+      !this.config.defectReviewEnabled &&
       explicitAcceptanceCriteria.length === 0
     ) {
       await this.publishAcceptanceGuide(
@@ -2185,11 +2198,12 @@ export class PrBot {
           prompts.candidateUser,
           explicitAcceptanceCriteria,
           {
-            repairInvalidOutput: !this.config.acceptanceGuideModeEnabled,
+            repairInvalidOutput: true,
           },
         );
         const guideMode = this.config.acceptanceGuideModeEnabled;
-        const candidates = guideMode ? [] : candidateResult.value.candidates;
+        const candidates =
+          guideMode && !this.config.defectReviewEnabled ? [] : candidateResult.value.candidates;
         const verificationResult = candidates.length === 0
           ? { verifications: [] }
           : (await this.ai.verifyReviewGateCandidates(
@@ -2430,7 +2444,11 @@ export class PrBot {
         contextHash,
         prompts,
         evaluatedEnvelope,
-        guide.items.length > 0 ? "FOLLOW_UP" : "PASS",
+        publicFindings.some((finding) => finding.kind === "fatal_defect")
+          ? "FAIL"
+          : guide.items.length > 0
+            ? "FOLLOW_UP"
+            : "PASS",
         [
           ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
           ...coverage.validationErrors,
@@ -2459,6 +2477,15 @@ export class PrBot {
           check,
           guide,
         );
+        if (this.config.defectReviewEnabled) {
+          await this.publishJansoreeAdvisory(
+            repo,
+            prNumber,
+            context.headSha,
+            publicFindings,
+            ledgerSnapshot.publishedFingerprints,
+          );
+        }
       }
       return;
     }
@@ -3305,6 +3332,56 @@ export class PrBot {
         "review submit failed; falling back to a plain PR comment",
       );
       await postPrComment(octokit, repo, prNumber, body);
+    }
+  }
+
+  /**
+   * Advisory defect publication under the Jansoree app identity. Never touches
+   * the Seori Review check; failures degrade to a warn log so the acceptance
+   * guide flow stays intact. The summary posts on every gate run, including
+   * zero-finding runs.
+   */
+  private async publishJansoreeAdvisory(
+    repo: RepoRef,
+    prNumber: number,
+    headSha: string,
+    findings: readonly ReviewGatePublicFinding[],
+    publishedFingerprints: ReadonlySet<string>,
+  ): Promise<void> {
+    try {
+      if (!this.jansoree.available()) {
+        return;
+      }
+      const octokit = await this.jansoree.octokitFor(repo);
+      if (!octokit) {
+        return;
+      }
+      const fatalFindings = findings.filter(
+        (finding): finding is ReviewGatePublicFatalFinding => finding.kind === "fatal_defect",
+      );
+      const summary = formatJansoreeSummary({
+        headSha,
+        findings: fatalFindings,
+        markerPrefix: JANSOREE_ADVISORY_MARKER_PREFIX,
+      });
+      const newFindings = fatalFindings.filter(
+        (finding) => !finding.fingerprint || !publishedFingerprints.has(finding.fingerprint),
+      );
+      if (newFindings.length === 0) {
+        await postPrComment(octokit, repo, prNumber, summary);
+        return;
+      }
+      const inlineComments: InlineReviewComment[] = newFindings.map((finding, index) => ({
+        path: finding.evidence.file,
+        line: finding.evidence.line,
+        body: formatReviewGateFinding(finding, index + 1),
+      }));
+      await this.safeSubmitReview(octokit, repo, prNumber, headSha, "COMMENT", summary, inlineComments);
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, prNumber, headSha },
+        "Jansoree advisory publication failed",
+      );
     }
   }
 

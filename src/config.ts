@@ -21,6 +21,9 @@ export type Config = {
   minimaxApiKey: string;
   minimaxBaseUrl: string;
   minimaxTimeoutMs: number;
+  defectReviewEnabled: boolean;
+  reviewGithubAppId?: string;
+  reviewGithubPrivateKey?: string;
   aiReviewProviders: AiReviewProviderName[];
   aiReviewProviderWeights: AiReviewProviderWeights;
   aiReviewProviderFallbackOrder: AiReviewProviderName[];
@@ -227,6 +230,9 @@ export function loadConfig(): Config {
     minimaxApiKey,
     minimaxBaseUrl: process.env.MINIMAX_BASE_URL?.trim() || "https://api.minimax.io",
     minimaxTimeoutMs: optionalInt("MINIMAX_TIMEOUT_MS", 180_000),
+    defectReviewEnabled: optionalBool("DEFECT_REVIEW_ENABLED", true),
+    reviewGithubAppId: process.env.REVIEW_GITHUB_APP_ID?.trim() || undefined,
+    reviewGithubPrivateKey: process.env.REVIEW_GITHUB_PRIVATE_KEY?.replace(/\\n/g, "\n") || undefined,
     aiReviewProviders,
     aiReviewProviderWeights,
     aiReviewProviderFallbackOrder: optionalProviderList("AI_REVIEW_PROVIDER_FALLBACK_ORDER", ["minimax"]),
