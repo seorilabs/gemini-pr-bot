@@ -2223,8 +2223,14 @@ export class PrBot {
       }
     } catch (error) {
       this.logger.warn(
-        { error, repo: repo.fullName, prNumber, headSha: context.headSha },
-        "Gemini conservative review gate could not produce validated evidence",
+        {
+          error,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          repo: repo.fullName,
+          prNumber,
+          headSha: context.headSha,
+        },
+        "MiniMax conservative review gate could not produce validated evidence",
       );
       if (this.config.acceptanceGuideModeEnabled) {
         const guide: AcceptanceGuideOutput = {
