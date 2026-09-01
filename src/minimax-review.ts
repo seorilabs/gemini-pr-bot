@@ -250,7 +250,7 @@ function buildRequest(
 ): MiniMaxMessagesRequest {
   const systemPrompt = requirePrompt(options.systemPrompt, "systemPrompt");
   const userPrompt = requirePrompt(options.userPrompt, "userPrompt");
-  const maxTokens = options.maxTokens ?? (phase === "candidate" ? 24_576 : 8_192);
+  const maxTokens = options.maxTokens ?? (phase === "candidate" ? 24_576 : 16_384);
   if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 524_288) {
     throw new RangeError("maxTokens must be a safe integer between 1 and 524288");
   }

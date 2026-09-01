@@ -2879,6 +2879,7 @@ export class PrBot {
         promptVersion: REVIEW_GATE_PROMPT_VERSION,
         verdict,
         validationErrors: validationErrors.length,
+        validationErrorDetails: validationErrors.slice(0, 4),
       },
       "conservative review gate evaluated",
     );
