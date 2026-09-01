@@ -2049,6 +2049,48 @@ export class PrBot {
 
   // Conservative merge gate. The model extracts evidence; strict parsing,
   // grounding and the final PASS/FAIL/FOLLOW_UP/ABSTAIN decision remain host-controlled.
+
+  private static readonly REVIEW_GATE_PROGRESS_STEPS = [
+    "컨텍스트 수집",
+    "후보 추출",
+    "후보 반증",
+    "판정 집계",
+    "결과 게시",
+  ] as const;
+
+  /** Seori Review check에 단계별 진행 상태를 표시한다. 실패해도 게이트 흐름을 막지 않는다. */
+  private async reportGateProgress(
+    octokit: Octokit,
+    repo: RepoRef,
+    check: ActiveCheckRun | null,
+    step: number,
+    detailKo?: string,
+  ): Promise<void> {
+    if (!check) {
+      return;
+    }
+    const steps = PrBot.REVIEW_GATE_PROGRESS_STEPS;
+    const total = steps.length;
+    const current = Math.min(Math.max(step, 1), total);
+    const bar = "▰".repeat(current) + "▱".repeat(total - current);
+    const title = `${bar} ${current}/${total} ${steps[current - 1]} 중`;
+    const summary = steps
+      .map((name, index) => {
+        const marker = index + 1 < current ? "✅" : index + 1 === current ? "🔄" : "⬜";
+        const detail = index + 1 === current && detailKo ? ` — ${detailKo}` : "";
+        return `${marker} ${index + 1}. ${name}${detail}`;
+      })
+      .join("\n");
+    try {
+      await updateInProgressCheck(octokit, repo, check.checkRunId, title, summary);
+    } catch (error) {
+      this.logger.warn(
+        { error, repo: repo.fullName, checkRunId: check.checkRunId },
+        "gate progress update failed",
+      );
+    }
+  }
+
   private async runStructuredReview(
     octokit: Octokit,
     repo: RepoRef,
@@ -2161,6 +2203,7 @@ export class PrBot {
       ledgerSnapshot.records.map((record) => record.finding),
       evidenceCandidates,
     );
+    await this.reportGateProgress(octokit, repo, check, 2, "MiniMax 후보 추출 호출");
     const contextHash = this.reviewGateContextHash({
       context,
       trustedRequest,
@@ -2204,6 +2247,9 @@ export class PrBot {
         const guideMode = this.config.acceptanceGuideModeEnabled;
         const candidates =
           guideMode && !this.config.defectReviewEnabled ? [] : candidateResult.value.candidates;
+        if (candidates.length > 0) {
+          await this.reportGateProgress(octokit, repo, check, 3, `후보 ${candidates.length}건 반증`);
+        }
         const verificationResult = candidates.length === 0
           ? { verifications: [] }
           : (await this.ai.verifyReviewGateCandidates(
@@ -2349,6 +2395,7 @@ export class PrBot {
       ...filteredEnvelope,
       acceptanceCoverage: effectiveAcceptanceCoverage,
     };
+    await this.reportGateProgress(octokit, repo, check, 4);
     const pipeline = evaluateMiniMaxReviewGateCandidates({
       candidates: evaluatedEnvelope.candidates,
       verifications: evaluatedEnvelope.verifications,
@@ -2460,6 +2507,7 @@ export class PrBot {
           ...coverage.validationErrors,
         ],
       );
+      await this.reportGateProgress(octokit, repo, check, 5);
       if (await this.cancelTrackedCheckIfShuttingDown(
         check,
         "인수조건 가이드 취소",
@@ -2543,6 +2591,7 @@ export class PrBot {
       ],
     );
 
+    await this.reportGateProgress(octokit, repo, check, 5);
     if (await this.cancelTrackedCheckIfShuttingDown(check, "리뷰 취소", "리뷰 결과를 게시하기 전에 봇이 중지되었습니다.")) {
       return;
     }
