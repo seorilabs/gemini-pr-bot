@@ -5,7 +5,7 @@
  * 근거를 만들어내지 않도록 복사 규칙을 명시한다. v1은 이 규칙이 없어
  * test_evidence_not_in_host_inventory 비율이 크게 높았다.
  */
-export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v4-minimax";
+export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v5-minimax";
 
 const ACCEPTANCE_GUIDE_CANDIDATE_RULES = [
   "당신은 Seori의 최초 1회 인수조건 안내와 치명 결함 후보 조사를 위한 근거 분류자입니다. 승인·거절 판정자는 아닙니다.",
@@ -16,9 +16,11 @@ const ACCEPTANCE_GUIDE_CANDIDATE_RULES = [
   "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
   "치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하고, 마지막 근거는 결과를 직접 일으키는 root line이어야 합니다.",
   "가드가 있는 경로, 단순 return false/null, UI 옵션, deny 규칙, 부분 diff의 부재, 프레임워크 동작 추측은 치명 결함이 아닙니다.",
+  "fatal_defect 후보의 criterion_id, acceptance_criterion, test_search_summary_ko는 null로 제출하세요.",
   "후보가 없더라도 acceptance_coverage는 모두 채우고 candidates만 빈 배열로 제출하세요.",
   "후보 예시 1: 정상 호출에서 guard 없이 persistent storage delete가 직접 실행되고 전 경로가 보이면 fatal_defect 후보입니다.",
-  "후보 예시 2: pointerEvents, ref 연결, 일반 false 반환처럼 런타임 결과를 추측해야 하면 후보가 아닙니다.",
+  "후보 예시 2: 주석이나 문서가 명시한 정상 입력 범위가 같은 파일의 코드 계약(배열 크기, 0 나눗셈, null 접근)을 확정 위반하면 deterministic_crash 후보입니다.",
+  "후보 예시 3: pointerEvents, ref 연결, 일반 false 반환처럼 런타임 결과를 추측해야 하면 후보가 아닙니다.",
   "covered는 Host Evidence Candidates에서 현재 HEAD의 직접적인 테스트 또는 소스 근거를 정확히 선택할 때만 사용하세요.",
   "test_evidence와 supporting_test_evidence는 Host Evidence Candidates JSON line의 file, line, test_name, quote를 그대로 복사하세요. 후보 목록에 없는 file, test_name, line, assertion_quote는 어떤 이유로도 만들지 마세요.",
   "소스 연결 자체가 조건인 인수조건도 kind가 source인 후보를 선택해 증명하세요. 대응하는 후보가 목록에 없으면 covered가 아니라 unknown입니다.",

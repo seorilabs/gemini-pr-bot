@@ -250,7 +250,7 @@ function buildRequest(
 ): MiniMaxMessagesRequest {
   const systemPrompt = requirePrompt(options.systemPrompt, "systemPrompt");
   const userPrompt = requirePrompt(options.userPrompt, "userPrompt");
-  const maxTokens = options.maxTokens ?? (phase === "candidate" ? 16_384 : 8_192);
+  const maxTokens = options.maxTokens ?? (phase === "candidate" ? 24_576 : 8_192);
   if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 524_288) {
     throw new RangeError("maxTokens must be a safe integer between 1 and 524288");
   }
@@ -541,22 +541,28 @@ function validateCandidateResult(
     return fail("$: expected an object");
   }
   const errors: string[] = [];
-  validateExactKeys(raw, CANDIDATE_RESULT_KEYS, "$", errors);
+  // MiniMax-M3 sometimes omits contractual defaults entirely. Absent
+  // candidates mean "no candidate"; restore the default before validation.
+  const normalizedRaw: Record<string, unknown> = { ...raw };
+  if (!("candidates" in normalizedRaw)) {
+    normalizedRaw.candidates = [];
+  }
+  validateExactKeys(normalizedRaw, CANDIDATE_RESULT_KEYS, "$", errors);
   const acceptanceCoverage = validateAcceptanceCoverage(
     raw.acceptance_coverage,
     options.expectedAcceptanceCriteria,
     errors,
   );
-  if (!Array.isArray(raw.candidates)) {
+  if (!Array.isArray(normalizedRaw.candidates)) {
     errors.push("$.candidates: expected an array");
     return { ok: false, errors };
   }
-  if (raw.candidates.length > MINIMAX_REVIEW_MAX_CANDIDATES) {
+  if (normalizedRaw.candidates.length > MINIMAX_REVIEW_MAX_CANDIDATES) {
     errors.push(`$.candidates: expected at most ${MINIMAX_REVIEW_MAX_CANDIDATES} items`);
   }
 
   const candidates: MiniMaxReviewCandidate[] = [];
-  for (const [index, candidate] of raw.candidates.entries()) {
+  for (const [index, candidate] of normalizedRaw.candidates.entries()) {
     const parsed = validateCandidate(candidate, index);
     if (parsed.ok) {
       candidates.push(parsed.value);
@@ -646,15 +652,24 @@ function validateAcceptanceCoverage(
       errors.push(`${entryPath}: expected an object`);
       continue;
     }
-    validateExactKeys(entry, ACCEPTANCE_COVERAGE_KEYS, entryPath, errors);
+    // Absent evidence keys mean "no evidence"; restore contract defaults so
+    // shape drift never fails a row whose content is not load-bearing.
+    const entryRecord: Record<string, unknown> = { ...entry };
+    if (!("test_evidence" in entryRecord)) {
+      entryRecord.test_evidence = null;
+    }
+    if (!("supporting_test_evidence" in entryRecord)) {
+      entryRecord.supporting_test_evidence = [];
+    }
+    validateExactKeys(entryRecord, ACCEPTANCE_COVERAGE_KEYS, entryPath, errors);
 
-    const criterionId = readString(entry.criterion_id, `${entryPath}.criterion_id`, errors, 80);
+    const criterionId = readString(entryRecord.criterion_id, `${entryPath}.criterion_id`, errors, 80);
     const expectedId = `AC-${index + 1}`;
     if (criterionId && (!CRITERION_ID_PATTERN.test(criterionId) || criterionId !== expectedId)) {
       errors.push(`${entryPath}.criterion_id: expected ${JSON.stringify(expectedId)}`);
     }
     const echoedAcceptanceCriterion = readString(
-      entry.acceptance_criterion,
+      entryRecord.acceptance_criterion,
       `${entryPath}.acceptance_criterion`,
       errors,
       2_000,
@@ -665,18 +680,28 @@ function validateAcceptanceCoverage(
     // the exact host source instead of paying for a repair over harmless echo
     // differences (quotes, whitespace, or paraphrasing).
     const acceptanceCriterion = expectedSource ?? echoedAcceptanceCriterion;
-    const status = readEnum(entry.status, COVERAGE_STATUS_SET, `${entryPath}.status`, errors);
+    const status = readEnum(entryRecord.status, COVERAGE_STATUS_SET, `${entryPath}.status`, errors);
     // MiniMax-M3 habitually submits an empty evidence object instead of the
     // contractual null for uncovered rows. Normalize the clearly empty shape
     // before strict validation; any real content keeps the full checks.
-    const rawTestEvidence = normalizeEmptyEvidenceToNull(entry.test_evidence);
+    const nonCoveredStatus = status === "missing" || status === "unknown";
+    const normalizedTestEvidence = normalizeEmptyEvidenceToNull(entryRecord.test_evidence);
+    const rawTestEvidence =
+      nonCoveredStatus && normalizedTestEvidence !== null && !isRecord(normalizedTestEvidence)
+        ? null
+        : normalizedTestEvidence;
     const testEvidence = readAcceptanceTestEvidence(
       rawTestEvidence,
       `${entryPath}.test_evidence`,
       errors,
     );
+    const rawSupportingTestEvidence = Array.isArray(entryRecord.supporting_test_evidence)
+      ? entryRecord.supporting_test_evidence.filter((item) => normalizeEmptyEvidenceToNull(item) !== null)
+      : nonCoveredStatus
+        ? []
+        : entryRecord.supporting_test_evidence;
     const supportingTestEvidence = readAcceptanceTestEvidenceArray(
-      entry.supporting_test_evidence,
+      rawSupportingTestEvidence,
       `${entryPath}.supporting_test_evidence`,
       errors,
     );
@@ -820,9 +845,9 @@ function validateCandidate(raw: unknown, index: number): ValidationResult<MiniMa
     requirePresent(line, `${path}.line`, errors);
     requirePresent(codeQuote, `${path}.code_quote`, errors);
     requirePresent(fatalOutcome, `${path}.fatal_outcome`, errors);
-    requireNull(criterionId, `${path}.criterion_id`, errors);
-    requireNull(acceptanceCriterion, `${path}.acceptance_criterion`, errors);
-    requireNull(testSearchSummaryKo, `${path}.test_search_summary_ko`, errors);
+    // M3 habitually links a fatal candidate back to an AC id and echoes a
+    // test-search summary. The linkage is surplus to the contract, so it is
+    // dropped below instead of failing the row.
     if (evidence && evidence.length === 0) {
       errors.push(`${path}.evidence: fatal defect requires at least one code record`);
     }
@@ -891,9 +916,9 @@ function validateCandidate(raw: unknown, index: number): ValidationResult<MiniMa
       line,
       codeQuote,
       fatalOutcome: fatalOutcome as MiniMaxFatalOutcome | null,
-      criterionId,
-      acceptanceCriterion,
-      testSearchSummaryKo,
+      criterionId: kind === "fatal_defect" ? null : criterionId,
+      acceptanceCriterion: kind === "fatal_defect" ? null : acceptanceCriterion,
+      testSearchSummaryKo: kind === "fatal_defect" ? null : testSearchSummaryKo,
       evidence,
     },
   };

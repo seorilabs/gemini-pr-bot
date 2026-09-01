@@ -2767,7 +2767,7 @@ export class PrBot {
       "",
       "## 수행할 작업",
       this.config.acceptanceGuideModeEnabled
-        ? "각 인수조건의 현재 HEAD 근거 상태만 분류하고 candidates는 빈 배열로 submit_review 도구에 제출하세요."
+        ? "각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, 위 현재 HEAD 근거만으로 완전히 입증된 치명 후보를 최대 2개 candidates에 함께 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
         : "위 현재 HEAD 근거만으로 허용된 후보를 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
     ].join("\n");
     return { candidateSystem, candidateUser, verifierSystem };
