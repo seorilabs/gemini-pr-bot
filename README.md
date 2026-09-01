@@ -19,8 +19,9 @@ flowchart LR
 - `ACCEPTANCE_GUIDE_MODE_ENABLED=true`에서는 Draft/일반 PR의 최초 이벤트에만 AI 인수조건 가이드를 한 번 게시합니다.
 - 최초 가이드는 인수조건 근거 분류 호출을 최대 한 번만 사용하며, 후보 verifier나 형식 보정 재호출을 실행하지 않습니다.
 - 누락되거나 소명이 필요한 항목은 변경 파일 단위의 resolvable review thread로 남깁니다. `Seori Review` required check는 이 스레드가 남아 있으면 `action_required`, 모두 Resolve되면 `success`입니다.
-- 새 커밋과 추가 `/review` 요청은 AI를 다시 호출하지 않습니다. `pull_request.synchronize`와 `pull_request_review_thread.resolved`는 현재 미해결 Seori 가이드 스레드만 다시 집계합니다.
-- 인수조건 가이드는 GitHub approval, `REQUEST_CHANGES`, 자동 병합을 제출하지 않습니다. 모델/API/스레드 조회 오류도 안내 기능 자체의 실패로 처리해 병합을 막지 않습니다.
+- 최초 가이드 게시 후 새 커밋과 추가 `/review` 요청은 AI를 다시 호출하지 않습니다. `pull_request.synchronize`와 `pull_request_review_thread.resolved`/`unresolved`는 현재 Seori 가이드 스레드만 다시 집계합니다.
+- `@seori /reconcile-status`는 최초 가이드가 없어도 AI를 호출하지 않는 상태 복구 명령입니다. 가이드 누락을 성공으로 바꾸거나 새 가이드를 생성하지 않습니다.
+- 인수조건 가이드는 GitHub approval, `REQUEST_CHANGES`, 자동 병합을 제출하지 않습니다. 가이드 생성·게시 실패의 기존 `neutral` 정책은 유지하지만, 현재 스레드·HEAD·check 조회 실패는 성공이나 `neutral`로 바꾸지 않고 복구 작업을 실패 처리합니다.
 - `ACCEPTANCE_GUIDE_MODE_ENABLED=false`일 때만 아래의 기존 보수적 merge-gate/approval 동작을 사용합니다.
 - Reviews PRs automatically on `pull_request.opened` and `pull_request.reopened`.
 - Runs a conservative structured merge gate (`STRUCTURED_REVIEW_ENABLED`) instead of a general-purpose code review.
@@ -61,12 +62,40 @@ flowchart LR
 
 ## Commands
 
-`ACCEPTANCE_GUIDE_MODE_ENABLED=true`에서는 `/review`가 새 AI 리뷰를 시작하지 않고 기존
-가이드 스레드 상태만 갱신합니다. `/approve`, `/force-approve`, 자동 approval과 자동 병합은
+### 검사 상태만 복구
+
+운영 활성화 대기: 배포와 canary 검증이 승인되기 전에는 아래 명령을 실제 PR에 보내지 않습니다.
+이 명령을 모르는 이전 운영 버전은 일반 AI 질문으로 처리할 수 있습니다.
+
+`@seori /reconcile-status`는 webhook 누락 때문에 남은 `Seori Review` 상태를 복구합니다.
+PR 댓글, inline 댓글, review 본문에서 기존의 신뢰된 작성자만 실행할 수 있습니다.
+
+- `resolved`/`unresolved`와 복구 명령은 durable 대기열의 전용 worker가 처리하므로 긴 AI 리뷰를 기다리지 않습니다.
+- 같은 delivery는 한 번만 등록합니다. PR별 MySQL lock으로 여러 worker의 읽기·쓰기를 직렬화하고, 이미 같은 결과이면 GitHub check를 다시 쓰지 않습니다.
+- 현재 PR HEAD, 모든 review-thread 페이지, Seori의 실제 publication, 현재 App 소유의 check를 읽습니다. 쓰기 직전 HEAD가 바뀌었거나 조회가 불완전하면 중단합니다.
+- 쓰기 응답이 불명확하면 같은 처리 안에서 재시도하지 않습니다. durable 재시도는 GitHub를 다시 읽어 이미 반영된 쓰기를 반복하지 않습니다.
+- 감사에는 delivery ID, workflow ID, repo/PR/HEAD, check ID, 이전·다음 상태, 사유, `modelCalls=0`, `costMicros=0`만 남깁니다. 쓰기 의도와 검증된 결과를 구분하며 provider 오류 본문은 출력하지 않습니다.
+- 미해결 Seori thread는 `action_required`입니다. 사람·Copilot 피드백은 별도 리뷰로 유지하며 이 명령이 Resolve하거나 승인하지 않습니다. 닫히거나 병합된 PR은 변경하지 않습니다.
+
+로컬 테스트는 `npm run check`입니다. CI에서는 격리된 MySQL 8.4 서비스로 실제 두 connection의
+배타 잠금과 중복 delivery, 전용 worker 분리를 검증합니다. 로컬에 해당 서비스가 없으면 MySQL
+통합 테스트만 skip되며, production DB에 테스트를 실행하지 않습니다.
+
+운영 배포 후에는 별도 승인된 열린 canary PR에서 60초 이내 상태 갱신, 누락 webhook의 명령 복구,
+AI 호출 0건을 확인해야 합니다. [중앙 이슈 #44](https://github.com/seorilabs/.github/issues/44)의
+과거 Backoffice #155는 이미 병합된 PR이므로
+역사적 check를 성공으로 덮어써 복구를 주장하지 않습니다.
+
+### 일반 명령
+
+`ACCEPTANCE_GUIDE_MODE_ENABLED=true`에서 `/review`는 기존 가이드가 있으면 상태만 갱신하지만,
+최초 가이드가 없으면 AI를 호출할 수 있습니다. 상태만 복구하려면 `@seori /reconcile-status`를
+사용합니다. `/approve`, `/force-approve`, 자동 approval과 자동 병합은
 비활성화됩니다. 일반 멘션은 PR 맥락에 대한 답변만 남깁니다. 아래 approval 명령은
 legacy mode에서만 사용할 수 있습니다.
 
 ```text
+@seori /reconcile-status
 @gemini-cli /review
 @seorilabs-seori /review
 @seori-bot /review

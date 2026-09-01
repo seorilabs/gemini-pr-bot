@@ -19,6 +19,9 @@ import {
 } from "./review-finding-ledger.js";
 import { metrics, type ActiveWorkflowMetric, type WorkflowQueueMetric } from "./metrics.js";
 import { transientGitHubRetryDelayMs } from "./workflow-retry.js";
+import { withMysqlStatusReconciliationLock } from "./status-reconciliation.js";
+import { STATUS_RECONCILIATION_EVENT } from "./events.js";
+import { isStatusReconciliationEvent } from "./text.js";
 
 type Logger = {
   info: (value: unknown, message?: string) => void;
@@ -611,7 +614,7 @@ export class MysqlWorkflowStore {
     return result.affectedRows > 0;
   }
 
-  async leaseNext(workerId: string): Promise<WorkflowRun | null> {
+  async leaseNext(workerId: string, lane: "standard" | "status" = "standard"): Promise<WorkflowRun | null> {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
@@ -629,6 +632,7 @@ export class MysqlWorkflowStore {
         FROM gemini_pr_bot_workflows
         WHERE
           attempts < max_attempts
+          AND event_name ${lane === "status" ? "=" : "<>"} ?
           AND (
             (status = 'queued' AND next_run_at <= CURRENT_TIMESTAMP(3))
             OR (status = 'running' AND lease_expires_at < CURRENT_TIMESTAMP(3))
@@ -637,6 +641,7 @@ export class MysqlWorkflowStore {
         LIMIT 1
         FOR UPDATE SKIP LOCKED
         `,
+        [STATUS_RECONCILIATION_EVENT],
       );
 
       const row = rows[0];
@@ -769,6 +774,10 @@ export class MysqlWorkflowStore {
       `,
       [record.checkRunId, record.kind, record.repoFullName, record.prNumber, record.headSha, id],
     );
+  }
+
+  async withStatusReconciliationLock<T>(key: string, task: () => Promise<T>): Promise<T> {
+    return withMysqlStatusReconciliationLock(this.pool, key, task);
   }
 
   async recordWorkflowTarget(id: number, record: WorkflowTargetRecord): Promise<void> {
@@ -1000,6 +1009,7 @@ export class WorkflowEngine {
   private readonly workerId = `${os.hostname()}-${process.pid}-${randomUUID()}`;
   private running = false;
   private loopPromise: Promise<void> | null = null;
+  private statusLoopPromise: Promise<void> | null = null;
 
   constructor(
     private readonly app: App,
@@ -1012,7 +1022,8 @@ export class WorkflowEngine {
   async start(): Promise<void> {
     await this.store.init();
     this.running = true;
-    this.loopPromise = this.loop();
+    this.loopPromise = this.loop("standard");
+    this.statusLoopPromise = this.loop("status");
     this.logger.info(
       {
         workerId: this.workerId,
@@ -1025,11 +1036,15 @@ export class WorkflowEngine {
 
   async enqueue(eventName: string, event: WebhookEvent): Promise<void> {
     const dedupeKey = this.dedupeKey(eventName, event);
-    const inserted = await this.store.enqueue(eventName, dedupeKey, event.payload);
-    metrics.recordWorkflowEnqueued(eventName, "webhook", inserted);
+    const statusOnly = isStatusReconciliationEvent(eventName, event.payload, this.config);
+    const queuedEvent = statusOnly ? STATUS_RECONCILIATION_EVENT : eventName;
+    const payload = statusOnly ? { ...event.payload, status_reconciliation_source: eventName } : event.payload;
+    const inserted = await this.store.enqueue(queuedEvent, dedupeKey, payload);
+    metrics.recordWorkflowEnqueued(queuedEvent, "webhook", inserted);
     this.logger.info(
       {
-        event: eventName,
+        event: queuedEvent,
+        sourceEvent: eventName,
         dedupeKey,
         inserted,
         repo: event.payload.repository?.full_name,
@@ -1058,7 +1073,7 @@ export class WorkflowEngine {
 
   async stop(): Promise<void> {
     this.running = false;
-    await this.loopPromise;
+    await Promise.all([this.loopPromise, this.statusLoopPromise]);
     await this.store.end();
   }
 
@@ -1078,12 +1093,12 @@ export class WorkflowEngine {
     await this.store.failExpiredFinalAttempt(run, message);
   }
 
-  private async loop(): Promise<void> {
+  private async loop(lane: "standard" | "status"): Promise<void> {
     while (this.running) {
       try {
         let processed = false;
         do {
-          processed = (await this.processExpiredFinalAttempt()) || (await this.processOne());
+          processed = (lane === "standard" && await this.processExpiredFinalAttempt()) || (await this.processOne(lane));
         } while (this.running && processed);
       } catch (error) {
         this.logger.error({ error }, "workflow worker loop failed");
@@ -1172,8 +1187,8 @@ export class WorkflowEngine {
     );
   }
 
-  private async processOne(): Promise<boolean> {
-    const run = await this.store.leaseNext(this.workerId);
+  private async processOne(lane: "standard" | "status"): Promise<boolean> {
+    const run = await this.store.leaseNext(this.workerId, lane);
     if (!run) {
       return false;
     }
@@ -1196,10 +1211,12 @@ export class WorkflowEngine {
         throw new Error("Webhook payload does not include installation.id");
       }
 
-      const installationToken = await this.createInstallationToken(installationId);
+      const installationToken = run.eventName === STATUS_RECONCILIATION_EVENT ? undefined : await this.createInstallationToken(installationId);
       const octokit = await this.app.getInstallationOctokit(installationId);
       await this.bot.processEvent(octokit, run.eventName, run.payload, {
         workflowId: run.id,
+        deliveryId: run.dedupeKey,
+        withStatusReconciliationLock: (key, task) => this.store.withStatusReconciliationLock(key, task),
         createdAt: run.createdAt,
         checkRunId: run.checkRunId,
         installationId,

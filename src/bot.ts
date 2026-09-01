@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AiReviewProviderName, Config } from "./config.js";
-import { CI_RECHECK_EVENT, STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
+import { CI_RECHECK_EVENT, STATUS_RECONCILIATION_EVENT, STALE_REVIEW_SELF_TRIGGER_EVENT, STALE_SELF_TRIGGER_ACTION_KIND } from "./events.js";
 import { AiClient, isAiProviderCooldownError } from "./ai-client.js";
 import { metrics, type GaugeSample } from "./metrics.js";
 import {
@@ -9,7 +9,6 @@ import {
   listExplicitAcceptanceCriteria,
   closePullRequest,
   completeCheck,
-  completeLatestOwnReviewCheck,
   completeLatestOwnReviewCheckAsSuccess,
   createInProgressCheck,
   getPullRequestStatus,
@@ -54,7 +53,8 @@ import {
   type StoredFinding,
 } from "./review.js";
 import { OperationsNotifier, type ApprovalNotificationMode } from "./notifications.js";
-import { parseBotCommand, truncate } from "./text.js";
+import { isStatusReconciliationEvent, parseBotCommand, truncate } from "./text.js";
+import { reconcileAcceptanceGuideStatus, type StatusReconciliationLock } from "./status-reconciliation.js";
 import type { ReviewRunRecord } from "./review-run.js";
 import { MINIMAX_REVIEW_MODEL, type MiniMaxReviewCandidate } from "./minimax-review.js";
 import {
@@ -118,7 +118,6 @@ import {
 import {
   ACCEPTANCE_GUIDE_INCOMPLETE_MARKER,
   ACCEPTANCE_GUIDE_PUBLICATION_MARKER,
-  acceptanceGuideCheckState,
   buildAcceptanceGuide,
   formatAcceptanceGuideThread,
   type AcceptanceGuideOutput,
@@ -219,6 +218,8 @@ export type ActiveReviewWorkflow = {
 
 export type WorkflowExecution = {
   workflowId?: number;
+  deliveryId?: string;
+  withStatusReconciliationLock?: StatusReconciliationLock;
   createdAt?: Date | string;
   checkRunId?: number | null;
   installationId?: number;
@@ -330,6 +331,14 @@ export class PrBot {
     payload: any,
     workflow?: WorkflowExecution,
   ): Promise<void> {
+    if (eventName === STATUS_RECONCILIATION_EVENT) {
+      const source = payload.status_reconciliation_source;
+      if (!isStatusReconciliationEvent(source, payload, this.config)) {
+        throw new Error("SEORI_STATUS_EVENT_INVALID");
+      }
+      await this.processEvent(octokit, source, payload, workflow);
+      return;
+    }
     if (eventName === "issue_comment") {
       await this.handleIssueComment(octokit, payload, workflow);
       return;
@@ -346,7 +355,7 @@ export class PrBot {
     }
 
     if (eventName === "pull_request_review_thread") {
-      await this.handlePullRequestReviewThread(octokit, payload);
+      await this.handlePullRequestReviewThread(octokit, payload, workflow);
       return;
     }
 
@@ -476,6 +485,11 @@ export class PrBot {
       return;
     }
 
+    if (command.mode === "reconcile_status") {
+      await this.refreshAcceptanceGuideCheck(octokit, repo, issueNumber, workflow, "issue_comment.reconcile-status");
+      return;
+    }
+
     if (command.mode === "help") {
       await postPrComment(octokit, repo, issueNumber, this.helpText());
       return;
@@ -548,6 +562,10 @@ export class PrBot {
     }
 
     const prNumber = payload.pull_request.number;
+    if (command.mode === "reconcile_status") {
+      await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber, workflow, "review_comment.reconcile-status");
+      return;
+    }
     if (
       (await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) ||
       (await this.shouldIgnoreResolvedReviewThread(octokit, repo, prNumber, payload.comment.id))
@@ -672,6 +690,11 @@ export class PrBot {
 
     const prNumber = payload.pull_request.number;
     if (await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) {
+      return;
+    }
+
+    if (command.mode === "reconcile_status") {
+      await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber, workflow, "pull_request_review.reconcile-status");
       return;
     }
 
@@ -812,8 +835,9 @@ export class PrBot {
     }
   }
 
-  private async handlePullRequestReviewThread(octokit: Octokit, payload: any): Promise<void> {
-    if (!this.config.acceptanceGuideModeEnabled || !shouldHandleRepository(payload, this.config)) {
+  private async handlePullRequestReviewThread(octokit: Octokit, payload: any, workflow?: WorkflowExecution): Promise<void> {
+    if (!this.config.acceptanceGuideModeEnabled || !shouldHandleRepository(payload, this.config) ||
+        !["resolved", "unresolved"].includes(payload.action)) {
       return;
     }
     const repo = repoFromPayload(payload);
@@ -821,7 +845,7 @@ export class PrBot {
     if (!Number.isFinite(prNumber) || await this.shouldIgnoreClosedPullRequest(octokit, repo, prNumber)) {
       return;
     }
-    await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber);
+    await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber, workflow, `pull_request_review_thread.${payload.action}`);
   }
 
   private async handleStaleReviewSelfTrigger(
@@ -843,7 +867,7 @@ export class PrBot {
       return;
     }
     if (this.config.acceptanceGuideModeEnabled) {
-      await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber);
+      await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber, workflow, STALE_REVIEW_SELF_TRIGGER_EVENT);
       return;
     }
 
@@ -1074,7 +1098,7 @@ export class PrBot {
         { repo: repo.fullName, prNumber, source: trigger.source },
         "acceptance guide already published; refreshing thread check without AI",
       );
-      await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber);
+      await this.refreshAcceptanceGuideCheck(octokit, repo, prNumber, workflow, trigger.source);
       return;
     }
 
@@ -1085,53 +1109,25 @@ export class PrBot {
     octokit: Octokit,
     repo: RepoRef,
     prNumber: number,
+    workflow?: WorkflowExecution,
+    source = "status_reconciliation",
   ): Promise<void> {
-    const status = await getPullRequestStatus(octokit, repo, prNumber);
-    if (this.isClosedPullRequest(status)) {
+    const audit = { repo: repo.fullName, prNumber, source, workflowId: workflow?.workflowId ?? null,
+      deliveryId: workflow?.deliveryId ?? null, modelCalls: 0, costMicros: 0 };
+    if (!this.config.acceptanceGuideModeEnabled) {
+      this.logger.info({ ...audit, action: "skipped", reason: "ACCEPTANCE_GUIDE_MODE_DISABLED" }, "Seori status reconciliation");
       return;
     }
-
     try {
-      const incomplete = await pullRequestConversationHasMarker(
-        octokit,
-        repo,
-        prNumber,
-        ACCEPTANCE_GUIDE_INCOMPLETE_MARKER,
-      );
-      if (incomplete) {
-        await completeLatestOwnReviewCheck(
-          octokit,
-          repo,
-          status.headSha,
-          "neutral",
-          "인수조건 스레드 게시 불완전",
-          "최초 안내 일부를 resolvable review thread로 게시하지 못했습니다. 안내 기능의 오류만으로 병합을 막지 않습니다.",
-        );
-        return;
-      }
-      const threads = await listReviewThreads(octokit, repo, prNumber);
-      const state = acceptanceGuideCheckState(threads);
-      await completeLatestOwnReviewCheck(
-        octokit,
-        repo,
-        status.headSha,
-        state.conclusion,
-        state.title,
-        state.summary,
-      );
+      const result = await reconcileAcceptanceGuideStatus({ octokit, repo, prNumber, appId: this.config.githubAppId,
+        withLock: workflow?.withStatusReconciliationLock,
+        beforeWrite: (record) => this.logger.info({ ...audit, ...record, stage: "mutation_intent" }, "Seori status reconciliation"),
+      });
+      this.logger.info({ ...audit, ...result, stage: "result" }, "Seori status reconciliation");
     } catch (error) {
-      this.logger.warn(
-        { error, repo: repo.fullName, prNumber, headSha: status.headSha },
-        "acceptance guide thread refresh failed",
-      );
-      await completeLatestOwnReviewCheck(
-        octokit,
-        repo,
-        status.headSha,
-        "neutral",
-        "인수조건 스레드 상태 확인 불가",
-        "GitHub review thread 상태를 읽지 못했습니다. 안내 기능의 오류만으로 병합을 막지 않습니다.",
-      );
+      // The reconciler throws fixed public codes, never provider error bodies or request headers.
+      this.logger.warn({ ...audit, action: "blocked", reason: (error as Error).message }, "Seori status reconciliation");
+      throw error;
     }
   }
 
@@ -4058,7 +4054,8 @@ export class PrBot {
         "Seori는 현재 인수조건 안내 모드입니다.",
         "",
         "- PR 최초 생성 시 인수조건 가이드를 한 번만 게시합니다.",
-        "- `/review`는 AI를 다시 호출하지 않고 기존 가이드 스레드의 Resolve 상태만 갱신합니다.",
+        "- `@seori /reconcile-status`는 최초 가이드 유무와 무관하게 AI를 호출하지 않고 현재 상태만 확인합니다.",
+        "- `/review`는 기존 가이드가 있으면 상태만 갱신하지만, 최초 가이드가 없으면 AI를 호출할 수 있습니다.",
         "- 누락 또는 소명이 필요한 review thread에 답한 뒤 Resolve해 주세요.",
         "- Seori는 GitHub approval, REQUEST_CHANGES 또는 자동 병합을 수행하지 않습니다.",
         "- 일반 질문에는 PR 맥락을 바탕으로 답변만 남깁니다.",
