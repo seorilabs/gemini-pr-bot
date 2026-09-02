@@ -2247,7 +2247,7 @@ export class PrBot {
 
     let envelope: MiniMaxReviewGateCacheEnvelope;
     let extractionFailures: string[] = [];
-    let defectReviewFailed = false;
+    let failedExtractionPasses: Array<"coverage" | "defect"> = [];
     let verificationFailures: string[] = [];
     try {
       if (cacheEnvelope) {
@@ -2286,7 +2286,7 @@ export class PrBot {
           );
         }
         extractionFailures = extraction.failures.map(formatExtractionFailure);
-        defectReviewFailed = extraction.failures.some((failure) => failure.pass === "defect");
+        failedExtractionPasses = extraction.failures.map((failure) => failure.pass);
         const candidates = extraction.candidates;
         if (candidates.length > 0) {
           await this.reportGateProgress(octokit, repo, check, 3, `후보 ${candidates.length}건 개별 반증`);
@@ -2514,6 +2514,7 @@ export class PrBot {
       !pipeline.inputValid ||
       !context.fatalContextComplete ||
       !coverage.complete ||
+      failedExtractionPasses.length > 0 ||
       blockingOpenFindings.length !== openFindings.length ||
       pipeline.rejected.some((rejected) => {
         const verification = evaluatedEnvelope.verifications.find((item) => item.candidateId === rejected.candidateId);
@@ -2538,6 +2539,7 @@ export class PrBot {
       candidates: evaluatedEnvelope.candidates,
       verifications: evaluatedEnvelope.verifications,
       unconfirmedOpenFindings,
+      failedExtractionPasses,
     });
     if (this.config.acceptanceGuideModeEnabled) {
       const guide = buildAcceptanceGuide({
@@ -2561,7 +2563,9 @@ export class PrBot {
           ? "FAIL"
           : guide.items.length > 0
             ? "FOLLOW_UP"
-            : "PASS",
+            : failedExtractionPasses.length > 0
+              ? "ABSTAIN"
+              : "PASS",
         [
           ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
           ...coverage.validationErrors,
@@ -2600,7 +2604,7 @@ export class PrBot {
             context.headSha,
             publicFindings,
             ledgerSnapshot.publishedFingerprints,
-            defectReviewFailed,
+            failedExtractionPasses.includes("defect"),
           );
         }
       }
