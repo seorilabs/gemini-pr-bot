@@ -12,7 +12,6 @@ import {
   VERIFIER_PATCH_CHARS_PER_PATH,
   buildReviewGateVerifierUserPrompt,
   formatVerificationCallFailure,
-  hasVerificationCallFailure,
   mergedLineWindows,
   referencedCandidatePaths,
   renderNumberedExcerpt,
@@ -195,9 +194,6 @@ test("후보 하나의 검증 호출이 실패하면 그 후보만 host uncertai
 
   const formatted = formatVerificationCallFailure(result.failures[0]!);
   assert.equal(formatted, `${VERIFICATION_CALL_FAILED_PREFIX}C-2: MiniMax request timed out after 300000ms`);
-  assert.equal(hasVerificationCallFailure([formatted]), true);
-  assert.equal(hasVerificationCallFailure(["AC-1: acceptance_coverage_unknown"]), false);
-  assert.equal(hasVerificationCallFailure(null), false);
 
   const pipeline = evaluateMiniMaxReviewGateCandidates({
     candidates,

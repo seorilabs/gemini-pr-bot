@@ -344,3 +344,23 @@ test("잔소리 요약은 치명 결함만 세어 위치와 함께 나열한다"
   assert.match(summary, /`src\/save\.ts:42`/u);
   assert.doesNotMatch(summary, /AC-1 테스트 없음/u);
 });
+
+test("잔소리 요약은 결함 검토 호출이 실패하면 지적 없음으로 위장하지 않는다", () => {
+  const failed = formatJansoreeSummary({
+    headSha: "abc1234",
+    findings: [],
+    markerPrefix: "jansoree:advisory",
+    defectReviewFailed: true,
+  });
+  assert.match(failed, /결함 검토 모델 호출이 실패해 이번 HEAD의 결함 여부를 판정하지 못했습니다/u);
+  assert.doesNotMatch(failed, /지적할 결함을 찾지 못했습니다/u);
+  assert.match(failed, /advisory이며 병합을 막지 않습니다/u);
+
+  const withFinding = formatJansoreeSummary({
+    headSha: "abc1234",
+    findings: [fatalFinding()],
+    markerPrefix: "jansoree:advisory",
+    defectReviewFailed: true,
+  });
+  assert.match(withFinding, /발견한 결함: 1건/u);
+});

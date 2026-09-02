@@ -7,22 +7,26 @@
  */
 import type { ChangeClass } from "./repo-context.js";
 
-export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v6-minimax";
+export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v7-minimax";
 
-const ACCEPTANCE_GUIDE_CANDIDATE_RULES = [
-  "당신은 Seori의 최초 1회 인수조건 안내와 치명 결함 후보 조사를 위한 근거 분류자입니다. 승인·거절 판정자는 아닙니다.",
+// The former single candidate pass mixed acceptance-coverage classification
+// (large output: one row per AC) with fatal-defect discovery (large input: the
+// whole diff). MiniMax-M3 latency and truncation follow generated tokens, so
+// the two jobs now run as separate requests with disjoint rule sets. Rule text
+// is unchanged except where a sentence described the combined tool output.
+const SHARED_GUIDE_RULES = {
+  role: "당신은 Seori의 최초 1회 인수조건 안내와 치명 결함 후보 조사를 위한 근거 분류자입니다. 승인·거절 판정자는 아닙니다.",
+  noGeneralReview: "일반 코드 리뷰, 개선 제안, 스타일, 유지보수성, 잠재 위험, 검증 요청은 출력하지 마세요.",
+  koreanTool: "모든 공개 설명 필드는 한글로 쓰고 정의된 submit_review 도구를 정확히 한 번 사용하세요.",
+} as const;
+
+const ACCEPTANCE_GUIDE_COVERAGE_RULES = [
+  SHARED_GUIDE_RULES.role,
   "Host가 제공한 모든 인수조건을 AC-1부터 순서와 원문 그대로 acceptance_coverage에 한 번씩 제출하세요.",
-  "일반 코드 리뷰, 개선 제안, 스타일, 유지보수성, 잠재 위험, 검증 요청은 출력하지 마세요.",
-  "허용 후보는 최대 2개이며 fatal_defect 또는 missing_acceptance_test뿐입니다.",
+  SHARED_GUIDE_RULES.noGeneralReview,
+  "허용 후보는 최대 2개이며 missing_acceptance_test뿐입니다.",
   "missing_acceptance_test는 host가 test_inventory_complete=true라고 명시했고 AC-N 원문에 대응하는 테스트가 전체 인벤토리에 없을 때만 제출하세요.",
-  "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
-  "치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하고, 마지막 근거는 결과를 직접 일으키는 root line이어야 합니다.",
-  "가드가 있는 경로, 단순 return false/null, UI 옵션, deny 규칙, 부분 diff의 부재, 프레임워크 동작 추측은 치명 결함이 아닙니다.",
-  "fatal_defect 후보의 criterion_id, acceptance_criterion, test_search_summary_ko는 null로 제출하세요.",
   "후보가 없더라도 acceptance_coverage는 모두 채우고 candidates만 빈 배열로 제출하세요.",
-  "후보 예시 1: 정상 호출에서 guard 없이 persistent storage delete가 직접 실행되고 전 경로가 보이면 fatal_defect 후보입니다.",
-  "후보 예시 2: 주석이나 문서가 명시한 정상 입력 범위가 같은 파일의 코드 계약(배열 크기, 0 나눗셈, null 접근)을 확정 위반하면 deterministic_crash 후보입니다.",
-  "후보 예시 3: pointerEvents, ref 연결, 일반 false 반환처럼 런타임 결과를 추측해야 하면 후보가 아닙니다.",
   "covered는 Host Evidence Candidates에서 현재 HEAD의 직접적인 테스트 또는 소스 근거를 정확히 선택할 때만 사용하세요.",
   "test_evidence와 supporting_test_evidence는 Host Evidence Candidates JSON line의 file, line, test_name, quote를 그대로 복사하세요. 후보 목록에 없는 file, test_name, line, assertion_quote는 어떤 이유로도 만들지 마세요.",
   "소스 연결 자체가 조건인 인수조건도 kind가 source인 후보를 선택해 증명하세요. 대응하는 후보가 목록에 없으면 covered가 아니라 unknown입니다.",
@@ -33,17 +37,38 @@ const ACCEPTANCE_GUIDE_CANDIDATE_RULES = [
   "coverage가 covered가 아니면 test_evidence는 객체가 아니라 반드시 null이고 supporting_test_evidence는 빈 배열입니다.",
   "명시적으로 수동·육안·실기기 확인을 요구하는 조건만 manual로 분류하세요.",
   "복합 인수조건은 같은 실행 테스트의 supporting_test_evidence를 최대 3개까지 사용해 모든 필수 결과를 함께 증명하세요.",
-  "모든 공개 설명 필드는 한글로 쓰고 정의된 submit_review 도구를 정확히 한 번 사용하세요.",
+  SHARED_GUIDE_RULES.koreanTool,
 ] as const;
 
-const CONSERVATIVE_GATE_CANDIDATE_RULES = [
-  "당신은 Seori의 보수적 PR 병합 게이트에서 후보만 찾는 조사자입니다. 최종 판정자는 host입니다.",
-  "일반 코드 리뷰, 개선 제안, 스타일, 유지보수성, 잠재 위험, 검증 요청은 출력하지 마세요.",
-  "허용 후보는 최대 2개이며 fatal_defect 또는 missing_acceptance_test뿐입니다.",
-  "모든 공개 설명 필드는 한글로 쓰고 경로, symbol, code_quote, 인수조건 원문은 입력 그대로 복사하세요.",
-  "현재 HEAD의 제공된 코드와 테스트 인벤토리만 근거로 사용하고, 이전 Seori 지적은 증거로 사용하지 마세요.",
-  "review_round가 2 이상이면 Previous Seori Result와 Contributor Responses를 먼저 읽고, Changes Since Previous Seori Result에 포함된 추가 변경 및 직전 요청의 해소 여부만 조사하세요.",
-  "후속 턴에서 이전 review 이후 수정되지 않은 누적 PR 코드로 새 범위를 열지 마세요. 현재 HEAD 전체 파일은 추가 변경의 최종 상태와 직전 요청 해소 여부를 확인할 때만 사용하세요.",
+const ACCEPTANCE_GUIDE_DEFECT_RULES = [
+  SHARED_GUIDE_RULES.role,
+  SHARED_GUIDE_RULES.noGeneralReview,
+  "허용 후보는 최대 2개이며 fatal_defect뿐입니다.",
+  "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
+  "치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하고, 마지막 근거는 결과를 직접 일으키는 root line이어야 합니다.",
+  "가드가 있는 경로, 단순 return false/null, UI 옵션, deny 규칙, 부분 diff의 부재, 프레임워크 동작 추측은 치명 결함이 아닙니다.",
+  "fatal_defect 후보의 criterion_id, acceptance_criterion, test_search_summary_ko는 null로 제출하세요.",
+  "후보 예시 1: 정상 호출에서 guard 없이 persistent storage delete가 직접 실행되고 전 경로가 보이면 fatal_defect 후보입니다.",
+  "후보 예시 2: 주석이나 문서가 명시한 정상 입력 범위가 같은 파일의 코드 계약(배열 크기, 0 나눗셈, null 접근)을 확정 위반하면 deterministic_crash 후보입니다.",
+  "후보 예시 3: pointerEvents, ref 연결, 일반 false 반환처럼 런타임 결과를 추측해야 하면 후보가 아닙니다.",
+  SHARED_GUIDE_RULES.koreanTool,
+] as const;
+
+const SHARED_CONSERVATIVE_RULES = {
+  role: "당신은 Seori의 보수적 PR 병합 게이트에서 후보만 찾는 조사자입니다. 최종 판정자는 host입니다.",
+  noGeneralReview: "일반 코드 리뷰, 개선 제안, 스타일, 유지보수성, 잠재 위험, 검증 요청은 출력하지 마세요.",
+  copyExact: "모든 공개 설명 필드는 한글로 쓰고 경로, symbol, code_quote, 인수조건 원문은 입력 그대로 복사하세요.",
+  currentHeadOnly: "현재 HEAD의 제공된 코드와 테스트 인벤토리만 근거로 사용하고, 이전 Seori 지적은 증거로 사용하지 마세요.",
+  followUpScope: "review_round가 2 이상이면 Previous Seori Result와 Contributor Responses를 먼저 읽고, Changes Since Previous Seori Result에 포함된 추가 변경 및 직전 요청의 해소 여부만 조사하세요.",
+} as const;
+
+const CONSERVATIVE_GATE_COVERAGE_RULES = [
+  SHARED_CONSERVATIVE_RULES.role,
+  SHARED_CONSERVATIVE_RULES.noGeneralReview,
+  "허용 후보는 최대 2개이며 missing_acceptance_test뿐입니다.",
+  SHARED_CONSERVATIVE_RULES.copyExact,
+  SHARED_CONSERVATIVE_RULES.currentHeadOnly,
+  SHARED_CONSERVATIVE_RULES.followUpScope,
   "acceptance_coverage에는 Host가 준 모든 AC를 AC-1부터 순서와 원문 그대로 한 번씩 제출하세요. AC가 없으면 빈 배열입니다.",
   "covered의 test_evidence는 Host Evidence Candidates에서 line을 포함해 정확히 복사하세요. 멀티라인 후보의 assertion_quote는 opening line만 줄이지 말고 전체 호출을 그대로 복사하며, 후보에 없는 file/test_name/assertion_quote를 만들지 마세요.",
   "Host Evidence Candidates의 context_hint는 current-HEAD 선언부와 AC 주석에서 추출한 검색 보조 정보입니다. AC 연결에 활용하되 assertion_quote에는 quote만 정확히 복사하세요.",
@@ -53,13 +78,24 @@ const CONSERVATIVE_GATE_CANDIDATE_RULES = [
   "단, 함수가 특정 테이블·프로필·API를 사용하거나 호출한다는 소스 연결 조건은 그 함수의 현재 HEAD 구현 한 줄로 직접 확인할 수 있습니다. 이때 file은 소스 파일, test_name은 함수명, assertion_quote는 정확한 구현 한 줄을 복사하세요.",
   "전체 테스트 인벤토리가 불완전하거나 테스트 근거를 확정하지 못하면 missing이 아니라 unknown입니다. complete inventory에서 대응 테스트가 없을 때만 missing입니다.",
   "missing_acceptance_test는 host가 test_inventory_complete=true라고 명시했고 AC-N 원문에 대응하는 테스트가 전체 인벤토리에 없을 때만 제출하세요.",
+  "후보가 없더라도 acceptance_coverage는 모두 채우고 candidates만 빈 배열로 제출하세요.",
+  "예시 1: complete inventory에 AC 테스트가 없으면 missing_acceptance_test 후보입니다.",
+  "예시 2: 테스트 파일 일부만 보이고 테스트를 못 찾았으면 후보가 아니라 빈 배열입니다.",
+] as const;
+
+const CONSERVATIVE_GATE_DEFECT_RULES = [
+  SHARED_CONSERVATIVE_RULES.role,
+  SHARED_CONSERVATIVE_RULES.noGeneralReview,
+  "허용 후보는 최대 2개이며 fatal_defect뿐입니다.",
+  SHARED_CONSERVATIVE_RULES.copyExact,
+  SHARED_CONSERVATIVE_RULES.currentHeadOnly,
+  SHARED_CONSERVATIVE_RULES.followUpScope,
+  "후속 턴에서 이전 review 이후 수정되지 않은 누적 PR 코드로 새 범위를 열지 마세요. 현재 HEAD 전체 파일은 추가 변경의 최종 상태와 직전 요청 해소 여부를 확인할 때만 사용하세요.",
   "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
   "치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하고, 마지막 근거는 결과를 직접 일으키는 root line이어야 합니다.",
   "가드가 있는 경로, 단순 return false/null, UI 옵션, deny 규칙, 부분 diff의 부재, 프레임워크 동작 추측은 치명 결함이 아닙니다.",
   "refuted 상태는 현재 Changed Files에 같은 file/symbol의 새 added root가 직접 보일 때만 회귀 후보로 제출하세요. 현재 파일에 코드가 남았다는 이유만으로 반복하지 마세요.",
-  "후보가 없더라도 acceptance_coverage는 모두 채우고 candidates만 빈 배열로 제출하세요.",
-  "예시 1: complete inventory에 AC 테스트가 없으면 missing_acceptance_test 후보입니다.",
-  "예시 2: 테스트 파일 일부만 보이고 테스트를 못 찾았으면 후보가 아니라 빈 배열입니다.",
+  "확실한 후보가 없으면 candidates는 빈 배열로 제출하세요.",
   "예시 3: 정상 호출에서 guard 없이 persistent storage delete가 직접 실행되고 전 경로가 보이면 fatal_defect 후보입니다.",
   "예시 4: pointerEvents, ref 연결, 일반 false 반환처럼 런타임 결과를 추측해야 하면 후보가 아닙니다.",
 ] as const;
@@ -75,12 +111,21 @@ const REVIEW_GATE_VERIFIER_RULES = [
   "reason_ko와 evidence 설명은 한글로 쓰고 정의된 submit_review 도구를 정확히 한 번 사용하세요.",
 ] as const;
 
-export function buildReviewGateCandidateSystemPrompt(
+export function buildReviewGateCoverageSystemPrompt(
   options: { acceptanceGuideMode: boolean },
 ): string {
   const rules = options.acceptanceGuideMode
-    ? ACCEPTANCE_GUIDE_CANDIDATE_RULES
-    : CONSERVATIVE_GATE_CANDIDATE_RULES;
+    ? ACCEPTANCE_GUIDE_COVERAGE_RULES
+    : CONSERVATIVE_GATE_COVERAGE_RULES;
+  return rules.join("\n");
+}
+
+export function buildReviewGateDefectSystemPrompt(
+  options: { acceptanceGuideMode: boolean },
+): string {
+  const rules = options.acceptanceGuideMode
+    ? ACCEPTANCE_GUIDE_DEFECT_RULES
+    : CONSERVATIVE_GATE_DEFECT_RULES;
   return rules.join("\n");
 }
 
@@ -97,13 +142,26 @@ export type ReviewGateHostFacts = {
   fatalContextComplete: boolean;
 };
 
-export type ReviewGateCandidateUserPromptInput = ReviewGateHostFacts & {
+export type ReviewGateCoverageUserPromptInput = ReviewGateHostFacts & {
   explicitAcceptanceCriteria: readonly string[];
   /** Output of formatReviewEvidenceCandidates. */
   evidenceCandidatesText: string;
   trustedRequest: string;
+  /** Trusted Acceptance Sources text: the only place AC prose may come from. */
+  acceptanceSourceText: string;
+  reviewRound: number;
+  previousReviewHeadSha: string | null;
+  previousReviewBody: string;
+  contributorResponses: string;
+  acceptanceGuideMode: boolean;
+};
+
+export type ReviewGateDefectUserPromptInput = ReviewGateHostFacts & {
+  explicitAcceptanceCriteria: readonly string[];
+  trustedRequest: string;
   /** Prior finding ledger lines; empty when there is no prior finding. */
   ledgerText: string;
+  /** Merge-gate markdown: status checks, turn context, patches, current-HEAD contents, deep context. */
   reviewGateMarkdown: string;
   acceptanceGuideMode: boolean;
 };
@@ -129,10 +187,11 @@ export function formatReviewGateAcceptanceCriteria(criteria: readonly string[]):
 }
 
 /**
- * Candidate-pass user prompt. The bot and the local gate probe share this
- * builder so the prompt the model actually sees cannot drift between them.
+ * Coverage-pass user prompt: acceptance criteria, the host evidence inventory,
+ * and acceptance sources only. It deliberately omits the PR diff so the call
+ * stays small regardless of PR size.
  */
-export function buildReviewGateCandidateUserPrompt(input: ReviewGateCandidateUserPromptInput): string {
+export function buildReviewGateCoverageUserPrompt(input: ReviewGateCoverageUserPromptInput): string {
   return [
     `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`,
     ...formatReviewGateHostFacts(input),
@@ -146,6 +205,42 @@ export function buildReviewGateCandidateUserPrompt(input: ReviewGateCandidateUse
     "## 신뢰된 명시 요청",
     input.trustedRequest || "(없음)",
     "",
+    "## Trusted Acceptance Sources",
+    "Acceptance criteria and source_quote values may be derived ONLY from this section.",
+    input.acceptanceSourceText || "(none)",
+    "",
+    "## Review Turn Context",
+    `review_round: ${input.reviewRound}`,
+    `previous_review_head: ${input.previousReviewHeadSha || "(none - first review turn)"}`,
+    "",
+    "### Previous Seori Result",
+    input.previousReviewBody || "(none - first review turn)",
+    "",
+    "### Contributor Responses Since Previous Seori Result",
+    input.contributorResponses || "(none)",
+    "",
+    "## 수행할 작업",
+    input.acceptanceGuideMode
+      ? "각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, complete inventory에 대응 테스트가 없는 인수조건만 missing_acceptance_test 후보로 최대 2개 candidates에 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
+      : "각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, 허용된 missing_acceptance_test 후보를 최대 2개 찾아 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
+  ].join("\n");
+}
+
+/**
+ * Defect-pass user prompt: the merge-gate markdown (diff, current-HEAD code,
+ * deep context) without the evidence inventory. Its output is at most two
+ * candidates, so generated tokens stay small even on large PRs.
+ */
+export function buildReviewGateDefectUserPrompt(input: ReviewGateDefectUserPromptInput): string {
+  return [
+    `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`,
+    ...formatReviewGateHostFacts(input),
+    "",
+    ...formatReviewGateAcceptanceCriteria(input.explicitAcceptanceCriteria),
+    "",
+    "## 신뢰된 명시 요청",
+    input.trustedRequest || "(없음)",
+    "",
     "## 지적 원장",
     input.ledgerText || "(이전 지적 없음)",
     "",
@@ -153,7 +248,7 @@ export function buildReviewGateCandidateUserPrompt(input: ReviewGateCandidateUse
     "",
     "## 수행할 작업",
     input.acceptanceGuideMode
-      ? "각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, 위 현재 HEAD 근거만으로 완전히 입증된 치명 후보를 최대 2개 candidates에 함께 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
-      : "위 현재 HEAD 근거만으로 허용된 후보를 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
+      ? "위 현재 HEAD 근거만으로 완전히 입증된 치명 후보를 최대 2개 candidates에 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
+      : "위 현재 HEAD 근거만으로 허용된 fatal_defect 후보를 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
   ].join("\n");
 }

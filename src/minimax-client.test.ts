@@ -8,7 +8,7 @@ import {
   callMiniMaxMessages,
   extractMiniMaxText,
 } from "./minimax-client.js";
-import { MINIMAX_ANTHROPIC_MESSAGES_PATH, buildMiniMaxReviewRequest } from "./minimax-review.js";
+import { MINIMAX_ANTHROPIC_MESSAGES_PATH, buildMiniMaxCoverageRequest } from "./minimax-review.js";
 
 function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -18,7 +18,7 @@ function jsonResponse(body: unknown, init: { status?: number; headers?: Record<s
 }
 
 test("성공 응답은 요청을 무가공 전송하고 body를 무가공 반환한다", async () => {
-  const request = buildMiniMaxReviewRequest({ systemPrompt: "system", userPrompt: "user" });
+  const request = buildMiniMaxCoverageRequest({ systemPrompt: "system", userPrompt: "user" });
   const upstream = { type: "message", role: "assistant", content: [], usage: { input_tokens: 1 } };
   const seen: { url?: string; init?: RequestInit } = {};
   const fetchImpl: typeof fetch = async (url, init) => {

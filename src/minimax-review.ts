@@ -106,7 +106,7 @@ export type MiniMaxMessagesRequest = {
   max_tokens: number;
   temperature: 1;
   top_p: 0.95;
-  thinking: { type: "adaptive" };
+  thinking: MiniMaxThinking;
   service_tier: "standard";
   stream: false;
   tools: Array<{
@@ -120,10 +120,18 @@ export type MiniMaxMessagesRequest = {
   tool_choice: { type: "auto" };
 };
 
+/** Anthropic-compatible thinking control. MiniMax-M3 accepts adaptive, a token budget, or off. */
+export type MiniMaxThinking =
+  | { type: "adaptive" }
+  | { type: "enabled"; budget_tokens: number }
+  | { type: "disabled" };
+
 export type MiniMaxReviewRequestOptions = {
   systemPrompt: string;
   userPrompt: string;
   maxTokens?: number;
+  /** Defaults to adaptive thinking. */
+  thinking?: MiniMaxThinking;
 };
 
 export type MiniMaxReviewParseOptions = {
@@ -133,6 +141,17 @@ export type MiniMaxReviewParseOptions = {
    * criterion prose is untrusted and rebound to these host-owned strings.
    */
   expectedAcceptanceCriteria?: readonly string[];
+  /**
+   * Candidate kinds this response may contain. The coverage pass may only
+   * propose missing_acceptance_test, the defect pass only fatal_defect; the
+   * merged cache envelope allows both.
+   */
+  allowedKinds?: readonly MiniMaxReviewCandidateKind[];
+  /**
+   * False for the defect pass, whose tool has no acceptance_coverage field.
+   * The parsed result then carries an empty coverage array.
+   */
+  requireAcceptanceCoverage?: boolean;
 };
 
 export type MiniMaxVerificationParseOptions = {
@@ -151,9 +170,10 @@ export type MiniMaxVerificationParseOptions = {
   expectedCandidateIds?: readonly string[];
 };
 
-type ReviewPhase = "candidate" | "verification";
+type ReviewPhase = "coverage" | "defect" | "verification";
 
 const CANDIDATE_RESULT_KEYS = ["acceptance_coverage", "candidates"] as const;
+const DEFECT_RESULT_KEYS = ["candidates"] as const;
 const ACCEPTANCE_COVERAGE_KEYS = [
   "criterion_id",
   "acceptance_criterion",
@@ -233,11 +253,18 @@ const ACCEPTANCE_TEST_EVIDENCE_SCHEMA: Record<string, unknown> = {
   },
 };
 
-/** Build the candidate-discovery request. */
-export function buildMiniMaxReviewRequest(
+/** Build the acceptance-coverage request: coverage rows plus missing-test candidates, no diff. */
+export function buildMiniMaxCoverageRequest(
   options: MiniMaxReviewRequestOptions,
 ): MiniMaxMessagesRequest {
-  return buildRequest("candidate", options);
+  return buildRequest("coverage", options);
+}
+
+/** Build the fatal-defect discovery request over the PR diff and current-HEAD code. */
+export function buildMiniMaxDefectRequest(
+  options: MiniMaxReviewRequestOptions,
+): MiniMaxMessagesRequest {
+  return buildRequest("defect", options);
 }
 
 /** Build the adversarial verification request for at most two candidates. */
@@ -253,7 +280,7 @@ function buildRequest(
 ): MiniMaxMessagesRequest {
   const systemPrompt = requirePrompt(options.systemPrompt, "systemPrompt");
   const userPrompt = requirePrompt(options.userPrompt, "userPrompt");
-  const maxTokens = options.maxTokens ?? (phase === "candidate" ? 24_576 : 16_384);
+  const maxTokens = options.maxTokens ?? (phase === "verification" ? 16_384 : 24_576);
   if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 524_288) {
     throw new RangeError("maxTokens must be a safe integer between 1 and 524288");
   }
@@ -270,10 +297,10 @@ function buildRequest(
     max_tokens: maxTokens,
     temperature: 1,
     top_p: 0.95,
-    thinking: { type: "adaptive" },
+    thinking: options.thinking ?? { type: "adaptive" },
     service_tier: "standard",
     stream: false,
-    tools: [phase === "candidate" ? candidateTool() : verificationTool()],
+    tools: [phase === "coverage" ? coverageTool() : phase === "defect" ? defectTool() : verificationTool()],
     tool_choice: { type: "auto" },
   };
 }
@@ -285,11 +312,43 @@ function requirePrompt(value: string, label: string): string {
   return value;
 }
 
-function candidateTool(): MiniMaxMessagesRequest["tools"][number] {
+function candidateItemSchema(kinds: readonly MiniMaxReviewCandidateKind[]): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: [...CANDIDATE_KEYS],
+    properties: {
+      candidate_id: { type: "string", pattern: "^C-[1-2]$" },
+      kind: { enum: [...kinds] },
+      title_ko: { type: "string", minLength: 1, maxLength: 120 },
+      problem_ko: { type: "string", minLength: 1, maxLength: 800 },
+      trigger_ko: { type: "string", minLength: 1, maxLength: 800 },
+      impact_ko: { type: "string", minLength: 1, maxLength: 800 },
+      fix_ko: { type: "string", minLength: 1, maxLength: 800 },
+      file: { type: ["string", "null"], minLength: 1, maxLength: 500 },
+      symbol: { type: ["string", "null"], minLength: 1, maxLength: 300 },
+      line: { type: ["integer", "null"], minimum: 1 },
+      code_quote: { type: ["string", "null"], minLength: 1, maxLength: 2_000 },
+      fatal_outcome: { anyOf: [{ enum: [...MINIMAX_FATAL_OUTCOMES] }, { type: "null" }] },
+      criterion_id: {
+        anyOf: [{ type: "string", pattern: "^AC-[1-9][0-9]*$" }, { type: "null" }],
+      },
+      acceptance_criterion: { type: ["string", "null"], minLength: 1, maxLength: 2_000 },
+      test_search_summary_ko: { type: ["string", "null"], minLength: 1, maxLength: 1_000 },
+      evidence: {
+        type: "array",
+        maxItems: 6,
+        items: CODE_EVIDENCE_SCHEMA,
+      },
+    },
+  };
+}
+
+function coverageTool(): MiniMaxMessagesRequest["tools"][number] {
   return {
     name: MINIMAX_REVIEW_TOOL_NAME,
     description:
-      "모든 인수조건의 현재 HEAD 테스트 커버리지를 순서대로 제출하고, 완전히 입증된 치명 결함 또는 전체 테스트 검색으로 입증된 테스트 누락 후보를 최대 2개 제출합니다.",
+      "모든 인수조건의 현재 HEAD 테스트 커버리지를 순서대로 제출하고, 전체 테스트 검색으로 입증된 테스트 누락 후보를 최대 2개 제출합니다.",
     input_schema: {
       type: "object",
       additionalProperties: false,
@@ -324,35 +383,28 @@ function candidateTool(): MiniMaxMessagesRequest["tools"][number] {
         candidates: {
           type: "array",
           maxItems: MINIMAX_REVIEW_MAX_CANDIDATES,
-          items: {
-            type: "object",
-            additionalProperties: false,
-            required: [...CANDIDATE_KEYS],
-            properties: {
-              candidate_id: { type: "string", pattern: "^C-[1-2]$" },
-              kind: { enum: [...MINIMAX_REVIEW_CANDIDATE_KINDS] },
-              title_ko: { type: "string", minLength: 1, maxLength: 120 },
-              problem_ko: { type: "string", minLength: 1, maxLength: 800 },
-              trigger_ko: { type: "string", minLength: 1, maxLength: 800 },
-              impact_ko: { type: "string", minLength: 1, maxLength: 800 },
-              fix_ko: { type: "string", minLength: 1, maxLength: 800 },
-              file: { type: ["string", "null"], minLength: 1, maxLength: 500 },
-              symbol: { type: ["string", "null"], minLength: 1, maxLength: 300 },
-              line: { type: ["integer", "null"], minimum: 1 },
-              code_quote: { type: ["string", "null"], minLength: 1, maxLength: 2_000 },
-              fatal_outcome: { anyOf: [{ enum: [...MINIMAX_FATAL_OUTCOMES] }, { type: "null" }] },
-              criterion_id: {
-                anyOf: [{ type: "string", pattern: "^AC-[1-9][0-9]*$" }, { type: "null" }],
-              },
-              acceptance_criterion: { type: ["string", "null"], minLength: 1, maxLength: 2_000 },
-              test_search_summary_ko: { type: ["string", "null"], minLength: 1, maxLength: 1_000 },
-              evidence: {
-                type: "array",
-                maxItems: 6,
-                items: CODE_EVIDENCE_SCHEMA,
-              },
-            },
-          },
+          description: "complete inventory에 대응 테스트가 없는 인수조건의 missing_acceptance_test 후보입니다. 없으면 빈 배열입니다.",
+          items: candidateItemSchema(["missing_acceptance_test"]),
+        },
+      },
+    },
+  };
+}
+
+function defectTool(): MiniMaxMessagesRequest["tools"][number] {
+  return {
+    name: MINIMAX_REVIEW_TOOL_NAME,
+    description:
+      "현재 HEAD 코드만으로 완전히 입증된 치명 결함 후보를 최대 2개 제출합니다. 확실한 후보가 없으면 빈 배열입니다.",
+    input_schema: {
+      type: "object",
+      additionalProperties: false,
+      required: [...DEFECT_RESULT_KEYS],
+      properties: {
+        candidates: {
+          type: "array",
+          maxItems: MINIMAX_REVIEW_MAX_CANDIDATES,
+          items: candidateItemSchema(["fatal_defect"]),
         },
       },
     },
@@ -393,7 +445,7 @@ function verificationTool(): MiniMaxMessagesRequest["tools"][number] {
   };
 }
 
-/** Parse and strictly validate a candidate-discovery Messages API response. */
+/** Parse and strictly validate a combined coverage+candidates Messages API response. */
 export function parseMiniMaxReviewResponse(
   response: unknown,
   options: MiniMaxReviewParseOptions = {},
@@ -404,6 +456,27 @@ export function parseMiniMaxReviewResponse(
   }
   const parsed = validateCandidateResult(payload.value, options);
   return parsed.ok ? { ok: true, value: parsed.value, source: payload.source } : parsed;
+}
+
+/** Coverage pass: ordered coverage rows plus at most two missing-test candidates. */
+export function parseMiniMaxCoverageResponse(
+  response: unknown,
+  options: Pick<MiniMaxReviewParseOptions, "expectedAcceptanceCriteria">,
+): MiniMaxReviewParseResult<MiniMaxReviewResult> {
+  return parseMiniMaxReviewResponse(response, {
+    ...options,
+    allowedKinds: ["missing_acceptance_test"],
+  });
+}
+
+/** Defect pass: at most two fatal-defect candidates and no coverage rows. */
+export function parseMiniMaxDefectResponse(
+  response: unknown,
+): MiniMaxReviewParseResult<MiniMaxReviewResult> {
+  return parseMiniMaxReviewResponse(response, {
+    allowedKinds: ["fatal_defect"],
+    requireAcceptanceCoverage: false,
+  });
 }
 
 /** Parse and strictly validate an adversarial-verifier Messages API response. */
@@ -546,16 +619,20 @@ function validateCandidateResult(
   const errors: string[] = [];
   // MiniMax-M3 sometimes omits contractual defaults entirely. Absent
   // candidates mean "no candidate"; restore the default before validation.
+  const requireAcceptanceCoverage = options.requireAcceptanceCoverage ?? true;
   const normalizedRaw: Record<string, unknown> = { ...raw };
   if (!("candidates" in normalizedRaw)) {
     normalizedRaw.candidates = [];
   }
-  validateExactKeys(normalizedRaw, CANDIDATE_RESULT_KEYS, "$", errors);
-  const acceptanceCoverage = validateAcceptanceCoverage(
-    raw.acceptance_coverage,
-    options.expectedAcceptanceCriteria,
+  validateExactKeys(
+    normalizedRaw,
+    requireAcceptanceCoverage ? CANDIDATE_RESULT_KEYS : DEFECT_RESULT_KEYS,
+    "$",
     errors,
   );
+  const acceptanceCoverage = requireAcceptanceCoverage
+    ? validateAcceptanceCoverage(raw.acceptance_coverage, options.expectedAcceptanceCriteria, errors)
+    : [];
   if (!Array.isArray(normalizedRaw.candidates)) {
     errors.push("$.candidates: expected an array");
     return { ok: false, errors };
@@ -568,12 +645,15 @@ function validateCandidateResult(
   for (const [index, candidate] of normalizedRaw.candidates.entries()) {
     const parsed = validateCandidate(candidate, index);
     if (parsed.ok) {
+      if (options.allowedKinds && !options.allowedKinds.includes(parsed.value.kind)) {
+        errors.push(`$.candidates[${index}].kind: ${JSON.stringify(parsed.value.kind)} is not allowed in this pass`);
+      }
       candidates.push(parsed.value);
     } else {
       errors.push(...parsed.errors);
     }
   }
-  if (acceptanceCoverage) {
+  if (acceptanceCoverage && requireAcceptanceCoverage) {
     for (const [index, candidate] of candidates.entries()) {
       if (candidate.kind !== "missing_acceptance_test") {
         continue;

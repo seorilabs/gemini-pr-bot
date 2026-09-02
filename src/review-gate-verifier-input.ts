@@ -240,11 +240,6 @@ export function formatVerificationCallFailure(failure: IsolatedVerificationFailu
   return `${VERIFICATION_CALL_FAILED_PREFIX}${failure.candidateId}: ${failure.message}`;
 }
 
-/** True when a recorded run contains a host-synthesized uncertain verdict and must not be reused as a cache hit. */
-export function hasVerificationCallFailure(validationErrors: readonly string[] | null | undefined): boolean {
-  return Boolean(validationErrors?.some((entry) => entry.startsWith(VERIFICATION_CALL_FAILED_PREFIX)));
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

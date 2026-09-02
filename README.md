@@ -320,7 +320,7 @@ After a `stale-self-trigger` marker is present for the current HEAD, later unmen
 
 ## Local Gate Probe
 
-`scripts/gate-probe.mts` replays the production candidate → verifier gate against the real MiniMax API on synthetic PR fixtures, so prompt and budget changes can be measured without a deploy-and-webhook cycle. It uses the same prompt builders, request/repair contract (`executeMiniMaxGateRequest`), isolated per-candidate verification, and host trust boundary (`evaluateMiniMaxReviewGateCandidates`) as the bot.
+`scripts/gate-probe.mts` replays the production gate against the real MiniMax API on synthetic PR fixtures, so prompt and budget changes can be measured without a deploy-and-webhook cycle. It uses the same prompt builders, request/repair contract (`executeMiniMaxGateRequest`), two isolated extraction passes (coverage without the diff, fatal-defect discovery without the evidence inventory), isolated per-candidate verification, and host trust boundary (`evaluateMiniMaxReviewGateCandidates`) as the bot. `--thinking-budget=N` or `--thinking-off` applies an experimental thinking setting to the extraction passes for latency comparison; production always uses adaptive thinking.
 
 ```bash
 set -a; source ~/.config/seorilabs/minimax-api-key.env; set +a   # shared/minimax/coding-plan-api-key
@@ -335,7 +335,7 @@ Fixtures:
 - `clean`: the same file with guards; no candidate may be accepted.
 - `large-defect`: a modified >20k-char file whose two defects are added in small hunks (rendered as a changed-region digest like production) plus several fully inlined generated files that push the candidate prompt toward the production context budget.
 
-Each run prints one JSON line with per-phase `{phase, inputTokens, outputTokens, elapsedMs}`, prompt sizes, coverage, candidates, verifier verdicts, isolated-call failures, and host pipeline accepted/rejected codes. The process exits non-zero when no planted root is accepted, a clean fixture yields an accepted finding, an isolated verifier call fails, or any verifier request takes 300 s or longer. Per-root candidate recall (`proposed`/`accepted`) and verifier verdicts with their reasons are printed for diagnosis but do not fail the run, because the probe measures the gate mechanism rather than the model's per-candidate judgement.
+Each run prints one JSON line with per-phase `{phase, inputTokens, outputTokens, elapsedMs}` (`커버리지 분류`, `결함 후보 탐색`, `후보 반증 C-n`), prompt sizes, coverage, candidates, verifier verdicts, isolated-call failures, and host pipeline accepted/rejected codes. The process exits non-zero when no planted root is accepted, a clean fixture yields an accepted finding, an isolated verifier call fails, or any verifier request takes 300 s or longer. Per-root candidate recall (`proposed`/`accepted`) and verifier verdicts with their reasons are printed for diagnosis but do not fail the run, because the probe measures the gate mechanism rather than the model's per-candidate judgement.
 
 ## Build And Deploy
 

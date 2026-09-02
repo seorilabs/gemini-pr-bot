@@ -59,17 +59,23 @@ import type { ReviewRunRecord } from "./review-run.js";
 import { MINIMAX_REVIEW_MODEL } from "./minimax-review.js";
 import {
   REVIEW_GATE_PROMPT_VERSION,
-  buildReviewGateCandidateSystemPrompt,
-  buildReviewGateCandidateUserPrompt,
+  buildReviewGateCoverageSystemPrompt,
+  buildReviewGateCoverageUserPrompt,
+  buildReviewGateDefectSystemPrompt,
+  buildReviewGateDefectUserPrompt,
   buildReviewGateVerifierSystemPrompt,
   type ReviewGateHostFacts,
 } from "./review-gate-prompt.js";
 import {
   buildReviewGateVerifierUserPrompt,
   formatVerificationCallFailure,
-  hasVerificationCallFailure,
   verifyReviewGateCandidatesIsolated,
 } from "./review-gate-verifier-input.js";
+import {
+  extractReviewGateCandidatesIsolated,
+  formatExtractionFailure,
+  hasGateCallFailure,
+} from "./review-gate-extraction.js";
 import {
   evaluateMiniMaxReviewGateCandidates,
 } from "./review-gate-pipeline.js";
@@ -141,6 +147,14 @@ const AGENT_CLOSE_MARKER = botActionMarker("close");
 const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
+
+type ReviewGatePrompts = {
+  coverageSystem: string;
+  coverageUser: string;
+  defectSystem: string;
+  defectUser: string;
+  verifierSystem: string;
+};
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -2207,7 +2221,7 @@ export class PrBot {
       ledgerSnapshot.records.map((record) => record.finding),
       evidenceCandidates,
     );
-    await this.reportGateProgress(octokit, repo, check, 2, "MiniMax 후보 추출 호출");
+    await this.reportGateProgress(octokit, repo, check, 2, "MiniMax 커버리지 분류·결함 후보 병렬 호출");
     const contextHash = this.reviewGateContextHash({
       context,
       trustedRequest,
@@ -2232,6 +2246,8 @@ export class PrBot {
     }
 
     let envelope: MiniMaxReviewGateCacheEnvelope;
+    let extractionFailures: string[] = [];
+    let defectReviewFailed = false;
     let verificationFailures: string[] = [];
     try {
       if (cacheEnvelope) {
@@ -2241,17 +2257,37 @@ export class PrBot {
           "reused completed Gemini review gate extraction",
         );
       } else {
-        const candidateResult = await this.ai.reviewGateCandidates(
-          prompts.candidateSystem,
-          prompts.candidateUser,
-          explicitAcceptanceCriteria,
-          {
-            repairInvalidOutput: true,
-          },
-        );
-        const guideMode = this.config.acceptanceGuideModeEnabled;
-        const candidates =
-          guideMode && !this.config.defectReviewEnabled ? [] : candidateResult.value.candidates;
+        const defectReviewActive =
+          !this.config.acceptanceGuideModeEnabled || this.config.defectReviewEnabled;
+        const extraction = await extractReviewGateCandidatesIsolated(explicitAcceptanceCriteria, {
+          coverage: explicitAcceptanceCriteria.length === 0
+            ? null
+            : async () =>
+                (await this.ai.reviewGateCoverage(
+                  prompts.coverageSystem,
+                  prompts.coverageUser,
+                  explicitAcceptanceCriteria,
+                )).value,
+          defect: defectReviewActive
+            ? async () =>
+                (await this.ai.reviewGateDefectCandidates(prompts.defectSystem, prompts.defectUser)).value
+            : null,
+        });
+        for (const failure of extraction.failures) {
+          this.logger.warn(
+            {
+              repo: repo.fullName,
+              prNumber,
+              headSha: context.headSha,
+              pass: failure.pass,
+              errorMessage: failure.message,
+            },
+            "MiniMax review gate extraction pass failed; continuing with host defaults",
+          );
+        }
+        extractionFailures = extraction.failures.map(formatExtractionFailure);
+        defectReviewFailed = extraction.failures.some((failure) => failure.pass === "defect");
+        const candidates = extraction.candidates;
         if (candidates.length > 0) {
           await this.reportGateProgress(octokit, repo, check, 3, `후보 ${candidates.length}건 개별 반증`);
         }
@@ -2286,7 +2322,7 @@ export class PrBot {
         verificationFailures = isolated.failures.map(formatVerificationCallFailure);
         envelope = {
           schemaVersion: REVIEW_GATE_CACHE_SCHEMA_VERSION,
-          acceptanceCoverage: candidateResult.value.acceptanceCoverage,
+          acceptanceCoverage: extraction.acceptanceCoverage,
           candidates,
           verifications: isolated.verifications,
         };
@@ -2529,6 +2565,7 @@ export class PrBot {
         [
           ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
           ...coverage.validationErrors,
+          ...extractionFailures,
           ...verificationFailures,
         ],
       );
@@ -2563,6 +2600,7 @@ export class PrBot {
             context.headSha,
             publicFindings,
             ledgerSnapshot.publishedFingerprints,
+            defectReviewFailed,
           );
         }
       }
@@ -2612,6 +2650,7 @@ export class PrBot {
       [
         ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
         ...coverage.validationErrors,
+        ...extractionFailures,
         ...verificationFailures,
         ...(!context.fatalContextComplete ? ["fatal_context_incomplete"] : []),
       ],
@@ -2790,15 +2829,10 @@ export class PrBot {
     explicitAcceptanceCriteria: readonly string[],
     priorFindings: readonly StoredReviewFinding[],
     evidenceCandidates: readonly ReviewEvidenceCandidate[],
-  ): {
-    candidateSystem: string;
-    candidateUser: string;
-    verifierSystem: string;
-  } {
-    const candidateSystem = buildReviewGateCandidateSystemPrompt({
-      acceptanceGuideMode: this.config.acceptanceGuideModeEnabled,
-    });
-    const verifierSystem = buildReviewGateVerifierSystemPrompt();
+  ): ReviewGatePrompts {
+    const acceptanceGuideMode = this.config.acceptanceGuideModeEnabled;
+    const hostFacts = this.reviewGateHostFacts(context);
+    const trustedRequest = this.trustedReviewRequest(trigger);
     const ledgerText = [...priorFindings]
       .sort((left, right) => left.semanticFingerprint.localeCompare(right.semanticFingerprint))
       .map((finding) => {
@@ -2810,16 +2844,31 @@ export class PrBot {
         return `- ${finding.semanticFingerprint} state=${finding.state} kind=${finding.candidate.kind} target=${target}`;
       })
       .join("\n");
-    const candidateUser = buildReviewGateCandidateUserPrompt({
-      ...this.reviewGateHostFacts(context),
-      explicitAcceptanceCriteria,
-      evidenceCandidatesText: formatReviewEvidenceCandidates(evidenceCandidates),
-      trustedRequest: this.trustedReviewRequest(trigger),
-      ledgerText,
-      reviewGateMarkdown: context.reviewGateMarkdown,
-      acceptanceGuideMode: this.config.acceptanceGuideModeEnabled,
-    });
-    return { candidateSystem, candidateUser, verifierSystem };
+    return {
+      coverageSystem: buildReviewGateCoverageSystemPrompt({ acceptanceGuideMode }),
+      coverageUser: buildReviewGateCoverageUserPrompt({
+        ...hostFacts,
+        explicitAcceptanceCriteria,
+        evidenceCandidatesText: formatReviewEvidenceCandidates(evidenceCandidates),
+        trustedRequest,
+        acceptanceSourceText: context.acceptanceSourceText,
+        reviewRound: context.reviewFollowUp.reviewRound,
+        previousReviewHeadSha: context.reviewFollowUp.previousReviewHeadSha,
+        previousReviewBody: context.reviewFollowUp.previousReviewBody,
+        contributorResponses: context.reviewFollowUp.contributorResponses,
+        acceptanceGuideMode,
+      }),
+      defectSystem: buildReviewGateDefectSystemPrompt({ acceptanceGuideMode }),
+      defectUser: buildReviewGateDefectUserPrompt({
+        ...hostFacts,
+        explicitAcceptanceCriteria,
+        trustedRequest,
+        ledgerText,
+        reviewGateMarkdown: context.reviewGateMarkdown,
+        acceptanceGuideMode,
+      }),
+      verifierSystem: buildReviewGateVerifierSystemPrompt(),
+    };
   }
 
   private reviewGateHostFacts(context: PullRequestContext): ReviewGateHostFacts {
@@ -2866,9 +2915,10 @@ export class PrBot {
     if (cached.verdict !== "PASS" && cached.verdict !== "FAIL") {
       return null;
     }
-    // A run whose verifier call failed holds a host-synthesized uncertain
-    // verdict; re-verify instead of reusing it.
-    if (hasVerificationCallFailure(cached.validationErrors)) {
+    // A run degraded by a failed model call holds host-synthesized defaults
+    // (unknown coverage, no candidate, or an uncertain verdict); re-run it
+    // instead of reusing it.
+    if (hasGateCallFailure(cached.validationErrors)) {
       return null;
     }
     return decodeReviewGateCache(cached.rawOutput, explicitAcceptanceCriteria);
@@ -2881,14 +2931,16 @@ export class PrBot {
     prNumber: number,
     context: PullRequestContext,
     contextHash: string,
-    prompts: { candidateSystem: string; candidateUser: string; verifierSystem: string },
+    prompts: ReviewGatePrompts,
     envelope: MiniMaxReviewGateCacheEnvelope | null,
     verdict: ReviewGatePublicVerdict,
     validationErrors: string[],
   ): Promise<void> {
     const promptDigestInput = [
-      prompts.candidateSystem,
-      prompts.candidateUser,
+      prompts.coverageSystem,
+      prompts.coverageUser,
+      prompts.defectSystem,
+      prompts.defectUser,
       prompts.verifierSystem,
     ].join("\n---\n");
     const record: ReviewRunRecord = {
@@ -3403,6 +3455,7 @@ export class PrBot {
     headSha: string,
     findings: readonly ReviewGatePublicFinding[],
     publishedFingerprints: ReadonlySet<string>,
+    defectReviewFailed = false,
   ): Promise<void> {
     try {
       if (!this.jansoree.available()) {
@@ -3419,6 +3472,7 @@ export class PrBot {
         headSha,
         findings: fatalFindings,
         markerPrefix: JANSOREE_ADVISORY_MARKER_PREFIX,
+        defectReviewFailed,
       });
       const newFindings = fatalFindings.filter(
         (finding) => !finding.fingerprint || !publishedFingerprints.has(finding.fingerprint),
