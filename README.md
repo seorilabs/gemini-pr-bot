@@ -318,6 +318,25 @@ The latest same-HEAD `no-action-required` marker clears older blockers. Legacy `
 
 After a `stale-self-trigger` marker is present for the current HEAD, later unmentioned comments do not reset the stale close window. A new commit or an explicit bot mention starts a fresh review path.
 
+## Local Gate Probe
+
+`scripts/gate-probe.mts` replays the production candidate → verifier gate against the real MiniMax API on synthetic PR fixtures, so prompt and budget changes can be measured without a deploy-and-webhook cycle. It uses the same prompt builders, request/repair contract (`executeMiniMaxGateRequest`), isolated per-candidate verification, and host trust boundary (`evaluateMiniMaxReviewGateCandidates`) as the bot.
+
+```bash
+set -a; source ~/.config/seorilabs/minimax-api-key.env; set +a   # shared/minimax/coding-plan-api-key
+node --import tsx scripts/gate-probe.mts large-defect 2
+node --import tsx scripts/gate-probe.mts defect
+node --import tsx scripts/gate-probe.mts clean
+```
+
+Fixtures:
+
+- `defect`: one small added GDScript file with two planted deterministic-crash defects.
+- `clean`: the same file with guards; no candidate may be accepted.
+- `large-defect`: a modified >20k-char file whose two defects are added in small hunks (rendered as a changed-region digest like production) plus several fully inlined generated files that push the candidate prompt toward the production context budget.
+
+Each run prints one JSON line with per-phase `{phase, inputTokens, outputTokens, elapsedMs}`, prompt sizes, coverage, candidates, verifier verdicts, isolated-call failures, and host pipeline accepted/rejected codes. The process exits non-zero when no planted root is accepted, a proposed planted root fails verification or host grounding, a clean fixture yields an accepted finding, an isolated verifier call fails, or any verifier request takes 300 s or longer. Candidate-pass recall is reported per planted root (`proposed`/`accepted`) but does not fail the run.
+
 ## Build And Deploy
 
 ```bash

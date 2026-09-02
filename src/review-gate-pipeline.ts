@@ -78,7 +78,7 @@ type CandidateValidationResult =
   | { rejection: RejectedReviewGateCandidate };
 
 const SIMPLE_IDENTIFIER_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
-const SYMBOL_MAX_DISTANCE = 200;
+export const SYMBOL_MAX_DISTANCE = 200;
 /**
  * Turns parsed MiniMax candidate/verifier results into host-grounded findings.
  *
@@ -577,7 +577,7 @@ function normalizedContentMap(contents: Readonly<Record<string, string>>): Map<s
   return result;
 }
 
-function normalizeRepositoryPath(value: string): string | null {
+export function normalizeRepositoryPath(value: string): string | null {
   const normalized = value.normalize("NFKC").trim().replace(/\\/gu, "/").replace(/^\.\//u, "");
   if (
     !normalized ||

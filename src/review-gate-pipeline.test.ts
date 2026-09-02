@@ -5,7 +5,9 @@ import type {
   MiniMaxReviewCandidate,
 } from "./minimax-review.js";
 import {
+  SYMBOL_MAX_DISTANCE,
   evaluateMiniMaxReviewGateCandidates,
+  normalizeRepositoryPath,
   type ReviewGatePipelineInput,
 } from "./review-gate-pipeline.js";
 
@@ -481,4 +483,12 @@ test("나눗셈 root는 deterministic_crash로 인정하고, 일반 호출 root�
   }));
   assert.equal(plain.accepted.length, 0);
   assert.equal(plain.rejected[0]?.code, "fatal_outcome_not_direct");
+});
+
+test("검증자 발췌가 재사용하는 grounding 상수와 경로 정규화를 export한다", () => {
+  assert.equal(SYMBOL_MAX_DISTANCE, 200);
+  assert.equal(normalizeRepositoryPath("./a/b.gd"), "a/b.gd");
+  assert.equal(normalizeRepositoryPath("a\\b.gd"), "a/b.gd");
+  assert.equal(normalizeRepositoryPath("../a.gd"), null);
+  assert.equal(normalizeRepositoryPath("/abs.gd"), null);
 });

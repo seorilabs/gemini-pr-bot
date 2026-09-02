@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   REVIEW_GATE_PROMPT_VERSION,
   buildReviewGateCandidateSystemPrompt,
+  buildReviewGateCandidateUserPrompt,
   buildReviewGateVerifierSystemPrompt,
 } from "./review-gate-prompt.js";
 
@@ -55,7 +56,57 @@ test("검증자 프롬프트는 반증 우선 규칙을 유지한다", () => {
   assert.match(prompt, /전달된 후보는 신뢰하지 마세요/u);
 });
 
-test("프롬프트 버전은 가이드 모드 v5 MiniMax를 가리킨다", () => {
+test("검증자 프롬프트는 발췌 입력 계약을 설명한다", () => {
+  // v6부터 검증자는 전체 diff 대신 후보 파일의 L번호 발췌만 받는다.
+  const prompt = buildReviewGateVerifierSystemPrompt();
+  assert.match(prompt, /`L줄번호: 원문` 형식/u);
+  assert.match(prompt, /code_quote는 접두어를 제외한 원문 줄 그대로/u);
+  assert.match(prompt, /발췌 밖의 경로나 줄, 전달되지 않은 파일은 인용하지 마세요/u);
+  assert.match(prompt, /본문이 발췌에 없으면 uncertain/u);
+});
+
+test("프롬프트 버전은 가이드 모드 v6 MiniMax를 가리킨다", () => {
   // 버전 문자열은 review_runs 테이블의 회귀 측정 단위이자 게이트 캐시 격리 키다.
-  assert.equal(REVIEW_GATE_PROMPT_VERSION, "acceptance-guide-v5-minimax");
+  // v6: 검증자 입력을 후보 파일 발췌로 축소하고 후보별 격리 호출로 바꿨다.
+  assert.equal(REVIEW_GATE_PROMPT_VERSION, "acceptance-guide-v6-minimax");
+});
+
+const candidateUserInput = {
+  headSha: "1c3aa42fa140fa411ee4f2260e8effb325c6f695",
+  changeClass: "product_logic" as const,
+  testInventoryComplete: false,
+  testInventoryFileCount: 0,
+  fatalContextComplete: true,
+  explicitAcceptanceCriteria: ["정상 진행 tier 1..3 입력에서 보상량이 반환된다."],
+  evidenceCandidatesText: "(current-HEAD evidence candidate 없음)",
+  trustedRequest: "",
+  ledgerText: "",
+  reviewGateMarkdown: "# Pull Request Merge Gate Context\n(body)",
+  acceptanceGuideMode: true,
+};
+
+test("후보 유저 프롬프트는 host 사실·인수조건·placeholder·모드별 지시문을 순서대로 담는다", () => {
+  const prompt = buildReviewGateCandidateUserPrompt(candidateUserInput);
+  const lines = prompt.split("\n");
+  assert.equal(lines[0], `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`);
+  assert.equal(lines[1], "## Host 검증 사실");
+  assert.equal(lines[2], "head_sha: 1c3aa42fa140fa411ee4f2260e8effb325c6f695");
+  assert.equal(lines[6], "fatal_context_complete: true");
+  assert.match(prompt, /^## Host가 추출한 명시적 인수조건\nAC-1: 정상 진행 tier 1\.\.3 입력에서 보상량이 반환된다\.$/mu);
+  assert.match(prompt, /^## 신뢰된 명시 요청\n\(없음\)$/mu);
+  assert.match(prompt, /^## 지적 원장\n\(이전 지적 없음\)$/mu);
+  assert.match(prompt, /# Pull Request Merge Gate Context\n\(body\)/u);
+  assert.ok(prompt.endsWith("확실한 후보가 없으면 candidates는 빈 배열입니다."));
+
+  const conservative = buildReviewGateCandidateUserPrompt({
+    ...candidateUserInput,
+    acceptanceGuideMode: false,
+    explicitAcceptanceCriteria: [],
+    ledgerText: "- fp state=open kind=fatal target=a.gd#f",
+    trustedRequest: "이 PR을 코드리뷰해줘.",
+  });
+  assert.match(conservative, /^\(명시적 인수조건 없음\)$/mu);
+  assert.match(conservative, /^- fp state=open kind=fatal target=a\.gd#f$/mu);
+  assert.match(conservative, /^이 PR을 코드리뷰해줘\.$/mu);
+  assert.ok(conservative.endsWith("확실한 후보가 없으면 빈 배열을 제출하세요."));
 });

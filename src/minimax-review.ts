@@ -137,9 +137,12 @@ export type MiniMaxReviewParseOptions = {
 
 export type MiniMaxVerificationParseOptions = {
   /**
-   * Require one verification per candidate, in the supplied order. Supplying
-   * kinds lets the host allow inventory-grounded missing-test confirmation
-   * without weakening fatal-defect evidence requirements.
+   * Require one verification per supplied candidate, in the supplied order.
+   * A single-candidate subset (for example only C-2) is allowed so the host can
+   * verify candidates in isolated requests; the C-1..C-N protocol of the whole
+   * set is enforced by the host pipeline. Supplying kinds lets the host allow
+   * inventory-grounded missing-test confirmation without weakening
+   * fatal-defect evidence requirements.
    */
   expectedCandidates?: ReadonlyArray<
     Pick<MiniMaxReviewCandidate, "candidateId" | "kind">
@@ -960,9 +963,6 @@ function validateVerificationResult(
       errors.push(`$options.expectedCandidates[${index}].kind: unexpected candidate kind`);
     }
   });
-  if (expectedCandidates && expectedCandidates.some((candidate, index) => candidate.candidateId !== `C-${index + 1}`)) {
-    errors.push("$options.expectedCandidates: candidate IDs must be sequential");
-  }
   if (expectedIds && raw.verifications.length !== expectedIds.length) {
     errors.push("$.verifications: expected exactly one result per supplied candidate");
   }

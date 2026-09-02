@@ -56,12 +56,20 @@ import { OperationsNotifier, type ApprovalNotificationMode } from "./notificatio
 import { isStatusReconciliationEvent, parseBotCommand, truncate } from "./text.js";
 import { reconcileAcceptanceGuideStatus, type StatusReconciliationLock } from "./status-reconciliation.js";
 import type { ReviewRunRecord } from "./review-run.js";
-import { MINIMAX_REVIEW_MODEL, type MiniMaxReviewCandidate } from "./minimax-review.js";
+import { MINIMAX_REVIEW_MODEL } from "./minimax-review.js";
 import {
   REVIEW_GATE_PROMPT_VERSION,
   buildReviewGateCandidateSystemPrompt,
+  buildReviewGateCandidateUserPrompt,
   buildReviewGateVerifierSystemPrompt,
+  type ReviewGateHostFacts,
 } from "./review-gate-prompt.js";
+import {
+  buildReviewGateVerifierUserPrompt,
+  formatVerificationCallFailure,
+  hasVerificationCallFailure,
+  verifyReviewGateCandidatesIsolated,
+} from "./review-gate-verifier-input.js";
 import {
   evaluateMiniMaxReviewGateCandidates,
 } from "./review-gate-pipeline.js";
@@ -2224,6 +2232,7 @@ export class PrBot {
     }
 
     let envelope: MiniMaxReviewGateCacheEnvelope;
+    let verificationFailures: string[] = [];
     try {
       if (cacheEnvelope) {
         envelope = cacheEnvelope;
@@ -2244,23 +2253,42 @@ export class PrBot {
         const candidates =
           guideMode && !this.config.defectReviewEnabled ? [] : candidateResult.value.candidates;
         if (candidates.length > 0) {
-          await this.reportGateProgress(octokit, repo, check, 3, `후보 ${candidates.length}건 반증`);
+          await this.reportGateProgress(octokit, repo, check, 3, `후보 ${candidates.length}건 개별 반증`);
         }
-        const verificationResult = candidates.length === 0
-          ? { verifications: [] }
-          : (await this.ai.verifyReviewGateCandidates(
-              prompts.verifierSystem,
-              this.reviewGateVerifierPrompt(
-                prompts.candidateUser,
-                candidates,
-              ),
-              candidates,
-            )).value;
+        const hostFacts = this.reviewGateHostFacts(context);
+        const evidenceCandidatesText = formatReviewEvidenceCandidates(evidenceCandidates);
+        const isolated = await verifyReviewGateCandidatesIsolated(candidates, async (candidate) =>
+          (await this.ai.verifyReviewGateCandidate(
+            prompts.verifierSystem,
+            buildReviewGateVerifierUserPrompt({
+              ...hostFacts,
+              candidate,
+              explicitAcceptanceCriteria,
+              evidenceCandidatesText,
+              currentHeadFileContents: context.currentHeadFileContents,
+              visibleChangedPatches: context.visibleChangedPatches,
+            }),
+            candidate,
+          )).value.verifications[0]!,
+        );
+        for (const failure of isolated.failures) {
+          this.logger.warn(
+            {
+              repo: repo.fullName,
+              prNumber,
+              headSha: context.headSha,
+              candidateId: failure.candidateId,
+              errorMessage: failure.message,
+            },
+            "MiniMax candidate verification failed; recording host uncertain verdict",
+          );
+        }
+        verificationFailures = isolated.failures.map(formatVerificationCallFailure);
         envelope = {
           schemaVersion: REVIEW_GATE_CACHE_SCHEMA_VERSION,
           acceptanceCoverage: candidateResult.value.acceptanceCoverage,
           candidates,
-          verifications: verificationResult.verifications,
+          verifications: isolated.verifications,
         };
       }
     } catch (error) {
@@ -2452,7 +2480,7 @@ export class PrBot {
       !coverage.complete ||
       blockingOpenFindings.length !== openFindings.length ||
       pipeline.rejected.some((rejected) => {
-        const verification = envelope.verifications.find((item) => item.candidateId === rejected.candidateId);
+        const verification = evaluatedEnvelope.verifications.find((item) => item.candidateId === rejected.candidateId);
         return verification?.verdict === "uncertain";
       });
     const baseVerdict: Exclude<ReviewGatePublicVerdict, "FOLLOW_UP"> = blockingOpenFindings.length > 0
@@ -2501,6 +2529,7 @@ export class PrBot {
         [
           ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
           ...coverage.validationErrors,
+          ...verificationFailures,
         ],
       );
       await this.reportGateProgress(octokit, repo, check, 5);
@@ -2583,6 +2612,7 @@ export class PrBot {
       [
         ...pipeline.rejected.map((rejected) => `${rejected.code}: ${rejected.reason}`),
         ...coverage.validationErrors,
+        ...verificationFailures,
         ...(!context.fatalContextComplete ? ["fatal_context_incomplete"] : []),
       ],
     );
@@ -2769,68 +2799,37 @@ export class PrBot {
       acceptanceGuideMode: this.config.acceptanceGuideModeEnabled,
     });
     const verifierSystem = buildReviewGateVerifierSystemPrompt();
-    const criteria = explicitAcceptanceCriteria.length === 0
-      ? "(명시적 인수조건 없음)"
-      : explicitAcceptanceCriteria.map((criterion, index) => `AC-${index + 1}: ${criterion}`).join("\n");
-    const ledger = priorFindings.length === 0
-      ? "(이전 지적 없음)"
-      : [...priorFindings]
-          .sort((left, right) => left.semanticFingerprint.localeCompare(right.semanticFingerprint))
-          .map((finding) => {
-            const target = finding.candidate.file
-              ? `${finding.candidate.file}#${finding.candidate.symbol || "(symbol 없음)"}`
-              : finding.candidate.kind === "missing_tests"
-                ? finding.candidate.acceptanceCriterion
-                : "(target 없음)";
-            return `- ${finding.semanticFingerprint} state=${finding.state} kind=${finding.candidate.kind} target=${target}`;
-          })
-          .join("\n");
-    const trustedRequest = this.trustedReviewRequest(trigger);
-    const candidateUser = [
-      `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`,
-      "## Host 검증 사실",
-      `head_sha: ${context.headSha}`,
-      `change_class: ${context.changeClass}`,
-      `test_inventory_complete: ${context.testInventoryComplete}`,
-      `test_inventory_file_count: ${context.testInventoryFileCount}`,
-      `fatal_context_complete: ${context.fatalContextComplete}`,
-      "",
-      "## Host가 추출한 명시적 인수조건",
-      criteria,
-      "",
-      "## Host Evidence Candidates",
-      "아래 JSON line만 test_evidence와 supporting_test_evidence의 근거로 선택할 수 있습니다.",
-      formatReviewEvidenceCandidates(evidenceCandidates),
-      "",
-      "## 신뢰된 명시 요청",
-      trustedRequest || "(없음)",
-      "",
-      "## 지적 원장",
-      ledger,
-      "",
-      context.reviewGateMarkdown,
-      "",
-      "## 수행할 작업",
-      this.config.acceptanceGuideModeEnabled
-        ? "각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, 위 현재 HEAD 근거만으로 완전히 입증된 치명 후보를 최대 2개 candidates에 함께 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
-        : "위 현재 HEAD 근거만으로 허용된 후보를 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
-    ].join("\n");
+    const ledgerText = [...priorFindings]
+      .sort((left, right) => left.semanticFingerprint.localeCompare(right.semanticFingerprint))
+      .map((finding) => {
+        const target = finding.candidate.file
+          ? `${finding.candidate.file}#${finding.candidate.symbol || "(symbol 없음)"}`
+          : finding.candidate.kind === "missing_tests"
+            ? finding.candidate.acceptanceCriterion
+            : "(target 없음)";
+        return `- ${finding.semanticFingerprint} state=${finding.state} kind=${finding.candidate.kind} target=${target}`;
+      })
+      .join("\n");
+    const candidateUser = buildReviewGateCandidateUserPrompt({
+      ...this.reviewGateHostFacts(context),
+      explicitAcceptanceCriteria,
+      evidenceCandidatesText: formatReviewEvidenceCandidates(evidenceCandidates),
+      trustedRequest: this.trustedReviewRequest(trigger),
+      ledgerText,
+      reviewGateMarkdown: context.reviewGateMarkdown,
+      acceptanceGuideMode: this.config.acceptanceGuideModeEnabled,
+    });
     return { candidateSystem, candidateUser, verifierSystem };
   }
 
-  private reviewGateVerifierPrompt(
-    candidateUser: string,
-    candidates: readonly MiniMaxReviewCandidate[],
-  ): string {
-    return [
-      candidateUser,
-      "",
-      "## 반증할 후보",
-      JSON.stringify({ candidates }, null, 2),
-      "",
-      "## 수행할 작업",
-      "각 후보를 현재 HEAD에서 먼저 반증하고, 후보 순서대로 confirmed/rejected/uncertain 중 하나를 submit_review 도구로 제출하세요.",
-    ].join("\n");
+  private reviewGateHostFacts(context: PullRequestContext): ReviewGateHostFacts {
+    return {
+      headSha: context.headSha,
+      changeClass: context.changeClass,
+      testInventoryComplete: context.testInventoryComplete,
+      testInventoryFileCount: context.testInventoryFileCount,
+      fatalContextComplete: context.fatalContextComplete,
+    };
   }
 
   private reviewGateContextHash(input: {
@@ -2865,6 +2864,11 @@ export class PrBot {
     explicitAcceptanceCriteria: readonly string[],
   ): MiniMaxReviewGateCacheEnvelope | null {
     if (cached.verdict !== "PASS" && cached.verdict !== "FAIL") {
+      return null;
+    }
+    // A run whose verifier call failed holds a host-synthesized uncertain
+    // verdict; re-verify instead of reusing it.
+    if (hasVerificationCallFailure(cached.validationErrors)) {
       return null;
     }
     return decodeReviewGateCache(cached.rawOutput, explicitAcceptanceCriteria);

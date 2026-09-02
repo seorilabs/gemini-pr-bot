@@ -184,3 +184,30 @@ test("suppressed candidate 뒤의 후보와 verifier는 C-1부터 다시 결합�
   assert.deepEqual(filtered.verifications.map((verification) => verification.candidateId), ["C-1"]);
   assert.equal(filtered.candidates[0]?.titleKo, "두 번째 인수조건 테스트가 없습니다");
 });
+
+test("host가 합성한 uncertain 검증(evidence 없음)은 캐시 왕복과 재번호에서 쌍을 유지한다", () => {
+  const envelope = validEnvelope();
+  const secondCandidate = {
+    ...envelope.candidates[0]!,
+    candidateId: "C-2",
+    titleKo: "두 번째 인수조건 테스트가 없습니다",
+  };
+  const hostUncertain = {
+    candidateId: "C-2",
+    verdict: "uncertain" as const,
+    reasonKo: "호스트 기록: 독립 검증 호출이 실패해 이 후보를 판정하지 못했습니다.",
+    evidence: [],
+  };
+  const combined: MiniMaxReviewGateCacheEnvelope = {
+    ...envelope,
+    candidates: [...envelope.candidates, secondCandidate],
+    verifications: [...envelope.verifications, hostUncertain],
+  };
+
+  const decoded = decodeReviewGateCache(JSON.stringify(encodeReviewGateCache(combined)), [ACCEPTANCE_CRITERION]);
+  assert.deepEqual(decoded?.verifications[1], hostUncertain);
+
+  const filtered = filterReviewGateCacheCandidates(combined, (candidate) => candidate.candidateId === "C-2");
+  assert.deepEqual(filtered.candidates.map((candidate) => candidate.candidateId), ["C-1"]);
+  assert.deepEqual(filtered.verifications, [{ ...hostUncertain, candidateId: "C-1" }]);
+});

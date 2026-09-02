@@ -5,7 +5,9 @@
  * 근거를 만들어내지 않도록 복사 규칙을 명시한다. v1은 이 규칙이 없어
  * test_evidence_not_in_host_inventory 비율이 크게 높았다.
  */
-export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v5-minimax";
+import type { ChangeClass } from "./repo-context.js";
+
+export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v6-minimax";
 
 const ACCEPTANCE_GUIDE_CANDIDATE_RULES = [
   "당신은 Seori의 최초 1회 인수조건 안내와 치명 결함 후보 조사를 위한 근거 분류자입니다. 승인·거절 판정자는 아닙니다.",
@@ -68,6 +70,8 @@ const REVIEW_GATE_VERIFIER_RULES = [
   "직접 반증되면 rejected, 근거가 일부라도 부족하면 uncertain, 모든 조건과 정확한 종단 근거가 남을 때만 confirmed입니다.",
   "fatal_defect confirmed/rejected는 현재 HEAD의 동일 root file:line:code_quote를 포함해야 합니다.",
   "missing_acceptance_test는 host의 complete inventory와 AC 원문만으로 confirmed할 수 있으며 코드 evidence는 비워 둡니다.",
+  "제공되는 현재 HEAD 코드는 후보가 지목한 파일의 발췌이며 각 줄은 `L줄번호: 원문` 형식입니다. evidence의 line은 그 줄번호, code_quote는 접두어를 제외한 원문 줄 그대로입니다.",
+  "발췌 밖의 경로나 줄, 전달되지 않은 파일은 인용하지 마세요. 판정에 필요한 본문이 발췌에 없으면 uncertain입니다.",
   "reason_ko와 evidence 설명은 한글로 쓰고 정의된 submit_review 도구를 정확히 한 번 사용하세요.",
 ] as const;
 
@@ -82,4 +86,74 @@ export function buildReviewGateCandidateSystemPrompt(
 
 export function buildReviewGateVerifierSystemPrompt(): string {
   return REVIEW_GATE_VERIFIER_RULES.join("\n");
+}
+
+/** Host-owned facts that both the candidate pass and every verifier request must see verbatim. */
+export type ReviewGateHostFacts = {
+  headSha: string;
+  changeClass: ChangeClass;
+  testInventoryComplete: boolean;
+  testInventoryFileCount: number;
+  fatalContextComplete: boolean;
+};
+
+export type ReviewGateCandidateUserPromptInput = ReviewGateHostFacts & {
+  explicitAcceptanceCriteria: readonly string[];
+  /** Output of formatReviewEvidenceCandidates. */
+  evidenceCandidatesText: string;
+  trustedRequest: string;
+  /** Prior finding ledger lines; empty when there is no prior finding. */
+  ledgerText: string;
+  reviewGateMarkdown: string;
+  acceptanceGuideMode: boolean;
+};
+
+export function formatReviewGateHostFacts(facts: ReviewGateHostFacts): string[] {
+  return [
+    "## Host 검증 사실",
+    `head_sha: ${facts.headSha}`,
+    `change_class: ${facts.changeClass}`,
+    `test_inventory_complete: ${facts.testInventoryComplete}`,
+    `test_inventory_file_count: ${facts.testInventoryFileCount}`,
+    `fatal_context_complete: ${facts.fatalContextComplete}`,
+  ];
+}
+
+export function formatReviewGateAcceptanceCriteria(criteria: readonly string[]): string[] {
+  return [
+    "## Host가 추출한 명시적 인수조건",
+    criteria.length === 0
+      ? "(명시적 인수조건 없음)"
+      : criteria.map((criterion, index) => `AC-${index + 1}: ${criterion}`).join("\n"),
+  ];
+}
+
+/**
+ * Candidate-pass user prompt. The bot and the local gate probe share this
+ * builder so the prompt the model actually sees cannot drift between them.
+ */
+export function buildReviewGateCandidateUserPrompt(input: ReviewGateCandidateUserPromptInput): string {
+  return [
+    `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`,
+    ...formatReviewGateHostFacts(input),
+    "",
+    ...formatReviewGateAcceptanceCriteria(input.explicitAcceptanceCriteria),
+    "",
+    "## Host Evidence Candidates",
+    "아래 JSON line만 test_evidence와 supporting_test_evidence의 근거로 선택할 수 있습니다.",
+    input.evidenceCandidatesText,
+    "",
+    "## 신뢰된 명시 요청",
+    input.trustedRequest || "(없음)",
+    "",
+    "## 지적 원장",
+    input.ledgerText || "(이전 지적 없음)",
+    "",
+    input.reviewGateMarkdown,
+    "",
+    "## 수행할 작업",
+    input.acceptanceGuideMode
+      ? "각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, 위 현재 HEAD 근거만으로 완전히 입증된 치명 후보를 최대 2개 candidates에 함께 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
+      : "위 현재 HEAD 근거만으로 허용된 후보를 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
+  ].join("\n");
 }
