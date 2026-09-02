@@ -9,11 +9,12 @@
  * Usage:
  *   MINIMAX_API_KEY=... node --import tsx scripts/gate-probe.mts <defect|clean|large-defect> [runs]
  *
- * Exit code 1 when no planted root is accepted by the host pipeline, a proposed
- * planted root is not accepted, a clean fixture yields an accepted finding, a
- * phase or isolated verifier call fails, or any verifier request takes
- * VERIFIER_TIMEOUT_BUDGET_MS or longer. Candidate-pass recall (how many planted
- * roots become candidates) is reported per root but does not fail the run.
+ * Exit code 1 when no planted root is accepted by the host pipeline, a clean
+ * fixture yields an accepted finding, a phase or isolated verifier call fails,
+ * or any verifier request takes VERIFIER_TIMEOUT_BUDGET_MS or longer. Per-root
+ * candidate recall and verifier verdicts (including a model rejection of a
+ * planted root) are reported for diagnosis but do not fail the run: the probe
+ * measures the gate mechanism, not the model's per-candidate judgement.
  */
 import { buildLargeFileDigest } from "../src/github.js";
 import { executeMiniMaxGateRequest, type MiniMaxGateRequestUsage } from "../src/minimax-gate.js";
@@ -485,9 +486,7 @@ async function main(): Promise<void> {
     const slowVerifier = phases.filter((phase) => phase.phase.startsWith("후보 반증") && phase.elapsedMs >= VERIFIER_TIMEOUT_BUDGET_MS);
     const pass = fixture.plantedRoots.length === 0
       ? pipeline.accepted.length === 0 && isolated.failures.length === 0
-      : plantedDetected.some((root) => root.accepted) &&
-        plantedDetected.every((root) => !root.proposed || root.accepted) &&
-        isolated.failures.length === 0;
+      : plantedDetected.some((root) => root.accepted) && isolated.failures.length === 0;
     if (!pass || slowVerifier.length > 0) {
       failed = true;
     }
@@ -507,7 +506,11 @@ async function main(): Promise<void> {
         line: candidate.line,
         outcome: candidate.fatalOutcome,
       })),
-      verifications: isolated.verifications.map((entry) => `${entry.candidateId}:${entry.verdict}`),
+      verifications: isolated.verifications.map((entry) => ({
+        id: entry.candidateId,
+        verdict: entry.verdict,
+        reasonKo: entry.reasonKo,
+      })),
       failures: isolated.failures,
       accepted: acceptedRoots,
       rejected: pipeline.rejected.map((item) => `${item.candidateId}:${item.code}`),

@@ -335,7 +335,7 @@ Fixtures:
 - `clean`: the same file with guards; no candidate may be accepted.
 - `large-defect`: a modified >20k-char file whose two defects are added in small hunks (rendered as a changed-region digest like production) plus several fully inlined generated files that push the candidate prompt toward the production context budget.
 
-Each run prints one JSON line with per-phase `{phase, inputTokens, outputTokens, elapsedMs}`, prompt sizes, coverage, candidates, verifier verdicts, isolated-call failures, and host pipeline accepted/rejected codes. The process exits non-zero when no planted root is accepted, a proposed planted root fails verification or host grounding, a clean fixture yields an accepted finding, an isolated verifier call fails, or any verifier request takes 300 s or longer. Candidate-pass recall is reported per planted root (`proposed`/`accepted`) but does not fail the run.
+Each run prints one JSON line with per-phase `{phase, inputTokens, outputTokens, elapsedMs}`, prompt sizes, coverage, candidates, verifier verdicts, isolated-call failures, and host pipeline accepted/rejected codes. The process exits non-zero when no planted root is accepted, a clean fixture yields an accepted finding, an isolated verifier call fails, or any verifier request takes 300 s or longer. Per-root candidate recall (`proposed`/`accepted`) and verifier verdicts with their reasons are printed for diagnosis but do not fail the run, because the probe measures the gate mechanism rather than the model's per-candidate judgement.
 
 ## Build And Deploy
 
