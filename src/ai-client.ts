@@ -8,12 +8,16 @@ import {
   type MiniMaxHttpOptions,
 } from "./minimax-client.js";
 import {
+  executeMiniMaxGateRequest,
+  type MiniMaxGateRequestUsage,
+  type MiniMaxGateResult,
+} from "./minimax-gate.js";
+import {
   MINIMAX_REVIEW_MODEL,
   buildMiniMaxReviewRequest,
   buildMiniMaxVerificationRequest,
   parseMiniMaxReviewResponse,
   parseMiniMaxVerificationResponse,
-  type MiniMaxMessagesRequest,
   type MiniMaxReviewCandidate,
   type MiniMaxReviewResult,
   type MiniMaxVerificationResult,
@@ -48,10 +52,6 @@ export type AiProviderResult = {
   selectedProvider: AiReviewProviderName;
   provider: AiReviewProviderName;
   model: string;
-};
-
-export type MiniMaxGateResult<T> = AiProviderResult & {
-  value: T;
 };
 
 export class AiProviderCooldownError extends Error {
@@ -132,28 +132,37 @@ export class AiClient {
     expectedAcceptanceCriteria: readonly string[],
     options: { repairInvalidOutput?: boolean } = {},
   ): Promise<MiniMaxGateResult<MiniMaxReviewResult>> {
-    return this.runMiniMaxGateRequest(
-      () => buildMiniMaxReviewRequest({ systemPrompt, userPrompt }),
-      (response: unknown) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria }),
-      userPrompt,
-      "후보 추출",
-      options.repairInvalidOutput ?? true,
-    );
+    return executeMiniMaxGateRequest({
+      http: this.minimaxHttpOptions(),
+      buildRequest: () => buildMiniMaxReviewRequest({ systemPrompt, userPrompt }),
+      parseResponse: (response) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria }),
+      originalUserPrompt: userPrompt,
+      phaseLabel: "후보 추출",
+      repairInvalidOutput: options.repairInvalidOutput ?? true,
+      onRequestCompleted: this.logGateRequest,
+    });
   }
 
-  async verifyReviewGateCandidates(
+  /** Verifies one candidate in its own request so a failure stays isolated to that candidate. */
+  async verifyReviewGateCandidate(
     systemPrompt: string,
     userPrompt: string,
-    candidates: readonly MiniMaxReviewCandidate[],
+    candidate: Pick<MiniMaxReviewCandidate, "candidateId" | "kind">,
   ): Promise<MiniMaxGateResult<MiniMaxVerificationResult>> {
-    const expectedCandidates = candidates.map(({ candidateId, kind }) => ({ candidateId, kind }));
-    return this.runMiniMaxGateRequest(
-      () => buildMiniMaxVerificationRequest({ systemPrompt, userPrompt }),
-      (response: unknown) => parseMiniMaxVerificationResponse(response, { expectedCandidates }),
-      userPrompt,
-      "후보 반증",
-    );
+    const expectedCandidates = [{ candidateId: candidate.candidateId, kind: candidate.kind }];
+    return executeMiniMaxGateRequest({
+      http: this.minimaxHttpOptions(),
+      buildRequest: () => buildMiniMaxVerificationRequest({ systemPrompt, userPrompt }),
+      parseResponse: (response) => parseMiniMaxVerificationResponse(response, { expectedCandidates }),
+      originalUserPrompt: userPrompt,
+      phaseLabel: `후보 반증 ${candidate.candidateId}`,
+      onRequestCompleted: this.logGateRequest,
+    });
   }
+
+  private readonly logGateRequest = (usage: MiniMaxGateRequestUsage): void => {
+    this.logger?.info(usage, "MiniMax review gate request completed");
+  };
 
   /** Exact system-instruction overhead used to size the host-visible gate context. */
   structuredReviewInstructionChars(): number {
@@ -626,67 +635,6 @@ export class AiClient {
     }
 
     return "응답을 생성하지 못했습니다.";
-  }
-
-  private async runMiniMaxGateRequest<T>(
-    buildRequest: () => MiniMaxMessagesRequest,
-    parseResponse: (response: unknown) =>
-      | { ok: true; value: T; source: "tool_use" | "text" }
-      | { ok: false; errors: string[] },
-    originalUserPrompt: string,
-    phaseLabel: string,
-    repairInvalidOutput = true,
-  ): Promise<MiniMaxGateResult<T>> {
-    const request = buildRequest();
-    const response = await this.callGateMessages(request, phaseLabel);
-    let parsed = parseResponse(response);
-
-    if (!parsed.ok && repairInvalidOutput) {
-      const repairPrompt = [
-        originalUserPrompt,
-        "",
-        "이전 출력은 서버 검증을 통과하지 못했습니다.",
-        `검증 오류: ${parsed.errors.slice(0, 8).join(" | ")}`,
-        "정의된 submit_review 도구를 호출하는 형식의 JSON을 정확히 다시 제출하세요.",
-      ].join("\n");
-      const repairRequest = {
-        ...request,
-        messages: [{ role: "user" as const, content: [{ type: "text" as const, text: repairPrompt }] }],
-      };
-      const repairResponse = await this.callGateMessages(repairRequest, `${phaseLabel} 형식 보정`);
-      parsed = parseResponse(repairResponse);
-    }
-
-    if (!parsed.ok) {
-      throw new Error(`MiniMax ${phaseLabel} output failed validation: ${parsed.errors.join(" | ")}`);
-    }
-
-    return {
-      selectedProvider: "minimax",
-      provider: "minimax",
-      model: MINIMAX_REVIEW_MODEL,
-      text: JSON.stringify(parsed.value),
-      value: parsed.value,
-    };
-  }
-
-  private async callGateMessages(request: MiniMaxMessagesRequest, phaseLabel: string): Promise<unknown> {
-    const startedAt = Date.now();
-    const response = await callMiniMaxMessages(request, this.minimaxHttpOptions());
-    const usage = (response as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
-
-    this.logger?.info(
-      {
-        phase: phaseLabel,
-        model: MINIMAX_REVIEW_MODEL,
-        inputTokens: usage?.input_tokens || 0,
-        outputTokens: usage?.output_tokens || 0,
-        elapsedMs: Date.now() - startedAt,
-      },
-      "MiniMax review gate request completed",
-    );
-
-    return response;
   }
 }
 

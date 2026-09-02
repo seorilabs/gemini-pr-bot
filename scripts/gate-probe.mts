@@ -1,46 +1,100 @@
 /**
  * Local review-gate probe against the real MiniMax API.
  *
- * Replays the production candidate → verifier prompt contract on synthetic
- * PR fixtures so prompt/sensitivity changes can be iterated without a
- * deploy-and-webhook cycle.
+ * Replays the production candidate → isolated verifier → host pipeline gate on
+ * synthetic PR fixtures with the same prompt builders, request/repair contract,
+ * and trust boundary the bot uses, so prompt and budget changes can be measured
+ * without a deploy-and-webhook cycle.
  *
  * Usage:
- *   MINIMAX_API_KEY=... node --import tsx scripts/gate-probe.mts <defect|clean> [runs]
+ *   MINIMAX_API_KEY=... node --import tsx scripts/gate-probe.mts <defect|clean|large-defect> [runs]
+ *
+ * Exit code 1 when no planted root is accepted by the host pipeline, a clean
+ * fixture yields an accepted finding, a phase or isolated verifier call fails,
+ * or any verifier request takes VERIFIER_TIMEOUT_BUDGET_MS or longer. Per-root
+ * candidate recall and verifier verdicts (including a model rejection of a
+ * planted root) are reported for diagnosis but do not fail the run: the probe
+ * measures the gate mechanism, not the model's per-candidate judgement.
  */
-import { callMiniMaxMessages } from "../src/minimax-client.js";
+import { buildLargeFileDigest } from "../src/github.js";
+import { executeMiniMaxGateRequest, type MiniMaxGateRequestUsage } from "../src/minimax-gate.js";
 import {
   buildMiniMaxReviewRequest,
   buildMiniMaxVerificationRequest,
   parseMiniMaxReviewResponse,
   parseMiniMaxVerificationResponse,
+  type MiniMaxReviewCandidate,
 } from "../src/minimax-review.js";
+import { evaluateMiniMaxReviewGateCandidates } from "../src/review-gate-pipeline.js";
 import {
-  REVIEW_GATE_PROMPT_VERSION,
   buildReviewGateCandidateSystemPrompt,
+  buildReviewGateCandidateUserPrompt,
   buildReviewGateVerifierSystemPrompt,
+  type ReviewGateHostFacts,
 } from "../src/review-gate-prompt.js";
+import {
+  buildReviewGateVerifierUserPrompt,
+  verifyReviewGateCandidatesIsolated,
+} from "../src/review-gate-verifier-input.js";
+import {
+  buildReviewEvidenceCandidates,
+  formatReviewEvidenceCandidates,
+} from "../src/review-grounding.js";
+import { truncate } from "../src/text.js";
 
-const DEFECT_FILE = `extends RefCounted
+// Production budgets mirrored from src/github.ts and src/config.ts defaults.
+const MAX_CHANGED_FILE_CONTENT_CHARS = 20_000;
+const MAX_REVIEW_GATE_PATCH_CHARS = 60_000;
+const MAX_CONTEXT_CHARS = 160_000;
+const REVIEW_GATE_PROMPT_RESERVE_CHARS = 16_000;
+const REQUEST_TIMEOUT_MS = 300_000;
+const VERIFIER_TIMEOUT_BUDGET_MS = 300_000;
 
-## 일일 보상 티어 테이블. 정상 진행에서 tier는 1..3을 전달받는다.
-const REWARD_TIERS: Array[int] = [10, 20, 30]
+type FixtureFile = {
+  status: "added" | "modified";
+  /** Current-HEAD body. */
+  content: string;
+  /** Unified diff hunks for this file (no file header). */
+  patch: string;
+  additions: number;
+  deletions: number;
+};
 
+type Fixture = {
+  title: string;
+  acceptanceCriteria: readonly string[];
+  files: Record<string, FixtureFile>;
+  /** Roots the gate must confirm and the host must accept. Empty for clean fixtures. */
+  plantedRoots: Array<{ file: string; line: number }>;
+};
 
-## 전달된 tier의 보상량을 돌려준다.
-static func reward_for_tier(tier: int) -> int:
-\treturn REWARD_TIERS[tier]
+const ACCEPTANCE_CRITERIA = [
+  "정상 진행 tier 1..3 입력에서 보상량이 반환된다.",
+  "빈 점수 목록에서도 평균 계산이 안전하다.",
+] as const;
 
+const INDEX_DEFECT_BLOCK = [
+  "## 일일 보상 티어 테이블. 정상 진행에서 tier는 1..3을 전달받는다.",
+  "const REWARD_TIERS: Array[int] = [10, 20, 30]",
+  "",
+  "",
+  "## 전달된 tier의 보상량을 돌려준다.",
+  "static func reward_for_tier(tier: int) -> int:",
+  "\treturn REWARD_TIERS[tier]",
+];
 
-## 최근 판 점수의 평균을 돌려준다.
-static func average_score(scores: Array) -> float:
-\tvar total := 0.0
-\tfor score in scores:
-\t\ttotal += score
-\treturn total / scores.size()
-`;
+const DIVISION_DEFECT_BLOCK = [
+  "## 최근 판 점수의 평균을 돌려준다.",
+  "static func average_score(scores: Array) -> float:",
+  "\tvar total := 0.0",
+  "\tfor score in scores:",
+  "\t\ttotal += score",
+  "\treturn total / scores.size()",
+];
 
-const CLEAN_FILE = `extends RefCounted
+const SMALL_DEFECT_FILE = ["extends RefCounted", "", ...INDEX_DEFECT_BLOCK, "", "", ...DIVISION_DEFECT_BLOCK].join("\n") + "\n";
+
+const SMALL_CLEAN_FILE = `extends RefCounted
 
 ## 일일 보상 티어 테이블. 정상 진행에서 tier는 1..3을 전달받는다.
 const REWARD_TIERS: Array[int] = [10, 20, 30]
@@ -62,31 +116,201 @@ static func average_score(scores: Array) -> float:
 \treturn total / scores.size()
 `;
 
-const ACCEPTANCE_CRITERIA = [
-  "정상 진행 tier 1..3 입력에서 보상량이 반환된다.",
-  "빈 점수 목록에서도 평균 계산이 안전하다.",
-];
-
-function asAddedPatch(content: string): string {
-  return content
-    .split("\n")
-    .map((line) => `+${line}`)
-    .join("\n");
+function addedFile(content: string): FixtureFile {
+  const lines = content.replace(/\n$/u, "").split("\n");
+  return {
+    status: "added",
+    content,
+    patch: [`@@ -0,0 +1,${lines.length} @@`, ...lines.map((line) => `+${line}`)].join("\n"),
+    additions: lines.length,
+    deletions: 0,
+  };
 }
 
-function buildCandidateUserPrompt(fileContent: string): string {
-  const criteria = ACCEPTANCE_CRITERIA.map((criterion, index) => `AC-${index + 1}: ${criterion}`).join("\n");
-  const markdown = [
+/** Deterministic, guard-complete GDScript module used to fill the context budget. */
+function generatedModule(index: number, targetChars: number): string {
+  const lines = ["extends RefCounted", "", `## 생성된 밸런스 모듈 ${index}. 테이블 조회는 모두 범위를 보정한다.`];
+  let table = 0;
+  while (lines.join("\n").length < targetChars) {
+    table += 1;
+    const size = 4 + ((index * 7 + table) % 5);
+    const values = Array.from({ length: size }, (_, position) => (index + 1) * 100 + table * 10 + position);
+    lines.push(
+      "",
+      `const TABLE_${index}_${table}: Array[int] = [${values.join(", ")}]`,
+      "",
+      `## 모듈 ${index} 테이블 ${table}의 index번째 값을 돌려준다. index는 0..${size - 1} 범위를 보정한다.`,
+      `static func table_${index}_${table}_value(index: int) -> int:`,
+      `\tvar safe_index := clampi(index, 0, TABLE_${index}_${table}.size() - 1)`,
+      `\treturn TABLE_${index}_${table}[safe_index]`,
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Inserts blocks after the given 1-based base lines and returns the new body
+ * plus a unified diff with three context lines around each insertion.
+ */
+function modifiedFile(
+  baseContent: string,
+  insertions: Array<{ afterLine: number; lines: string[] }>,
+): { file: FixtureFile; newLineOf: (insertionIndex: number, offsetInBlock: number) => number } {
+  const base = baseContent.replace(/\n$/u, "").split("\n");
+  const sorted = [...insertions].sort((left, right) => left.afterLine - right.afterLine);
+  const out: string[] = [];
+  const hunks: string[] = [];
+  const blockStarts: number[] = [];
+  let cursor = 0;
+  let added = 0;
+  for (const insertion of sorted) {
+    out.push(...base.slice(cursor, insertion.afterLine));
+    cursor = insertion.afterLine;
+    const contextBefore = base.slice(insertion.afterLine - 3, insertion.afterLine);
+    const contextAfter = base.slice(insertion.afterLine, insertion.afterLine + 3);
+    const oldStart = insertion.afterLine - 2;
+    const newStart = oldStart + added;
+    hunks.push(
+      `@@ -${oldStart},${contextBefore.length + contextAfter.length} +${newStart},${contextBefore.length + contextAfter.length + insertion.lines.length} @@`,
+      ...contextBefore.map((line) => ` ${line}`),
+      ...insertion.lines.map((line) => `+${line}`),
+      ...contextAfter.map((line) => ` ${line}`),
+    );
+    blockStarts.push(out.length + 1);
+    out.push(...insertion.lines);
+    added += insertion.lines.length;
+  }
+  out.push(...base.slice(cursor));
+  return {
+    file: {
+      status: "modified",
+      content: `${out.join("\n")}\n`,
+      patch: hunks.join("\n"),
+      additions: added,
+      deletions: 0,
+    },
+    newLineOf: (insertionIndex, offsetInBlock) => blockStarts[insertionIndex]! + offsetInBlock,
+  };
+}
+
+function buildFixture(name: string): Fixture {
+  const smallPath = "godot/scripts/reward_tiers.gd";
+  if (name === "clean") {
+    return {
+      title: "chore: 잔소리 봇 프로브 (clean)",
+      acceptanceCriteria: ACCEPTANCE_CRITERIA,
+      files: { [smallPath]: addedFile(SMALL_CLEAN_FILE) },
+      plantedRoots: [],
+    };
+  }
+  if (name === "large-defect") {
+    const largePath = "godot/scripts/economy_tables.gd";
+    const base = generatedModule(0, 24_000);
+    const baseLineCount = base.replace(/\n$/u, "").split("\n").length;
+    const firstAfter = Math.floor(baseLineCount / 3);
+    const secondAfter = Math.floor((baseLineCount * 2) / 3);
+    const { file, newLineOf } = modifiedFile(base, [
+      { afterLine: firstAfter, lines: INDEX_DEFECT_BLOCK },
+      { afterLine: secondAfter, lines: DIVISION_DEFECT_BLOCK },
+    ]);
+    const files: Record<string, FixtureFile> = { [largePath]: file };
+    for (let index = 1; index <= 5; index += 1) {
+      files[`godot/scripts/gen_module_${String(index).padStart(2, "0")}.gd`] = addedFile(generatedModule(index, 11_000));
+    }
+    return {
+      title: "chore: 대형 diff 잔소리 봇 프로브",
+      acceptanceCriteria: ACCEPTANCE_CRITERIA,
+      files,
+      plantedRoots: [
+        { file: largePath, line: newLineOf(0, INDEX_DEFECT_BLOCK.length - 1) },
+        { file: largePath, line: newLineOf(1, DIVISION_DEFECT_BLOCK.length - 1) },
+      ],
+    };
+  }
+  const file = addedFile(SMALL_DEFECT_FILE);
+  const lines = SMALL_DEFECT_FILE.split("\n");
+  return {
+    title: "chore: 잔소리 봇 프로브",
+    acceptanceCriteria: ACCEPTANCE_CRITERIA,
+    files: { [smallPath]: file },
+    plantedRoots: [
+      { file: smallPath, line: lines.indexOf("\treturn REWARD_TIERS[tier]") + 1 },
+      { file: smallPath, line: lines.indexOf("\treturn total / scores.size()") + 1 },
+    ],
+  };
+}
+
+type RenderedContext = {
+  hostFacts: ReviewGateHostFacts;
+  reviewGateMarkdown: string;
+  currentHeadFileContents: Record<string, string>;
+  visibleChangedPatches: Record<string, string>;
+};
+
+/** Mirrors the merge-gate markdown, truncation, and host visibility rules of buildPullRequestContext. */
+function renderContext(fixture: Fixture): RenderedContext {
+  const headSha = "1c3aa42fa140fa411ee4f2260e8effb325c6f695";
+  const paths = Object.keys(fixture.files).sort((left, right) => left.localeCompare(right));
+
+  const patchSections: Array<{ filename: string; patch: string; section: string }> = [];
+  let patchChars = 0;
+  for (const filename of paths) {
+    const file = fixture.files[filename]!;
+    const section = [
+      `### ${filename}`,
+      `status=${file.status} additions=${file.additions} deletions=${file.deletions}`,
+      "```diff",
+      file.patch,
+      "```",
+    ].join("\n");
+    if (patchChars + section.length > MAX_REVIEW_GATE_PATCH_CHARS) {
+      break;
+    }
+    patchSections.push({ filename, patch: file.patch, section });
+    patchChars += section.length;
+  }
+
+  const contentSections: Array<{ filename: string; content: string; section: string; contextComplete: boolean }> = [];
+  for (const filename of paths) {
+    const file = fixture.files[filename]!;
+    const header = `status=${file.status} additions=${file.additions} deletions=${file.deletions} current_head_size=${file.content.length}`;
+    if (file.content.length > MAX_CHANGED_FILE_CONTENT_CHARS) {
+      const digest = buildLargeFileDigest(file.content, file.patch);
+      contentSections.push({
+        filename,
+        content: file.content,
+        contextComplete: Boolean(digest?.changedRegionsComplete),
+        section: digest
+          ? [
+              `### ${filename}`,
+              `${header} (full body omitted >${MAX_CHANGED_FILE_CONTENT_CHARS} chars; showing changed-region windows + symbol outline)`,
+              "````gdscript",
+              digest.markdown,
+              "````",
+            ].join("\n")
+          : [`### ${filename}`, header, `current HEAD content omitted because it exceeds ${MAX_CHANGED_FILE_CONTENT_CHARS} characters`].join("\n"),
+      });
+      continue;
+    }
+    contentSections.push({
+      filename,
+      content: file.content,
+      contextComplete: true,
+      section: [`### ${filename}`, header, "````gdscript", file.content.trimEnd(), "````"].join("\n"),
+    });
+  }
+
+  const reviewGateMarkdown = [
     "# Pull Request Merge Gate Context",
     "",
     "Repository: seorilabs/animal-chess",
     "Pull request: #14",
-    "Title: chore: 잔소리 봇 프로브",
-    "Head SHA: 1c3aa42fa140fa411ee4f2260e8effb325c6f695",
+    `Title: ${fixture.title}`,
+    `Head SHA: ${headSha}`,
     "Base: seorilabs/animal-chess:main",
     "Head: seorilabs/animal-chess:jansoree-bot-probe",
     "Change class: product_logic",
-    "Minimum explicit acceptance criteria: 2",
+    `Minimum explicit acceptance criteria: ${fixture.acceptanceCriteria.length}`,
     "",
     "## Status Checks",
     "- checks / Godot compile and smoke: success",
@@ -95,7 +319,7 @@ function buildCandidateUserPrompt(fileContent: string): string {
     "Acceptance criteria and source_quote values may be derived ONLY from this section.",
     "### PR body",
     "## 인수조건 체크리스트",
-    ...ACCEPTANCE_CRITERIA.map((criterion) => `- [ ] ${criterion}`),
+    ...fixture.acceptanceCriteria.map((criterion) => `- [ ] ${criterion}`),
     "",
     "## Review Turn Context",
     "review_round: 1",
@@ -111,97 +335,170 @@ function buildCandidateUserPrompt(fileContent: string): string {
     "(none - first review turn)",
     "",
     "## Changed Files",
-    "### godot/scripts/reward_tiers.gd",
-    "```diff",
-    asAddedPatch(fileContent),
-    "```",
+    truncate(patchSections.map(({ section }) => section).join("\n\n") || "(none)", MAX_REVIEW_GATE_PATCH_CHARS),
     "",
     "## Current Changed File Contents",
     "Product files are prioritized. Large files contain every changed-hunk window plus a bounded symbol outline instead of the full body.",
-    "### godot/scripts/reward_tiers.gd",
-    "```gdscript",
-    fileContent,
-    "```",
+    contentSections.map(({ section }) => section).join("\n\n") || "(none)",
     "",
     "## Deep Repository Context",
     "This is selected current-HEAD evidence, not necessarily the whole repository.",
     "(none)",
   ].join("\n");
+  const truncated = truncate(reviewGateMarkdown, MAX_CONTEXT_CHARS - REVIEW_GATE_PROMPT_RESERVE_CHARS);
 
-  return [
-    `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`,
-    "## Host 검증 사실",
-    "head_sha: 1c3aa42fa140fa411ee4f2260e8effb325c6f695",
-    "change_class: product_logic",
-    "test_inventory_complete: false",
-    "test_inventory_file_count: 0",
-    "fatal_context_complete: true",
-    "",
-    "## Host가 추출한 명시적 인수조건",
-    criteria,
-    "",
-    "## Host Evidence Candidates",
-    "아래 JSON line만 test_evidence와 supporting_test_evidence의 근거로 선택할 수 있습니다.",
-    "(current-HEAD evidence candidate 없음)",
-    "",
-    "## 신뢰된 명시 요청",
-    "(없음)",
-    "",
-    "## 지적 원장",
-    "(이전 지적 없음)",
-    "",
-    markdown,
-    "",
-    "## 수행할 작업",
-    "각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, 위 현재 HEAD 근거만으로 완전히 입증된 치명 후보를 최대 2개 candidates에 함께 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다.",
-  ].join("\n");
-}
+  const currentHeadFileContents = Object.fromEntries(
+    contentSections
+      .filter(({ contextComplete, section }) => contextComplete && truncated.includes(section))
+      .map(({ filename, content }) => [filename, content]),
+  );
+  const visibleChangedPatches = Object.fromEntries(
+    patchSections
+      .filter(({ section }) => truncated.includes(section))
+      .map(({ filename, patch }) => [filename, patch]),
+  );
+  const fatalContextComplete = paths.every((filename) => Boolean(visibleChangedPatches[filename]));
 
-function buildVerifierUserPrompt(candidateUser: string, candidates: unknown[]): string {
-  return [
-    candidateUser,
-    "",
-    "## 반증할 후보",
-    JSON.stringify({ candidates }, null, 2),
-    "",
-    "## 수행할 작업",
-    "각 후보를 현재 HEAD에서 먼저 반증하고, 후보 순서대로 confirmed/rejected/uncertain 중 하나를 submit_review 도구로 제출하세요.",
-  ].join("\n");
+  return {
+    hostFacts: {
+      headSha,
+      changeClass: "product_logic",
+      testInventoryComplete: false,
+      testInventoryFileCount: 0,
+      fatalContextComplete,
+    },
+    reviewGateMarkdown: truncated,
+    currentHeadFileContents,
+    visibleChangedPatches,
+  };
 }
 
 async function main(): Promise<void> {
-  const scenario = process.argv[2] === "clean" ? "clean" : "defect";
+  const scenario = process.argv[2] || "defect";
   const runs = Number.parseInt(process.argv[3] || "1", 10);
   const apiKey = process.env.MINIMAX_API_KEY?.trim();
   if (!apiKey) {
     throw new Error("MINIMAX_API_KEY is required");
   }
-  const http = { apiKey, timeoutMs: 300_000 };
-  const fileContent = scenario === "defect" ? DEFECT_FILE : CLEAN_FILE;
+  if (!["defect", "clean", "large-defect"].includes(scenario)) {
+    throw new Error(`unknown fixture: ${scenario}`);
+  }
+
+  const http = { apiKey, timeoutMs: REQUEST_TIMEOUT_MS };
+  const fixture = buildFixture(scenario);
+  const context = renderContext(fixture);
+  const explicitAcceptanceCriteria = [...fixture.acceptanceCriteria];
+  const evidenceCandidatesText = formatReviewEvidenceCandidates(
+    buildReviewEvidenceCandidates(context.currentHeadFileContents, { acceptanceCriteria: explicitAcceptanceCriteria }),
+  );
   const candidateSystem = buildReviewGateCandidateSystemPrompt({ acceptanceGuideMode: true });
   const verifierSystem = buildReviewGateVerifierSystemPrompt();
-  const candidateUser = buildCandidateUserPrompt(fileContent);
+  const candidateUser = buildReviewGateCandidateUserPrompt({
+    ...context.hostFacts,
+    explicitAcceptanceCriteria,
+    evidenceCandidatesText,
+    trustedRequest: "",
+    ledgerText: "",
+    reviewGateMarkdown: context.reviewGateMarkdown,
+    acceptanceGuideMode: true,
+  });
+  console.log(JSON.stringify({
+    scenario,
+    files: Object.keys(fixture.files).length,
+    visibleContents: Object.keys(context.currentHeadFileContents),
+    visiblePatches: Object.keys(context.visibleChangedPatches).length,
+    fatalContextComplete: context.hostFacts.fatalContextComplete,
+    candidatePromptChars: candidateUser.length,
+    plantedRoots: fixture.plantedRoots,
+  }));
 
+  let failed = false;
   for (let run = 1; run <= runs; run += 1) {
     const startedAt = Date.now();
-    const candidateResponse = await callMiniMaxMessages(
-      buildMiniMaxReviewRequest({ systemPrompt: candidateSystem, userPrompt: candidateUser }),
-      http,
-    );
-    const parsed = parseMiniMaxReviewResponse(candidateResponse, {
-      expectedAcceptanceCriteria: ACCEPTANCE_CRITERIA,
-    });
-    if (!parsed.ok) {
-      console.log(JSON.stringify({ scenario, run, phase: "candidate", ok: false, errors: parsed.errors.slice(0, 6) }));
+    const phases: MiniMaxGateRequestUsage[] = [];
+    const record = (usage: MiniMaxGateRequestUsage): void => {
+      phases.push(usage);
+    };
+
+    let candidates: MiniMaxReviewCandidate[];
+    let coverage: string[];
+    try {
+      const result = await executeMiniMaxGateRequest({
+        http,
+        buildRequest: () => buildMiniMaxReviewRequest({ systemPrompt: candidateSystem, userPrompt: candidateUser }),
+        parseResponse: (response) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria: explicitAcceptanceCriteria }),
+        originalUserPrompt: candidateUser,
+        phaseLabel: "후보 추출",
+        onRequestCompleted: record,
+      });
+      candidates = result.value.candidates;
+      coverage = result.value.acceptanceCoverage.map((row) => `${row.criterionId}:${row.status}`);
+    } catch (error) {
+      failed = true;
+      console.log(JSON.stringify({ scenario, run, phase: "candidate", ok: false, phases, error: error instanceof Error ? error.message : String(error) }));
       continue;
     }
 
-    const candidates = parsed.value.candidates;
-    const summary: Record<string, unknown> = {
+    const verifierPromptChars: Record<string, number> = {};
+    const isolated = await verifyReviewGateCandidatesIsolated(candidates, async (candidate) => {
+      const userPrompt = buildReviewGateVerifierUserPrompt({
+        ...context.hostFacts,
+        candidate,
+        explicitAcceptanceCriteria,
+        evidenceCandidatesText,
+        currentHeadFileContents: context.currentHeadFileContents,
+        visibleChangedPatches: context.visibleChangedPatches,
+      });
+      verifierPromptChars[candidate.candidateId] = userPrompt.length;
+      const result = await executeMiniMaxGateRequest({
+        http,
+        buildRequest: () => buildMiniMaxVerificationRequest({ systemPrompt: verifierSystem, userPrompt }),
+        parseResponse: (response) =>
+          parseMiniMaxVerificationResponse(response, {
+            expectedCandidates: [{ candidateId: candidate.candidateId, kind: candidate.kind }],
+          }),
+        originalUserPrompt: userPrompt,
+        phaseLabel: `후보 반증 ${candidate.candidateId}`,
+        onRequestCompleted: record,
+      });
+      return result.value.verifications[0]!;
+    });
+
+    const pipeline = evaluateMiniMaxReviewGateCandidates({
+      candidates,
+      verifications: isolated.verifications,
+      explicitAcceptanceCriteria,
+      testInventoryComplete: context.hostFacts.testInventoryComplete,
+      testInventoryFileCount: context.hostFacts.testInventoryFileCount,
+      currentHeadFileContents: context.currentHeadFileContents,
+      visibleChangedPatches: context.visibleChangedPatches,
+    });
+
+    const acceptedRoots = pipeline.accepted.map((item) => {
+      const candidate = candidates.find((entry) => entry.candidateId === item.candidateId);
+      return { candidateId: item.candidateId, file: candidate?.file ?? null, line: candidate?.line ?? null };
+    });
+    const plantedDetected = fixture.plantedRoots.map((root) => ({
+      ...root,
+      proposed: candidates.some((candidate) => candidate.file === root.file && candidate.line === root.line),
+      accepted: acceptedRoots.some((item) => item.file === root.file && item.line === root.line),
+    }));
+    const slowVerifier = phases.filter((phase) => phase.phase.startsWith("후보 반증") && phase.elapsedMs >= VERIFIER_TIMEOUT_BUDGET_MS);
+    const pass = fixture.plantedRoots.length === 0
+      ? pipeline.accepted.length === 0 && isolated.failures.length === 0
+      : plantedDetected.some((root) => root.accepted) && isolated.failures.length === 0;
+    if (!pass || slowVerifier.length > 0) {
+      failed = true;
+    }
+
+    console.log(JSON.stringify({
       scenario,
       run,
-      elapsedMs: Date.now() - startedAt,
-      coverage: parsed.value.acceptanceCoverage.map((row) => `${row.criterionId}:${row.status}`),
+      pass,
+      totalElapsedMs: Date.now() - startedAt,
+      phases,
+      verifierPromptChars,
+      coverage,
       candidates: candidates.map((candidate) => ({
         id: candidate.candidateId,
         kind: candidate.kind,
@@ -209,26 +506,20 @@ async function main(): Promise<void> {
         line: candidate.line,
         outcome: candidate.fatalOutcome,
       })),
-    };
-
-    if (candidates.length > 0) {
-      const verificationResponse = await callMiniMaxMessages(
-        buildMiniMaxVerificationRequest({
-          systemPrompt: verifierSystem,
-          userPrompt: buildVerifierUserPrompt(candidateUser, [...candidates]),
-        }),
-        http,
-      );
-      const verification = parseMiniMaxVerificationResponse(verificationResponse, {
-        expectedCandidates: candidates.map(({ candidateId, kind }) => ({ candidateId, kind })),
-      });
-      summary.verifications = verification.ok
-        ? verification.value.verifications.map((entry) => `${entry.candidateId}:${entry.verdict}`)
-        : { errors: verification.errors.slice(0, 6) };
-    }
-
-    console.log(JSON.stringify(summary));
+      verifications: isolated.verifications.map((entry) => ({
+        id: entry.candidateId,
+        verdict: entry.verdict,
+        reasonKo: entry.reasonKo,
+      })),
+      failures: isolated.failures,
+      accepted: acceptedRoots,
+      rejected: pipeline.rejected.map((item) => `${item.candidateId}:${item.code}`),
+      plantedDetected,
+      slowVerifier: slowVerifier.map((phase) => phase.phase),
+    }));
   }
+
+  process.exitCode = failed ? 1 : 0;
 }
 
 await main();

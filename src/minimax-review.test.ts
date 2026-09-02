@@ -670,6 +670,33 @@ test("verifier maps confirmed/rejected/uncertain results and checks expected IDs
   }
 });
 
+test("verifier accepts an isolated single-candidate subset but still requires the echoed ID and order", () => {
+  const isolated = parseMiniMaxVerificationPayload(
+    { verifications: [verification("C-2", "uncertain")] },
+    { expectedCandidates: [{ candidateId: "C-2", kind: "fatal_defect" }] },
+  );
+  assert.equal(isolated.ok, true);
+  if (isolated.ok) assert.equal(isolated.value.verifications[0]?.candidateId, "C-2");
+
+  const wrongEcho = parseMiniMaxVerificationPayload(
+    { verifications: [verification("C-1", "uncertain")] },
+    { expectedCandidates: [{ candidateId: "C-2", kind: "fatal_defect" }] },
+  );
+  assert.equal(wrongEcho.ok, false);
+  if (!wrongEcho.ok) assert.ok(wrongEcho.errors.some((error) => error.includes('expected "C-2"')));
+
+  const wrongOrder = parseMiniMaxVerificationPayload(
+    { verifications: [verification("C-1", "uncertain"), verification("C-2", "uncertain")] },
+    {
+      expectedCandidates: [
+        { candidateId: "C-2", kind: "fatal_defect" },
+        { candidateId: "C-1", kind: "fatal_defect" },
+      ],
+    },
+  );
+  assert.equal(wrongOrder.ok, false);
+});
+
 test("confirmed and rejected verifier verdicts require current-HEAD evidence", () => {
   const rejected = verification("C-1", "rejected");
   rejected.evidence = [];
