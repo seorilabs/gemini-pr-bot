@@ -234,3 +234,38 @@ function fatalCandidate(): MiniMaxReviewCandidate {
     evidence: [],
   };
 }
+
+test("추출 패스 실패는 공개 보류 항목이 되고 결함 검사 통과를 주장하지 않는다", () => {
+  const disclosure = buildReviewGateDisclosure({
+    explicitAcceptanceCriteria: [AC_1],
+    acceptanceCoverage: [unknown("AC-1", AC_1)],
+    groundedAcceptanceCriteria: new Set(),
+    coverageValidationErrors: ["AC-1: acceptance_coverage_unknown"],
+    fatalContextComplete: true,
+    pipeline: pipeline(),
+    candidates: [],
+    verifications: [],
+    unconfirmedOpenFindings: [],
+    failedExtractionPasses: ["coverage", "defect"],
+  });
+  assert.equal(disclosure.fatalCheckPassed, false);
+  const labels = disclosure.abstainItems.map((item) => item.label);
+  assert.ok(labels.includes("인수조건 커버리지 분류"));
+  assert.ok(labels.includes("치명 결함 검사"));
+  assert.ok(disclosure.abstainItems.every((item) => item.peripheral === false));
+
+  const healthy = buildReviewGateDisclosure({
+    explicitAcceptanceCriteria: [],
+    acceptanceCoverage: [],
+    groundedAcceptanceCriteria: new Set(),
+    coverageValidationErrors: [],
+    fatalContextComplete: true,
+    pipeline: pipeline(),
+    candidates: [],
+    verifications: [],
+    unconfirmedOpenFindings: [],
+    failedExtractionPasses: [],
+  });
+  assert.equal(healthy.fatalCheckPassed, true);
+  assert.deepEqual(healthy.abstainItems, []);
+});

@@ -276,7 +276,7 @@ PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github,seorilabs/platform,seorilabs/seori
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 
-The conservative gate uses MiniMax-M3's Anthropic-compatible Messages API with a strict submit_review tool contract. It runs two bounded passes: a maximum-two candidate pass followed by an adversarial verifier pass. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
+The conservative gate uses MiniMax-M3's Anthropic-compatible Messages API with a strict submit_review tool contract. It runs three bounded passes: an acceptance-coverage pass (criteria plus the host evidence inventory, no diff; also proposes missing-test candidates), a fatal-defect pass (diff and current-HEAD code, at most two candidates) that runs in parallel with it, and one adversarial verifier request per candidate. A failed pass degrades only its own output (unknown coverage, no defect candidate, or an uncertain verdict) and is recorded in the run's validation errors; the whole gate abstains only when every extraction pass fails. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
 
 Structured PR reviews use the bounded Gemini candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable. Incomplete or ambiguous evidence on the first two review turns becomes `FOLLOW_UP`, posts a PR comment with a host-owned reason and concrete Contributor response, and completes the check as `action_required`. From the third turn, `neutral` is permitted only when every remaining item is peripheral; it still posts the unresolved scope and required response, submits no approval, and hands merge authorization to a current-HEAD human review.
 
@@ -320,7 +320,7 @@ After a `stale-self-trigger` marker is present for the current HEAD, later unmen
 
 ## Local Gate Probe
 
-`scripts/gate-probe.mts` replays the production candidate → verifier gate against the real MiniMax API on synthetic PR fixtures, so prompt and budget changes can be measured without a deploy-and-webhook cycle. It uses the same prompt builders, request/repair contract (`executeMiniMaxGateRequest`), isolated per-candidate verification, and host trust boundary (`evaluateMiniMaxReviewGateCandidates`) as the bot.
+`scripts/gate-probe.mts` replays the production gate against the real MiniMax API on synthetic PR fixtures, so prompt and budget changes can be measured without a deploy-and-webhook cycle. It uses the same prompt builders, request/repair contract (`executeMiniMaxGateRequest`), two isolated extraction passes (coverage without the diff, fatal-defect discovery without the evidence inventory), isolated per-candidate verification, and host trust boundary (`evaluateMiniMaxReviewGateCandidates`) as the bot. `--thinking-budget=N` or `--thinking-off` applies an experimental thinking setting to the extraction passes for latency comparison; production always uses adaptive thinking.
 
 ```bash
 set -a; source ~/.config/seorilabs/minimax-api-key.env; set +a   # shared/minimax/coding-plan-api-key
@@ -335,7 +335,7 @@ Fixtures:
 - `clean`: the same file with guards; no candidate may be accepted.
 - `large-defect`: a modified >20k-char file whose two defects are added in small hunks (rendered as a changed-region digest like production) plus several fully inlined generated files that push the candidate prompt toward the production context budget.
 
-Each run prints one JSON line with per-phase `{phase, inputTokens, outputTokens, elapsedMs}`, prompt sizes, coverage, candidates, verifier verdicts, isolated-call failures, and host pipeline accepted/rejected codes. The process exits non-zero when no planted root is accepted, a clean fixture yields an accepted finding, an isolated verifier call fails, or any verifier request takes 300 s or longer. Per-root candidate recall (`proposed`/`accepted`) and verifier verdicts with their reasons are printed for diagnosis but do not fail the run, because the probe measures the gate mechanism rather than the model's per-candidate judgement.
+Each run prints one JSON line with per-phase `{phase, inputTokens, outputTokens, elapsedMs}` (`커버리지 분류`, `결함 후보 탐색`, `후보 반증 C-n`), prompt sizes, coverage, candidates, verifier verdicts, isolated-call failures, and host pipeline accepted/rejected codes. The process exits non-zero when no planted root is accepted, a clean fixture yields an accepted finding, an isolated verifier call fails, or any verifier request takes 300 s or longer. Per-root candidate recall (`proposed`/`accepted`) and verifier verdicts with their reasons are printed for diagnosis but do not fail the run, because the probe measures the gate mechanism rather than the model's per-candidate judgement.
 
 ## Build And Deploy
 

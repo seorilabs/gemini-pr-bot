@@ -14,9 +14,11 @@ import {
 } from "./minimax-gate.js";
 import {
   MINIMAX_REVIEW_MODEL,
-  buildMiniMaxReviewRequest,
+  buildMiniMaxCoverageRequest,
+  buildMiniMaxDefectRequest,
   buildMiniMaxVerificationRequest,
-  parseMiniMaxReviewResponse,
+  parseMiniMaxCoverageResponse,
+  parseMiniMaxDefectResponse,
   parseMiniMaxVerificationResponse,
   type MiniMaxReviewCandidate,
   type MiniMaxReviewResult,
@@ -126,19 +128,33 @@ export class AiClient {
     );
   }
 
-  async reviewGateCandidates(
+  /** Coverage pass: classifies every acceptance criterion and proposes missing-test candidates without the diff. */
+  async reviewGateCoverage(
     systemPrompt: string,
     userPrompt: string,
     expectedAcceptanceCriteria: readonly string[],
-    options: { repairInvalidOutput?: boolean } = {},
   ): Promise<MiniMaxGateResult<MiniMaxReviewResult>> {
     return executeMiniMaxGateRequest({
       http: this.minimaxHttpOptions(),
-      buildRequest: () => buildMiniMaxReviewRequest({ systemPrompt, userPrompt }),
-      parseResponse: (response) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria }),
+      buildRequest: () => buildMiniMaxCoverageRequest({ systemPrompt, userPrompt }),
+      parseResponse: (response) => parseMiniMaxCoverageResponse(response, { expectedAcceptanceCriteria }),
       originalUserPrompt: userPrompt,
-      phaseLabel: "후보 추출",
-      repairInvalidOutput: options.repairInvalidOutput ?? true,
+      phaseLabel: "커버리지 분류",
+      onRequestCompleted: this.logGateRequest,
+    });
+  }
+
+  /** Defect pass: hunts fatal-defect candidates over the diff and current-HEAD code. */
+  async reviewGateDefectCandidates(
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<MiniMaxGateResult<MiniMaxReviewResult>> {
+    return executeMiniMaxGateRequest({
+      http: this.minimaxHttpOptions(),
+      buildRequest: () => buildMiniMaxDefectRequest({ systemPrompt, userPrompt }),
+      parseResponse: (response) => parseMiniMaxDefectResponse(response),
+      originalUserPrompt: userPrompt,
+      phaseLabel: "결함 후보 탐색",
       onRequestCompleted: this.logGateRequest,
     });
   }

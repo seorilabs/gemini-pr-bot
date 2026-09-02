@@ -7,7 +7,10 @@
  * without a deploy-and-webhook cycle.
  *
  * Usage:
- *   MINIMAX_API_KEY=... node --import tsx scripts/gate-probe.mts <defect|clean|large-defect> [runs]
+ *   MINIMAX_API_KEY=... node --import tsx scripts/gate-probe.mts <defect|clean|large-defect> [runs] [--thinking-budget N|--thinking-off]
+ *
+ * The optional thinking flag applies to the coverage and defect passes only and
+ * exists to measure MiniMax-M3 latency against production's adaptive default.
  *
  * Exit code 1 when no planted root is accepted by the host pipeline, a clean
  * fixture yields an accepted finding, a phase or isolated verifier call fails,
@@ -19,16 +22,21 @@
 import { buildLargeFileDigest } from "../src/github.js";
 import { executeMiniMaxGateRequest, type MiniMaxGateRequestUsage } from "../src/minimax-gate.js";
 import {
-  buildMiniMaxReviewRequest,
+  buildMiniMaxCoverageRequest,
+  buildMiniMaxDefectRequest,
   buildMiniMaxVerificationRequest,
-  parseMiniMaxReviewResponse,
+  parseMiniMaxCoverageResponse,
+  parseMiniMaxDefectResponse,
   parseMiniMaxVerificationResponse,
-  type MiniMaxReviewCandidate,
+  type MiniMaxThinking,
 } from "../src/minimax-review.js";
+import { extractReviewGateCandidatesIsolated } from "../src/review-gate-extraction.js";
 import { evaluateMiniMaxReviewGateCandidates } from "../src/review-gate-pipeline.js";
 import {
-  buildReviewGateCandidateSystemPrompt,
-  buildReviewGateCandidateUserPrompt,
+  buildReviewGateCoverageSystemPrompt,
+  buildReviewGateCoverageUserPrompt,
+  buildReviewGateDefectSystemPrompt,
+  buildReviewGateDefectUserPrompt,
   buildReviewGateVerifierSystemPrompt,
   type ReviewGateHostFacts,
 } from "../src/review-gate-prompt.js";
@@ -374,8 +382,15 @@ function renderContext(fixture: Fixture): RenderedContext {
 }
 
 async function main(): Promise<void> {
-  const scenario = process.argv[2] || "defect";
-  const runs = Number.parseInt(process.argv[3] || "1", 10);
+  const args = process.argv.slice(2);
+  const scenario = args.find((arg) => !arg.startsWith("--")) || "defect";
+  const runs = Number.parseInt(args.filter((arg) => !arg.startsWith("--"))[1] || "1", 10);
+  const budgetArg = args.find((arg) => arg.startsWith("--thinking-budget="))?.split("=")[1];
+  const thinking: MiniMaxThinking | undefined = args.includes("--thinking-off")
+    ? { type: "disabled" }
+    : budgetArg
+      ? { type: "enabled", budget_tokens: Number.parseInt(budgetArg, 10) }
+      : undefined;
   const apiKey = process.env.MINIMAX_API_KEY?.trim();
   if (!apiKey) {
     throw new Error("MINIMAX_API_KEY is required");
@@ -391,12 +406,24 @@ async function main(): Promise<void> {
   const evidenceCandidatesText = formatReviewEvidenceCandidates(
     buildReviewEvidenceCandidates(context.currentHeadFileContents, { acceptanceCriteria: explicitAcceptanceCriteria }),
   );
-  const candidateSystem = buildReviewGateCandidateSystemPrompt({ acceptanceGuideMode: true });
+  const coverageSystem = buildReviewGateCoverageSystemPrompt({ acceptanceGuideMode: true });
+  const defectSystem = buildReviewGateDefectSystemPrompt({ acceptanceGuideMode: true });
   const verifierSystem = buildReviewGateVerifierSystemPrompt();
-  const candidateUser = buildReviewGateCandidateUserPrompt({
+  const coverageUser = buildReviewGateCoverageUserPrompt({
     ...context.hostFacts,
     explicitAcceptanceCriteria,
     evidenceCandidatesText,
+    trustedRequest: "",
+    acceptanceSourceText: fixture.acceptanceCriteria.map((criterion) => `- [ ] ${criterion}`).join("\n"),
+    reviewRound: 1,
+    previousReviewHeadSha: null,
+    previousReviewBody: "",
+    contributorResponses: "",
+    acceptanceGuideMode: true,
+  });
+  const defectUser = buildReviewGateDefectUserPrompt({
+    ...context.hostFacts,
+    explicitAcceptanceCriteria,
     trustedRequest: "",
     ledgerText: "",
     reviewGateMarkdown: context.reviewGateMarkdown,
@@ -404,11 +431,13 @@ async function main(): Promise<void> {
   });
   console.log(JSON.stringify({
     scenario,
+    thinking: thinking ?? { type: "adaptive" },
     files: Object.keys(fixture.files).length,
     visibleContents: Object.keys(context.currentHeadFileContents),
     visiblePatches: Object.keys(context.visibleChangedPatches).length,
     fatalContextComplete: context.hostFacts.fatalContextComplete,
-    candidatePromptChars: candidateUser.length,
+    coveragePromptChars: coverageUser.length,
+    defectPromptChars: defectUser.length,
     plantedRoots: fixture.plantedRoots,
   }));
 
@@ -420,24 +449,35 @@ async function main(): Promise<void> {
       phases.push(usage);
     };
 
-    let candidates: MiniMaxReviewCandidate[];
-    let coverage: string[];
+    let extraction;
     try {
-      const result = await executeMiniMaxGateRequest({
-        http,
-        buildRequest: () => buildMiniMaxReviewRequest({ systemPrompt: candidateSystem, userPrompt: candidateUser }),
-        parseResponse: (response) => parseMiniMaxReviewResponse(response, { expectedAcceptanceCriteria: explicitAcceptanceCriteria }),
-        originalUserPrompt: candidateUser,
-        phaseLabel: "후보 추출",
-        onRequestCompleted: record,
+      extraction = await extractReviewGateCandidatesIsolated(explicitAcceptanceCriteria, {
+        coverage: async () =>
+          (await executeMiniMaxGateRequest({
+            http,
+            buildRequest: () => buildMiniMaxCoverageRequest({ systemPrompt: coverageSystem, userPrompt: coverageUser, thinking }),
+            parseResponse: (response) => parseMiniMaxCoverageResponse(response, { expectedAcceptanceCriteria: explicitAcceptanceCriteria }),
+            originalUserPrompt: coverageUser,
+            phaseLabel: "커버리지 분류",
+            onRequestCompleted: record,
+          })).value,
+        defect: async () =>
+          (await executeMiniMaxGateRequest({
+            http,
+            buildRequest: () => buildMiniMaxDefectRequest({ systemPrompt: defectSystem, userPrompt: defectUser, thinking }),
+            parseResponse: (response) => parseMiniMaxDefectResponse(response),
+            originalUserPrompt: defectUser,
+            phaseLabel: "결함 후보 탐색",
+            onRequestCompleted: record,
+          })).value,
       });
-      candidates = result.value.candidates;
-      coverage = result.value.acceptanceCoverage.map((row) => `${row.criterionId}:${row.status}`);
     } catch (error) {
       failed = true;
-      console.log(JSON.stringify({ scenario, run, phase: "candidate", ok: false, phases, error: error instanceof Error ? error.message : String(error) }));
+      console.log(JSON.stringify({ scenario, run, phase: "extraction", ok: false, phases, error: error instanceof Error ? error.message : String(error) }));
       continue;
     }
+    const candidates = extraction.candidates;
+    const coverage = extraction.acceptanceCoverage.map((row) => `${row.criterionId}:${row.status}`);
 
     const verifierPromptChars: Record<string, number> = {};
     const isolated = await verifyReviewGateCandidatesIsolated(candidates, async (candidate) => {
@@ -484,9 +524,10 @@ async function main(): Promise<void> {
       accepted: acceptedRoots.some((item) => item.file === root.file && item.line === root.line),
     }));
     const slowVerifier = phases.filter((phase) => phase.phase.startsWith("후보 반증") && phase.elapsedMs >= VERIFIER_TIMEOUT_BUDGET_MS);
+    const callFailures = extraction.failures.length + isolated.failures.length;
     const pass = fixture.plantedRoots.length === 0
-      ? pipeline.accepted.length === 0 && isolated.failures.length === 0
-      : plantedDetected.some((root) => root.accepted) && isolated.failures.length === 0;
+      ? pipeline.accepted.length === 0 && callFailures === 0
+      : plantedDetected.some((root) => root.accepted) && callFailures === 0;
     if (!pass || slowVerifier.length > 0) {
       failed = true;
     }
@@ -511,6 +552,7 @@ async function main(): Promise<void> {
         verdict: entry.verdict,
         reasonKo: entry.reasonKo,
       })),
+      extractionFailures: extraction.failures,
       failures: isolated.failures,
       accepted: acceptedRoots,
       rejected: pipeline.rejected.map((item) => `${item.candidateId}:${item.code}`),

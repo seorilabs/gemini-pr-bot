@@ -38,6 +38,8 @@ export type ReviewGateDisclosureInput = {
   candidates: readonly MiniMaxReviewCandidate[];
   verifications: readonly MiniMaxCandidateVerification[];
   unconfirmedOpenFindings: readonly StoredReviewFinding[];
+  /** Extraction passes whose model call failed; their output is host defaults, not a verdict. */
+  failedExtractionPasses?: readonly ("coverage" | "defect")[];
 };
 
 /**
@@ -140,6 +142,24 @@ export function buildReviewGateDisclosure(
     });
   }
 
+  const failedPasses = new Set(input.failedExtractionPasses ?? []);
+  if (failedPasses.has("coverage")) {
+    abstainItems.push({
+      label: "인수조건 커버리지 분류",
+      reason: "커버리지 분류 모델 호출이 실패해 인수조건별 자동화 테스트 근거를 확정하지 못했습니다.",
+      requiredAction: "코드 수정은 필요하지 않습니다. 이 댓글에 현재 HEAD 재검토를 요청하면 Seori가 분류를 다시 실행합니다.",
+      peripheral: false,
+    });
+  }
+  if (failedPasses.has("defect")) {
+    abstainItems.push({
+      label: "치명 결함 검사",
+      reason: "결함 탐색 모델 호출이 실패해 현재 HEAD의 치명 결함 여부를 검사하지 못했습니다.",
+      requiredAction: "코드 수정은 필요하지 않습니다. 이 댓글에 현재 HEAD 재검토를 요청하면 Seori가 결함 검사를 다시 실행합니다.",
+      peripheral: false,
+    });
+  }
+
   for (const finding of input.unconfirmedOpenFindings) {
     abstainItems.push({
       label: unconfirmedFindingLabel(finding),
@@ -152,6 +172,7 @@ export function buildReviewGateDisclosure(
   const fatalCheckPassed =
     input.fatalContextComplete &&
     input.pipeline.inputValid &&
+    !failedPasses.has("defect") &&
     !uncertainCandidates.some((candidate) => candidate.kind === "fatal_defect") &&
     !input.unconfirmedOpenFindings.some((finding) => finding.candidate.kind === "fatal");
 

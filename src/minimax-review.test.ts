@@ -6,7 +6,10 @@ import {
   MINIMAX_REVIEW_MAX_CANDIDATES,
   MINIMAX_REVIEW_MODEL,
   MINIMAX_REVIEW_TOOL_NAME,
-  buildMiniMaxReviewRequest,
+  buildMiniMaxCoverageRequest,
+  buildMiniMaxDefectRequest,
+  parseMiniMaxCoverageResponse,
+  parseMiniMaxDefectResponse,
   buildMiniMaxVerificationRequest,
   parseMiniMaxReviewPayload,
   parseMiniMaxReviewResponse,
@@ -150,8 +153,8 @@ function messagesResponse(
   };
 }
 
-test("candidate request uses MiniMax-M3 conservative Anthropic Messages defaults", () => {
-  const request = buildMiniMaxReviewRequest({
+test("coverage request uses MiniMax-M3 conservative Anthropic Messages defaults", () => {
+  const request = buildMiniMaxCoverageRequest({
     systemPrompt: "고정된 시스템 규칙",
     userPrompt: "PR 현재 HEAD 문맥",
   });
@@ -192,6 +195,74 @@ test("candidate request uses MiniMax-M3 conservative Anthropic Messages defaults
   assert.ok(schema.properties.candidates.items.required.includes("test_search_summary_ko"));
 });
 
+test("defect request carries a candidates-only fatal schema and honors an explicit thinking setting", () => {
+  const request = buildMiniMaxDefectRequest({
+    systemPrompt: "결함 규칙",
+    userPrompt: "diff와 현재 HEAD",
+    thinking: { type: "enabled", budget_tokens: 4_096 },
+  });
+  assert.equal(request.max_tokens, 24_576);
+  assert.deepEqual(request.thinking, { type: "enabled", budget_tokens: 4_096 });
+  const schema = request.tools[0]?.input_schema as any;
+  assert.deepEqual(schema.required, ["candidates"]);
+  assert.equal(schema.properties.acceptance_coverage, undefined);
+  assert.deepEqual(schema.properties.candidates.items.properties.kind.enum, ["fatal_defect"]);
+
+  const coverage = buildMiniMaxCoverageRequest({ systemPrompt: "규칙", userPrompt: "문맥" });
+  const coverageSchema = coverage.tools[0]?.input_schema as any;
+  assert.deepEqual(coverageSchema.properties.candidates.items.properties.kind.enum, ["missing_acceptance_test"]);
+  assert.deepEqual(coverage.thinking, { type: "adaptive" });
+});
+
+test("defect pass parses candidates-only payloads and rejects coverage rows or missing-test kinds", () => {
+  const ok = parseMiniMaxDefectResponse(messagesResponse({ candidates: [fatalCandidate()] }));
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.deepEqual(ok.value.acceptanceCoverage, []);
+    assert.equal(ok.value.candidates[0]?.kind, "fatal_defect");
+  }
+
+  const empty = parseMiniMaxDefectResponse(messagesResponse({ candidates: [] }));
+  assert.equal(empty.ok, true);
+
+  const withCoverage = parseMiniMaxDefectResponse(messagesResponse({ acceptance_coverage: [], candidates: [] }));
+  assert.equal(withCoverage.ok, false);
+  if (!withCoverage.ok) assert.ok(withCoverage.errors.some((error) => error.includes("acceptance_coverage") && error.includes("unexpected field")));
+
+  const wrongKind = parseMiniMaxDefectResponse(messagesResponse({ candidates: [missingTestCandidate()] }));
+  assert.equal(wrongKind.ok, false);
+  if (!wrongKind.ok) assert.ok(wrongKind.errors.some((error) => error.includes("is not allowed in this pass")));
+});
+
+test("coverage pass rejects fatal candidates but keeps the combined cache parser permissive", () => {
+  const criterion = "저장 후 다시 열어도 값이 유지된다.";
+  const coverageRow = {
+    criterion_id: "AC-1",
+    acceptance_criterion: criterion,
+    status: "missing",
+    test_evidence: null,
+    supporting_test_evidence: [],
+  };
+  const rejected = parseMiniMaxCoverageResponse(
+    messagesResponse({ acceptance_coverage: [coverageRow], candidates: [fatalCandidate()] }),
+    { expectedAcceptanceCriteria: [criterion] },
+  );
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) assert.ok(rejected.errors.some((error) => error.includes('"fatal_defect" is not allowed in this pass')));
+
+  const accepted = parseMiniMaxCoverageResponse(
+    messagesResponse({ acceptance_coverage: [coverageRow], candidates: [] }),
+    { expectedAcceptanceCriteria: [criterion] },
+  );
+  assert.equal(accepted.ok, true);
+
+  const combined = parseMiniMaxReviewPayload(
+    { acceptance_coverage: [coverageRow], candidates: [fatalCandidate()] },
+    { expectedAcceptanceCriteria: [criterion] },
+  );
+  assert.equal(combined.ok, true);
+});
+
 test("verification request has its own strict verifier schema and smaller default output", () => {
   const request = buildMiniMaxVerificationRequest({
     systemPrompt: "반증을 우선하는 검증 규칙",
@@ -210,7 +281,7 @@ test("verification request has its own strict verifier schema and smaller defaul
 });
 
 test("request builder preserves system/user boundaries and validates inputs", () => {
-  const request = buildMiniMaxReviewRequest({
+  const request = buildMiniMaxCoverageRequest({
     systemPrompt: "  시스템 앞뒤 공백도 그대로 둔다  ",
     userPrompt: "  사용자 문맥도 그대로 둔다  ",
     maxTokens: 12_345,
@@ -220,16 +291,16 @@ test("request builder preserves system/user boundaries and validates inputs", ()
   assert.equal(request.max_tokens, 12_345);
 
   assert.throws(
-    () => buildMiniMaxReviewRequest({ systemPrompt: " ", userPrompt: "문맥" }),
+    () => buildMiniMaxCoverageRequest({ systemPrompt: " ", userPrompt: "문맥" }),
     /systemPrompt must be a non-empty string/,
   );
   assert.throws(
-    () => buildMiniMaxReviewRequest({ systemPrompt: "규칙", userPrompt: "\n" }),
+    () => buildMiniMaxCoverageRequest({ systemPrompt: "규칙", userPrompt: "\n" }),
     /userPrompt must be a non-empty string/,
   );
   assert.throws(
     () =>
-      buildMiniMaxReviewRequest({
+      buildMiniMaxCoverageRequest({
         systemPrompt: "규칙",
         userPrompt: "문맥",
         maxTokens: 524_289,
