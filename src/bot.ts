@@ -148,6 +148,13 @@ const NO_ACTIONABLE_FINDINGS_TEXT = "조치할 항목 없음.";
 const AUTO_SQUASH_MERGE_FAILED_MARKER = botAutoSquashMergeFailedMarker();
 const REVIEW_GATE_METADATA_RESERVE_CHARS = 4_000;
 
+/**
+ * Validation errors kept in the gate log line. Four truncated the record below
+ * the per-AC coverage errors alone, so host rejection codes never reached the
+ * operational log and a run could not be diagnosed without a local replay.
+ */
+const REVIEW_GATE_LOGGED_VALIDATION_ERRORS = 20;
+
 type ReviewGatePrompts = {
   coverageSystem: string;
   coverageUser: string;
@@ -2520,6 +2527,21 @@ export class PrBot {
         const verification = evaluatedEnvelope.verifications.find((item) => item.candidateId === rejected.candidateId);
         return verification?.verdict === "uncertain";
       });
+    // Verifier-confirmed fatal candidates the host could not ground. Jansoree
+    // must not report those runs as "no defect found": the gate never reached
+    // that judgement, and a silent drop reads exactly like a clean review.
+    const undecidedFatalCandidates = pipeline.rejected.filter((rejectedCandidate) => {
+      const candidate = evaluatedEnvelope.candidates.find(
+        (item) => item.candidateId === rejectedCandidate.candidateId,
+      );
+      if (candidate?.kind !== "fatal_defect") {
+        return false;
+      }
+      const verification = evaluatedEnvelope.verifications.find(
+        (item) => item.candidateId === rejectedCandidate.candidateId,
+      );
+      return verification?.verdict === "confirmed";
+    }).length;
     const baseVerdict: Exclude<ReviewGatePublicVerdict, "FOLLOW_UP"> = blockingOpenFindings.length > 0
       ? "FAIL"
       : hasUnresolvedValidation
@@ -2605,6 +2627,7 @@ export class PrBot {
             publicFindings,
             ledgerSnapshot.publishedFingerprints,
             failedExtractionPasses.includes("defect"),
+            undecidedFatalCandidates,
           );
         }
       }
@@ -2984,7 +3007,7 @@ export class PrBot {
         promptVersion: REVIEW_GATE_PROMPT_VERSION,
         verdict,
         validationErrors: validationErrors.length,
-        validationErrorDetails: validationErrors.slice(0, 4),
+        validationErrorDetails: validationErrors.slice(0, REVIEW_GATE_LOGGED_VALIDATION_ERRORS),
       },
       "conservative review gate evaluated",
     );
@@ -3460,6 +3483,7 @@ export class PrBot {
     findings: readonly ReviewGatePublicFinding[],
     publishedFingerprints: ReadonlySet<string>,
     defectReviewFailed = false,
+    undecidedCandidates = 0,
   ): Promise<void> {
     try {
       if (!this.jansoree.available()) {
@@ -3477,6 +3501,7 @@ export class PrBot {
         findings: fatalFindings,
         markerPrefix: JANSOREE_ADVISORY_MARKER_PREFIX,
         defectReviewFailed,
+        undecidedCandidates,
       });
       const newFindings = fatalFindings.filter(
         (finding) => !finding.fingerprint || !publishedFingerprints.has(finding.fingerprint),

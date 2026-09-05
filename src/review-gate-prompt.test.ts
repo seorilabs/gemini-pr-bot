@@ -36,6 +36,15 @@ test("가이드 커버리지 프롬프트는 quote 전사 실패를 막는 규�
   assert.match(prompt, /실행 명령 자체를 assertion_quote로 만들지 마세요/u);
 });
 
+test("결함 프롬프트는 host가 검증하는 symbol 형식을 두 모드 모두에 명시한다", () => {
+  // host는 symbol을 인과 근거 범위에서 그대로 찾는다. 계약이 프롬프트에 없으면
+  // 모델이 파일명을 수식해 붙여 검증까지 끝난 결함이 조용히 폐기된다.
+  for (const prompt of [guideDefect(), conservativeDefect()]) {
+    assert.match(prompt, /현재 HEAD 코드에 그대로 나타나는 식별자 하나만 제출하세요/u);
+    assert.match(prompt, /파일명, 모듈, 클래스 수식을 붙이거나 새로 만들지 마세요/u);
+  }
+});
+
 test("커버리지 패스와 결함 패스는 후보 종류와 규칙을 서로 나눈다", () => {
   // v7: 한 호출이 커버리지 행과 diff 전체를 함께 다루던 구조를 두 호출로 나눴다.
   const coverage = guideCoverage();

@@ -227,6 +227,34 @@ test("symbol이 근거에서 200줄보다 멀리 떨어져 있으면 같은 실�
   assert.equal(result.rejected[0]?.code, "fatal_symbol_not_grounded");
 });
 
+test("파일·모듈 수식이 붙은 symbol은 마지막 식별자로 재바인딩해 인정하고 ledger에는 실제 식별자를 남긴다", () => {
+  const qualified = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({ symbol: "save.saveDraft" })],
+    verifications: [fatalVerification()],
+  }));
+
+  assert.deepEqual(qualified.rejected, []);
+  assert.equal(qualified.accepted.length, 1);
+  assert.equal(qualified.ledgerCandidates[0]?.symbol, "saveDraft");
+  assert.equal(qualified.ledgerCandidates[0]?.trigger, "src/save.ts#saveDraft");
+
+  const bare = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate()],
+    verifications: [fatalVerification()],
+  }));
+  assert.equal(qualified.publicFindings[0]?.fingerprint, bare.publicFindings[0]?.fingerprint);
+});
+
+test("수식을 벗겨낸 식별자도 현재 HEAD 근거 범위에 없으면 치명 결함을 계속 거부한다", () => {
+  const result = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({ symbol: "save.persistDraft" })],
+    verifications: [fatalVerification()],
+  }));
+
+  assert.equal(result.accepted.length, 0);
+  assert.equal(result.rejected[0]?.code, "fatal_symbol_not_grounded");
+});
+
 test("인과 근거가 하나뿐이거나 대표 종단 위치로 끝나지 않으면 거부한다", () => {
   const oneEvidence = evaluateMiniMaxReviewGateCandidates(input({
     candidates: [fatalCandidate({ evidence: [codeEvidence(3, 'storage.remove("save-record");')] })],

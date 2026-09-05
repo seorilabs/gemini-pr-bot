@@ -364,3 +364,30 @@ test("잔소리 요약은 결함 검토 호출이 실패하면 지적 없음으�
   });
   assert.match(withFinding, /발견한 결함: 1건/u);
 });
+
+test("잔소리 요약은 host가 근거를 확정하지 못한 후보를 지적 없음으로 위장하지 않는다", () => {
+  const undecided = formatJansoreeSummary({
+    headSha: "abc1234",
+    findings: [],
+    markerPrefix: "jansoree:advisory",
+    undecidedCandidates: 2,
+  });
+  assert.match(undecided, /결함 후보 2건이 host 근거 검증을 통과하지 못해/u);
+  assert.doesNotMatch(undecided, /지적할 결함을 찾지 못했습니다/u);
+
+  const none = formatJansoreeSummary({
+    headSha: "abc1234",
+    findings: [],
+    markerPrefix: "jansoree:advisory",
+    undecidedCandidates: 0,
+  });
+  assert.match(none, /지적할 결함을 찾지 못했습니다/u);
+
+  const withFinding = formatJansoreeSummary({
+    headSha: "abc1234",
+    findings: [fatalFinding()],
+    markerPrefix: "jansoree:advisory",
+    undecidedCandidates: 1,
+  });
+  assert.match(withFinding, /발견한 결함: 1건/u);
+});

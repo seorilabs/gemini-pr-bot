@@ -326,7 +326,13 @@ function candidateItemSchema(kinds: readonly MiniMaxReviewCandidateKind[]): Reco
       impact_ko: { type: "string", minLength: 1, maxLength: 800 },
       fix_ko: { type: "string", minLength: 1, maxLength: 800 },
       file: { type: ["string", "null"], minLength: 1, maxLength: 500 },
-      symbol: { type: ["string", "null"], minLength: 1, maxLength: 300 },
+      symbol: {
+        type: ["string", "null"],
+        minLength: 1,
+        maxLength: 300,
+        description:
+          "fatal_defect 후보가 지목한 함수나 상수의 이름입니다. 인과 근거 범위의 현재 HEAD 코드에 그대로 나타나는 식별자 하나만 쓰고 파일·모듈·클래스 수식을 붙이지 마세요. missing_acceptance_test 후보는 null입니다.",
+      },
       line: { type: ["integer", "null"], minimum: 1 },
       code_quote: { type: ["string", "null"], minLength: 1, maxLength: 2_000 },
       fatal_outcome: { anyOf: [{ enum: [...MINIMAX_FATAL_OUTCOMES] }, { type: "null" }] },

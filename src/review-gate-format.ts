@@ -573,6 +573,12 @@ export function formatJansoreeSummary(input: {
   markerPrefix: string;
   /** True when the defect-discovery call failed, so "no findings" would be a false claim. */
   defectReviewFailed?: boolean;
+  /**
+   * Fatal candidates the verifier confirmed but the host could not ground.
+   * They are not publishable findings, yet reporting them as "no findings"
+   * would hide a judgement the gate never actually reached.
+   */
+  undecidedCandidates?: number;
 }): string {
   const fatalFindings = input.findings.filter(
     (finding): finding is ReviewGatePublicFatalFinding => finding.kind === "fatal_defect",
@@ -584,8 +590,13 @@ export function formatJansoreeSummary(input: {
     `검토 HEAD: \`${input.headSha}\``,
     "",
   ];
+  const undecidedCandidates = input.undecidedCandidates ?? 0;
   if (fatalFindings.length === 0 && input.defectReviewFailed) {
     lines.push("결함 검토 모델 호출이 실패해 이번 HEAD의 결함 여부를 판정하지 못했습니다. 지적이 없다는 뜻은 아닙니다.");
+  } else if (fatalFindings.length === 0 && undecidedCandidates > 0) {
+    lines.push(
+      `결함 후보 ${undecidedCandidates}건이 host 근거 검증을 통과하지 못해 이번 HEAD의 결함 여부를 판정하지 못했습니다. 지적이 없다는 뜻은 아닙니다.`,
+    );
   } else if (fatalFindings.length === 0) {
     lines.push("지적할 결함을 찾지 못했습니다.");
   } else {

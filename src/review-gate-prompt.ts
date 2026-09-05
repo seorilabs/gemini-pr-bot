@@ -20,6 +20,14 @@ const SHARED_GUIDE_RULES = {
   koreanTool: "모든 공개 설명 필드는 한글로 쓰고 정의된 submit_review 도구를 정확히 한 번 사용하세요.",
 } as const;
 
+/**
+ * Host grounds `symbol` against the causal window verbatim, so a file, module,
+ * or class qualifier the source does not declare loses the whole candidate.
+ * The rule states that contract to the model instead of leaving it host-only.
+ */
+const DEFECT_SYMBOL_RULE =
+  "symbol은 인과 근거 범위의 현재 HEAD 코드에 그대로 나타나는 식별자 하나만 제출하세요. 파일명, 모듈, 클래스 수식을 붙이거나 새로 만들지 마세요.";
+
 const ACCEPTANCE_GUIDE_COVERAGE_RULES = [
   SHARED_GUIDE_RULES.role,
   "Host가 제공한 모든 인수조건을 AC-1부터 순서와 원문 그대로 acceptance_coverage에 한 번씩 제출하세요.",
@@ -46,6 +54,7 @@ const ACCEPTANCE_GUIDE_DEFECT_RULES = [
   "허용 후보는 최대 2개이며 fatal_defect뿐입니다.",
   "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
   "치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하고, 마지막 근거는 결과를 직접 일으키는 root line이어야 합니다.",
+  DEFECT_SYMBOL_RULE,
   "가드가 있는 경로, 단순 return false/null, UI 옵션, deny 규칙, 부분 diff의 부재, 프레임워크 동작 추측은 치명 결함이 아닙니다.",
   "fatal_defect 후보의 criterion_id, acceptance_criterion, test_search_summary_ko는 null로 제출하세요.",
   "후보 예시 1: 정상 호출에서 guard 없이 persistent storage delete가 직접 실행되고 전 경로가 보이면 fatal_defect 후보입니다.",
@@ -93,6 +102,7 @@ const CONSERVATIVE_GATE_DEFECT_RULES = [
   "후속 턴에서 이전 review 이후 수정되지 않은 누적 PR 코드로 새 범위를 열지 마세요. 현재 HEAD 전체 파일은 추가 변경의 최종 상태와 직전 요청 해소 여부를 확인할 때만 사용하세요.",
   "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
   "치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하고, 마지막 근거는 결과를 직접 일으키는 root line이어야 합니다.",
+  DEFECT_SYMBOL_RULE,
   "가드가 있는 경로, 단순 return false/null, UI 옵션, deny 규칙, 부분 diff의 부재, 프레임워크 동작 추측은 치명 결함이 아닙니다.",
   "refuted 상태는 현재 Changed Files에 같은 file/symbol의 새 added root가 직접 보일 때만 회귀 후보로 제출하세요. 현재 파일에 코드가 남았다는 이유만으로 반복하지 마세요.",
   "확실한 후보가 없으면 candidates는 빈 배열로 제출하세요.",

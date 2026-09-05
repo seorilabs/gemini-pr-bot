@@ -340,7 +340,8 @@ function validateFatalCandidate(
     return rejected(candidate, causalError.code, causalError.reason);
   }
 
-  if (!isSymbolGrounded(content, candidateSymbol, candidate.evidence)) {
+  const groundedSymbol = groundSymbol(content, candidateSymbol, candidate.evidence);
+  if (!groundedSymbol) {
     return rejected(
       candidate,
       "fatal_symbol_not_grounded",
@@ -375,7 +376,7 @@ function validateFatalCandidate(
     kind: "code",
     file: path,
     line: evidence.line,
-    symbol: candidateSymbol,
+    symbol: groundedSymbol,
     quote: evidence.codeQuote,
   }));
   const ledgerCandidate: FatalFindingCandidate = {
@@ -383,9 +384,9 @@ function validateFatalCandidate(
     category: "fatal_defect",
     outcome: fatalOutcome,
     file: path,
-    symbol: candidateSymbol,
+    symbol: groundedSymbol,
     // Stable host-owned trigger prevents paraphrases from creating duplicates.
-    trigger: `${path}#${candidateSymbol}`,
+    trigger: `${path}#${groundedSymbol}`,
     evidence: ledgerEvidence,
   };
   const publicFinding: ReviewGatePublicFinding = {
@@ -489,13 +490,24 @@ function validatePublicFinding(
   return { candidateId: candidate.candidateId, ledgerCandidate, publicFinding };
 }
 
-function isSymbolGrounded(
+/**
+ * Resolves the model's symbol to the identifier the current HEAD causal window
+ * actually contains, or null when nothing matches.
+ *
+ * MiniMax sometimes qualifies the symbol with its file or module
+ * (`reward_tiers.reward_for_tier`) where the source only declares the bare
+ * identifier, which discarded verifier-confirmed fatal defects. A qualified
+ * name therefore retries with its last segment, and the resolved identifier is
+ * what the ledger stores, so the same finding cannot fork its fingerprint
+ * across turns when the model changes the qualifier.
+ */
+function groundSymbol(
   content: string,
   symbol: string,
   evidence: readonly MiniMaxCodeEvidence[],
-): boolean {
+): string | null {
   if (!symbol.trim() || /[\r\n]/u.test(symbol)) {
-    return false;
+    return null;
   }
   const lines = content.split(/\r?\n/u);
   const firstEvidenceLine = evidence[0]?.line || 1;
@@ -503,10 +515,28 @@ function isSymbolGrounded(
   const start = Math.max(0, firstEvidenceLine - SYMBOL_MAX_DISTANCE - 1);
   const end = Math.min(lines.length, lastEvidenceLine);
   const window = lines.slice(start, end).join("\n");
+  if (windowContainsSymbol(window, symbol)) {
+    return symbol;
+  }
+  const tail = qualifiedSymbolTail(symbol);
+  return tail && windowContainsSymbol(window, tail) ? tail : null;
+}
+
+function windowContainsSymbol(window: string, symbol: string): boolean {
   if (SIMPLE_IDENTIFIER_PATTERN.test(symbol)) {
     return new RegExp(`(?<![A-Za-z0-9_$])${escapeRegExp(symbol)}(?![A-Za-z0-9_$])`, "u").test(window);
   }
   return window.includes(symbol);
+}
+
+/** Last segment of a qualified name such as `module.fn` or `Class::fn`, only when it is a plain identifier. */
+function qualifiedSymbolTail(symbol: string): string | null {
+  const segments = symbol.split(/::|\./u);
+  if (segments.length < 2) {
+    return null;
+  }
+  const tail = segments.at(-1)!.trim();
+  return SIMPLE_IDENTIFIER_PATTERN.test(tail) ? tail : null;
 }
 
 function hasDirectOutcomeSignature(
