@@ -2388,6 +2388,16 @@ export class PrBot {
             guide,
             true,
           );
+          if (this.config.defectReviewEnabled) {
+            await this.publishJansoreeAdvisory(
+              repo,
+              prNumber,
+              context.headSha,
+              [],
+              ledgerSnapshot.publishedFingerprints,
+              true,
+            );
+          }
         }
         return;
       }
