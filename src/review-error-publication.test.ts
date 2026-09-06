@@ -5,7 +5,7 @@ import { PrBot } from "./bot.js";
 const HEAD = "a37cad512cc9068f650122edb479ef64bc15dde8";
 const REPO = { owner: "seorilabs", repo: "saju-reader", fullName: "seorilabs/saju-reader" };
 
-function fixture(current = true) {
+function fixture(current = true, failAfterGuidePublication = false) {
   const comments: string[] = [];
   const verdicts: string[] = [];
   const guides: boolean[] = [];
@@ -27,7 +27,10 @@ function fixture(current = true) {
     reviewGateContextHash: () => "fixture",
     recordReviewGateRun: async (...args: any[]) => { verdicts.push(args[8]); },
     currentStatusForPublish: async () => current ? { headSha: HEAD } : null,
-    publishAcceptanceGuide: async (...args: any[]) => { guides.push(args[6]); },
+    publishAcceptanceGuide: async (...args: any[]) => {
+      guides.push(args[6]);
+      if (failAfterGuidePublication) throw new Error("check completion failed after guide publication");
+    },
   });
   const run = () => bot.runStructuredReview({}, REPO, 124, {
     headSha: HEAD,
@@ -56,4 +59,12 @@ test("오류 처리 중 HEAD가 바뀌면 이전 HEAD의 가이드와 요약을 
   assert.deepEqual(f.verdicts, ["ABSTAIN"]);
   assert.deepEqual(f.guides, []);
   assert.deepEqual(f.comments, []);
+});
+
+test("가이드 게시 후 check 완료가 실패해도 잔소리 요약은 이미 게시되어 있다", async () => {
+  const f = fixture(true, true);
+  await assert.rejects(f.run(), /check completion failed/u);
+  assert.deepEqual(f.guides, [true]);
+  assert.equal(f.comments.length, 1);
+  assert.match(f.comments[0]!, /판정하지 못했습니다/u);
 });

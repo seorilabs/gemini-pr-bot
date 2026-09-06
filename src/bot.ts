@@ -2379,15 +2379,6 @@ export class PrBot {
           check,
         );
         if (latest) {
-          await this.publishAcceptanceGuide(
-            octokit,
-            repo,
-            prNumber,
-            context,
-            check,
-            guide,
-            true,
-          );
           if (this.config.defectReviewEnabled) {
             await this.publishJansoreeAdvisory(
               repo,
@@ -2398,6 +2389,15 @@ export class PrBot {
               true,
             );
           }
+          await this.publishAcceptanceGuide(
+            octokit,
+            repo,
+            prNumber,
+            context,
+            check,
+            guide,
+            true,
+          );
         }
         return;
       }
