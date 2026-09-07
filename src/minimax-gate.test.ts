@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { executeMiniMaxGateRequest, type MiniMaxGateRequestUsage } from "./minimax-gate.js";
+import {
+  executeMiniMaxGateRequest,
+  type MiniMaxGateRequestUsage,
+  type MiniMaxGateResponse,
+} from "./minimax-gate.js";
 import { buildMiniMaxVerificationRequest, parseMiniMaxVerificationResponse } from "./minimax-review.js";
 
 function toolResponse(verifications: unknown[]): Response {
@@ -28,7 +32,11 @@ function validVerification(candidateId = "C-2") {
   };
 }
 
-function gateOptions(fetchImpl: typeof fetch, usages: MiniMaxGateRequestUsage[]) {
+function gateOptions(
+  fetchImpl: typeof fetch,
+  usages: MiniMaxGateRequestUsage[],
+  responses: MiniMaxGateResponse[] = [],
+) {
   return {
     http: { apiKey: "test-key", timeoutMs: 5_000, fetchImpl },
     buildRequest: () => buildMiniMaxVerificationRequest({ systemPrompt: "system", userPrompt: "user prompt" }),
@@ -41,12 +49,16 @@ function gateOptions(fetchImpl: typeof fetch, usages: MiniMaxGateRequestUsage[])
     onRequestCompleted: (usage: MiniMaxGateRequestUsage) => {
       usages.push(usage);
     },
+    onResponseReceived: (response: MiniMaxGateResponse) => {
+      responses.push(response);
+    },
   };
 }
 
 test("형식이 틀린 첫 응답은 검증 오류를 덧붙여 한 번만 다시 요청한다", async () => {
   const prompts: string[] = [];
   const usages: MiniMaxGateRequestUsage[] = [];
+  const responses: MiniMaxGateResponse[] = [];
   let calls = 0;
   const fetchImpl: typeof fetch = async (_url, init) => {
     calls += 1;
@@ -57,7 +69,7 @@ test("형식이 틀린 첫 응답은 검증 오류를 덧붙여 한 번만 다�
       : toolResponse([validVerification("C-2")]);
   };
 
-  const result = await executeMiniMaxGateRequest(gateOptions(fetchImpl, usages));
+  const result = await executeMiniMaxGateRequest(gateOptions(fetchImpl, usages, responses));
   assert.equal(calls, 2);
   assert.equal(result.value.verifications[0]?.candidateId, "C-2");
   assert.equal(result.provider, "minimax");
@@ -67,6 +79,11 @@ test("형식이 틀린 첫 응답은 검증 오류를 덧붙여 한 번만 다�
   assert.equal(usages[0]?.inputTokens, 120);
   assert.equal(usages[0]?.outputTokens, 40);
   assert.ok((usages[0]?.elapsedMs ?? -1) >= 0);
+  assert.deepEqual(responses.map((response) => response.phase), [
+    "후보 반증 C-2",
+    "후보 반증 C-2 형식 보정",
+  ]);
+  assert.ok(responses.every((response) => response.rawBody.includes('"model":"MiniMax-M3"')));
 });
 
 test("보정 요청도 실패하면 phase 라벨이 담긴 오류를 던지고, 보정을 끄면 재요청하지 않는다", async () => {

@@ -21,6 +21,7 @@ test("성공 응답은 요청을 무가공 전송하고 body를 무가공 반환
   const request = buildMiniMaxCoverageRequest({ systemPrompt: "system", userPrompt: "user" });
   const upstream = { type: "message", role: "assistant", content: [], usage: { input_tokens: 1 } };
   const seen: { url?: string; init?: RequestInit } = {};
+  const rawResponses: string[] = [];
   const fetchImpl: typeof fetch = async (url, init) => {
     seen.url = String(url);
     seen.init = init;
@@ -31,6 +32,7 @@ test("성공 응답은 요청을 무가공 전송하고 body를 무가공 반환
     apiKey: "test-key",
     timeoutMs: 5_000,
     fetchImpl,
+    onResponse: (item) => { rawResponses.push(item.rawBody); },
   });
 
   assert.equal(seen.url, `${MINIMAX_DEFAULT_BASE_URL}${MINIMAX_ANTHROPIC_MESSAGES_PATH}`);
@@ -41,9 +43,11 @@ test("성공 응답은 요청을 무가공 전송하고 body를 무가공 반환
   assert.equal(headers["content-type"], "application/json");
   assert.deepEqual(JSON.parse(String(seen.init?.body)), request);
   assert.deepEqual(response, upstream);
+  assert.deepEqual(rawResponses, [JSON.stringify(upstream)]);
 });
 
 test("HTTP 429는 상태 코드와 Retry-After 기반 retryDelayMs를 오류 메시지에 싣는다", async () => {
+  const rawResponses: Array<{ status: number; body: string }> = [];
   const fetchImpl: typeof fetch = async () =>
     new Response("too many requests", { status: 429, headers: { "retry-after": "7" } });
 
@@ -52,6 +56,7 @@ test("HTTP 429는 상태 코드와 Retry-After 기반 retryDelayMs를 오류 메
       apiKey: "k",
       timeoutMs: 5_000,
       fetchImpl,
+      onResponse: (item) => { rawResponses.push({ status: item.status, body: item.rawBody }); },
     }),
     (error: Error) => {
       assert.match(error.message, /MiniMax HTTP 429/u);
@@ -59,6 +64,21 @@ test("HTTP 429는 상태 코드와 Retry-After 기반 retryDelayMs를 오류 메
       return true;
     },
   );
+  assert.deepEqual(rawResponses, [{ status: 429, body: "too many requests" }]);
+});
+
+test("응답 원문 관찰자 실패는 MiniMax 리뷰 결과를 바꾸지 않는다", async () => {
+  const upstream = { content: [], base_resp: { status_code: 0 } };
+  const response = await callMiniMaxMessages(
+    buildMiniMaxTextRequest({ systemPrompt: "", userPrompt: "p", maxTokens: 128 }),
+    {
+      apiKey: "k",
+      timeoutMs: 5_000,
+      fetchImpl: async () => jsonResponse(upstream),
+      onResponse: async () => { throw new Error("Discord unavailable"); },
+    },
+  );
+  assert.deepEqual(response, upstream);
 });
 
 test("base_resp 오류 봉투는 HTTP 200이어도 quota 키워드와 함께 거부된다", async () => {

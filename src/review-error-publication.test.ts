@@ -13,6 +13,9 @@ function fixture(current = true, failAfterGuidePublication = false) {
   Object.assign(bot, {
     config: { acceptanceGuideModeEnabled: true, defectReviewEnabled: true },
     logger: { warn: () => undefined },
+    operationsNotifier: {
+      startReviewAudit: async () => null,
+    },
     ai: { reviewGateDefectCandidates: async () => { throw new Error("request timed out"); } },
     jansoree: {
       available: () => true,
@@ -67,4 +70,52 @@ test("가이드 게시 후 check 완료가 실패해도 잔소리 요약은 이�
   assert.deepEqual(f.guides, [true]);
   assert.equal(f.comments.length, 1);
   assert.match(f.comments[0]!, /판정하지 못했습니다/u);
+});
+
+test("서리 리뷰와 잔소리 리뷰의 요약 및 지적을 Discord 리뷰 쓰레드에 남긴다", async () => {
+  const entries: Array<{ title: string; text: string }> = [];
+  const bot: any = Object.create(PrBot.prototype);
+  bot.operationsNotifier = {
+    notifyReviewAuditEntry: async (_session: unknown, entry: { title: string; text: string }) => {
+      entries.push(entry);
+    },
+  };
+  const session = {
+    repoFullName: REPO.fullName,
+    prNumber: 124,
+    prTitle: "리뷰 감사 로그",
+    prUrl: `https://github.com/${REPO.fullName}/pull/124`,
+    headSha: HEAD,
+    parentId: "review-audit-parent",
+    threadName: "saju-reader #124 리뷰 로그",
+  };
+
+  await bot.notifyAcceptanceGuideAudit(session, {
+    summary: "서리 리뷰 결과",
+    items: [{
+      id: "AC-1",
+      label: "저장 실패 시 데이터를 보존한다",
+      reason: "현재 테스트 근거가 없습니다.",
+      requiredAction: "회귀 테스트를 추가해 주세요.",
+    }],
+  }, "");
+  await bot.notifyJansoreeAudit(session, "잔소리 리뷰 결과", [{
+    kind: "fatal_defect",
+    title: "저장 시 프로세스가 종료됩니다",
+    problem: "정상 저장 경로에서 예외가 발생합니다.",
+    trigger: "저장 버튼을 누릅니다.",
+    evidence: { file: "src/save.ts", line: 42, code: "throw new Error('fatal')" },
+    impact: "저장할 수 없습니다.",
+    requiredAction: "예외를 제거하고 회귀 테스트를 추가해 주세요.",
+    fingerprint: "fatal-save-42",
+  }]);
+
+  assert.deepEqual(entries.map((entry) => entry.title), [
+    "서리 리뷰 · 요약",
+    "서리 리뷰 · 쓰레드 1",
+    "잔소리 리뷰 · 요약",
+    "잔소리 리뷰 · 지적 1",
+  ]);
+  assert.match(entries[1]!.text, /회귀 테스트를 추가/u);
+  assert.match(entries[3]!.text, /src\/save\.ts/u);
 });

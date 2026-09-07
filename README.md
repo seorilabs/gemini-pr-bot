@@ -278,7 +278,7 @@ AUTO_SQUASH_MERGE_ENABLED=true
 
 The conservative gate uses MiniMax-M3's Anthropic-compatible Messages API with a strict submit_review tool contract. It runs three bounded passes: an acceptance-coverage pass (criteria plus the host evidence inventory, no diff; also proposes missing-test candidates), a fatal-defect pass (diff and current-HEAD code, at most two candidates) that runs in parallel with it, and one adversarial verifier request per candidate. A failed pass degrades only its own output (unknown coverage, no defect candidate, or an uncertain verdict) and is recorded in the run's validation errors; the whole gate abstains only when every extraction pass fails. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
 
-Structured PR reviews use the bounded Gemini candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable. Incomplete or ambiguous evidence on the first two review turns becomes `FOLLOW_UP`, posts a PR comment with a host-owned reason and concrete Contributor response, and completes the check as `action_required`. From the third turn, `neutral` is permitted only when every remaining item is peripheral; it still posts the unresolved scope and required response, submits no approval, and hands merge authorization to a current-HEAD human review.
+Structured PR reviews use the bounded MiniMax candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable. Incomplete or ambiguous evidence on the first two review turns becomes `FOLLOW_UP`, posts a PR comment with a host-owned reason and concrete Contributor response, and completes the check as `action_required`. From the third turn, `neutral` is permitted only when every remaining item is peripheral; it still posts the unresolved scope and required response, submits no approval, and hands merge authorization to a current-HEAD human review.
 
 Changed-file context is product-code-first. Small changed product files are supplied in full; large files use changed-hunk windows plus a bounded symbol outline. Fatal review is scoped to defects introduced on changed lines, so a PASS requires a visible usable patch for every current product file instead of the full body of every large file. Related tests and repository context use the remaining prompt budget.
 `ALLOW_PUBLIC_REPOS=false` remains the default. Only repositories listed in `PUBLIC_REPOSITORY_ALLOWLIST` are handled when they are public.
@@ -289,8 +289,11 @@ If every enabled provider is already in cooldown before a provider command is st
 
 Discord operations notifications are accepted durably by Backoffice before this service treats delivery as successful. The subject is `ops.notification.v1.seori-review` and each request carries a stable event ID.
 
+When review auditing is enabled, each structured review posts one PR link in `#seori-review`, opens a Discord thread below it, and adds the published Seori guide and Jansoree advisory as thread messages. Every MiniMax HTTP response is attached to the same thread as its exact response body (`.json` or `.txt`), including thinking blocks and non-2xx error bodies. Request prompts, request headers, and credentials are not included. A Discord/NATS audit failure is logged but never changes the GitHub review verdict.
+
 ```text
 APPROVAL_DISCORD_NOTIFY_ENABLED=true
+REVIEW_DISCORD_AUDIT_ENABLED=true
 QUOTA_DISCORD_NOTIFY_ENABLED=true
 QUOTA_DISCORD_SUMMARY_INTERVAL_MS=3600000
 NATS_SERVER_URL=nats://nats.data.svc.cluster.local:4222
