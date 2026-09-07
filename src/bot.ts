@@ -2379,6 +2379,16 @@ export class PrBot {
           check,
         );
         if (latest) {
+          if (this.config.defectReviewEnabled) {
+            await this.publishJansoreeAdvisory(
+              repo,
+              prNumber,
+              context.headSha,
+              [],
+              ledgerSnapshot.publishedFingerprints,
+              true,
+            );
+          }
           await this.publishAcceptanceGuide(
             octokit,
             repo,

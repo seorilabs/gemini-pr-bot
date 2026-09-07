@@ -57,7 +57,7 @@ flowchart LR
 - Publishes approval and throttled provider-quota notifications through the acknowledged Backoffice NATS contract.
 - Periodically closes stale PRs when a bot action-required review/comment has had no new commit or human response for more than 24 hours.
 - Ignores public repositories by default with `ALLOW_PUBLIC_REPOS=false`.
-- Allows selected public repositories with `PUBLIC_REPOSITORY_ALLOWLIST`, currently `seorilabs/.github`, `seorilabs/platform`, and `seorilabs/seorilabs-backoffice` for central governance PRs. Automatic review on an allowlisted public repository still requires a same-repository PR whose author has current `write`, `maintain`, or `admin` repository permission; a trusted maintainer must explicitly request review for external forks.
+- Allows selected public repositories with `PUBLIC_REPOSITORY_ALLOWLIST`: `seorilabs/.github`, `seorilabs/platform`, and `seorilabs/seorilabs-backoffice` for central governance PRs, plus `seorilabs/seorilabs-official` for public product and privacy documentation. Automatic review on an allowlisted public repository still requires a same-repository PR whose author has current `write`, `maintain`, or `admin` repository permission; a trusted maintainer must explicitly request review for external forks.
 - Only responds to `OWNER`, `MEMBER`, or `COLLABORATOR` comments by default. On an allowlisted public repository, current `write`, `maintain`, or `admin` repository permission is the source of truth because GitHub App installation responses can report an organization member as `CONTRIBUTOR`.
 
 ## Commands
@@ -272,7 +272,7 @@ AI_REVIEW_PROVIDER_WEIGHTS=minimax:100
 AI_REVIEW_PROVIDER_FALLBACK_ORDER=minimax
 AI_REVIEW_TIEBREAKER_ENABLED=false
 AUTO_REVIEW_IGNORED_REPOSITORIES=seorilabs/gemini-pr-bot,seorilabs/seori-pr-bot
-PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github,seorilabs/platform,seorilabs/seorilabs-backoffice
+PUBLIC_REPOSITORY_ALLOWLIST=seorilabs/.github,seorilabs/platform,seorilabs/seorilabs-backoffice,seorilabs/seorilabs-official
 AUTO_SQUASH_MERGE_ENABLED=true
 ```
 

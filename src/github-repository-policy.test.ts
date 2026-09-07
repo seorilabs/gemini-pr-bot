@@ -15,6 +15,7 @@ function config(overrides: Partial<Config> = {}): Config {
       "seorilabs/.github",
       "seorilabs/platform",
       "seorilabs/seorilabs-backoffice",
+      "seorilabs/seorilabs-official",
     ]),
     trustedAssociations: new Set(["OWNER", "MEMBER", "COLLABORATOR"]),
     ...overrides,
@@ -56,6 +57,11 @@ test("allowlisted public central repository의 trusted same-repo PR만 자동 �
   const octokit = publicPullRequestOctokit("admin");
   assert.equal(shouldHandleRepository(payload, config()), true);
   assert.equal(await shouldAutomaticallyReviewPullRequest(octokit, payload, config()), true);
+});
+
+test("공개 개인정보 안내 저장소도 허용하며 등록되지 않은 공개 저장소는 거부한다", () => {
+  assert.equal(shouldHandleRepository(pullRequestPayload({ repository: "seorilabs/seorilabs-official" }), config()), true);
+  assert.equal(shouldHandleRepository(pullRequestPayload({ repository: "seorilabs/unlisted" }), config()), false);
 });
 
 function publicPullRequestOctokit(permission: string) {
