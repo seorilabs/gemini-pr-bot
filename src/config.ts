@@ -47,6 +47,7 @@ export type Config = {
   acceptanceGuideModeEnabled: boolean;
   autoSquashMergeEnabled: boolean;
   approvalDiscordNotifyEnabled: boolean;
+  reviewDiscordAuditEnabled: boolean;
   quotaDiscordNotifyEnabled: boolean;
   quotaDiscordSummaryIntervalMs: number;
   staleReviewCloseEnabled: boolean;
@@ -269,6 +270,7 @@ export function loadConfig(): Config {
     acceptanceGuideModeEnabled: optionalBool("ACCEPTANCE_GUIDE_MODE_ENABLED", true),
     autoSquashMergeEnabled: optionalBool("AUTO_SQUASH_MERGE_ENABLED", false),
     approvalDiscordNotifyEnabled: optionalBool("APPROVAL_DISCORD_NOTIFY_ENABLED", false),
+    reviewDiscordAuditEnabled: optionalBool("REVIEW_DISCORD_AUDIT_ENABLED", false),
     quotaDiscordNotifyEnabled: optionalBool("QUOTA_DISCORD_NOTIFY_ENABLED", false),
     quotaDiscordSummaryIntervalMs: optionalInt("QUOTA_DISCORD_SUMMARY_INTERVAL_MS", 60 * 60 * 1000),
     staleReviewCloseEnabled: optionalBool("STALE_REVIEW_CLOSE_ENABLED", false),

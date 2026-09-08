@@ -23,6 +23,16 @@ export type MiniMaxHttpOptions = {
   baseUrl?: string;
   timeoutMs: number;
   fetchImpl?: typeof fetch;
+  onResponse?: (response: MiniMaxHttpResponse) => Promise<void> | void;
+};
+
+export type MiniMaxHttpResponse = {
+  status: number;
+  ok: boolean;
+  contentType: string | null;
+  requestId: string | null;
+  rawBody: string;
+  receivedAt: string;
 };
 
 /** Freeform request without tools; the response is read as plain text blocks. */
@@ -89,8 +99,21 @@ export async function callMiniMaxMessages(
     clearTimeout(timer);
   }
 
+  const rawBody = await response.text().catch(() => "");
+  await reportResponse(options.onResponse, {
+    status: response.status,
+    ok: response.ok,
+    contentType: response.headers.get("content-type"),
+    requestId:
+      response.headers.get("x-request-id") ??
+      response.headers.get("request-id") ??
+      response.headers.get("trace-id"),
+    rawBody,
+    receivedAt: new Date().toISOString(),
+  });
+
   if (!response.ok) {
-    const bodySnippet = truncate(await response.text().catch(() => ""), 600);
+    const bodySnippet = truncate(rawBody, 600);
     const retryAfterSeconds = Number(response.headers.get("retry-after"));
     const retryHint =
       Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
@@ -101,13 +124,25 @@ export async function callMiniMaxMessages(
 
   let parsed: unknown;
   try {
-    parsed = await response.json();
+    parsed = JSON.parse(rawBody);
   } catch {
     throw new Error("MiniMax returned invalid JSON");
   }
 
   assertMiniMaxEnvelopeOk(parsed);
   return parsed;
+}
+
+async function reportResponse(
+  reporter: MiniMaxHttpOptions["onResponse"],
+  response: MiniMaxHttpResponse,
+): Promise<void> {
+  if (!reporter) return;
+  try {
+    await reporter(response);
+  } catch {
+    // Discord 감사 로그는 관찰 경로다. 전송 실패로 PR 리뷰 자체를 실패시키지 않는다.
+  }
 }
 
 /**

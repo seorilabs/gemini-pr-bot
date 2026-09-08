@@ -52,7 +52,11 @@ import {
   type ClassifiedFinding,
   type StoredFinding,
 } from "./review.js";
-import { OperationsNotifier, type ApprovalNotificationMode } from "./notifications.js";
+import {
+  OperationsNotifier,
+  type ApprovalNotificationMode,
+  type ReviewAuditSession,
+} from "./notifications.js";
 import { isStatusReconciliationEvent, parseBotCommand, truncate } from "./text.js";
 import { reconcileAcceptanceGuideStatus, type StatusReconciliationLock } from "./status-reconciliation.js";
 import type { ReviewRunRecord } from "./review-run.js";
@@ -1168,6 +1172,7 @@ export class PrBot {
     check: ActiveCheckRun | null,
     guide: AcceptanceGuideOutput,
     inconclusive = false,
+    reviewAudit: ReviewAuditSession | null = null,
   ): Promise<void> {
     if (!(await this.currentStatusForPublish(
       octokit,
@@ -1220,6 +1225,7 @@ export class PrBot {
         ].join("\n")
       : "";
     await postPrComment(octokit, repo, prNumber, `${guide.summary}${publicationNote}`);
+    await this.notifyAcceptanceGuideAudit(reviewAudit, guide, publicationNote);
 
     if (inconclusive || threadPublicationFailed) {
       await this.completeTrackedCheck(
@@ -2125,6 +2131,18 @@ export class PrBot {
     check: ActiveCheckRun | null,
     workflow?: WorkflowExecution,
   ): Promise<void> {
+    const reviewAudit = await this.operationsNotifier.startReviewAudit({
+      repoFullName: repo.fullName,
+      prNumber,
+      prTitle: context.title,
+      prUrl: `https://github.com/${repo.fullName}/pull/${prNumber}`,
+      headSha: context.headSha,
+      workflowId: workflow?.workflowId,
+    });
+    const reportMiniMaxResponse = reviewAudit
+      ? (response: Parameters<OperationsNotifier["notifyMiniMaxResponse"]>[1]) =>
+          this.operationsNotifier.notifyMiniMaxResponse(reviewAudit, response)
+      : undefined;
     const trustedRequest = this.trustedReviewRequest(trigger);
     const explicitAcceptanceCriteria = this.uniqueAcceptanceCriteria([
       ...context.explicitAcceptanceCriteria,
@@ -2149,6 +2167,8 @@ export class PrBot {
           abstainItems: [],
           findings: [],
         }),
+        false,
+        reviewAudit,
       );
       return;
     }
@@ -2259,6 +2279,11 @@ export class PrBot {
     try {
       if (cacheEnvelope) {
         envelope = cacheEnvelope;
+        await this.operationsNotifier.notifyReviewAuditEntry(reviewAudit, {
+          entryKey: "minimax-cache-reused",
+          title: "MiniMax API 호출 없음",
+          text: "같은 HEAD와 입력의 검증된 캐시를 재사용해 이번 실행에서는 MiniMax API를 호출하지 않았습니다.",
+        });
         this.logger.info(
           { repo: repo.fullName, prNumber, headSha: context.headSha },
           "reused completed Gemini review gate extraction",
@@ -2274,10 +2299,15 @@ export class PrBot {
                   prompts.coverageSystem,
                   prompts.coverageUser,
                   explicitAcceptanceCriteria,
+                  reportMiniMaxResponse,
                 )).value,
           defect: defectReviewActive
             ? async () =>
-                (await this.ai.reviewGateDefectCandidates(prompts.defectSystem, prompts.defectUser)).value
+                (await this.ai.reviewGateDefectCandidates(
+                  prompts.defectSystem,
+                  prompts.defectUser,
+                  reportMiniMaxResponse,
+                )).value
             : null,
         });
         for (const failure of extraction.failures) {
@@ -2312,6 +2342,7 @@ export class PrBot {
               visibleChangedPatches: context.visibleChangedPatches,
             }),
             candidate,
+            reportMiniMaxResponse,
           )).value.verifications[0]!,
         );
         for (const failure of isolated.failures) {
@@ -2387,6 +2418,8 @@ export class PrBot {
               [],
               ledgerSnapshot.publishedFingerprints,
               true,
+              0,
+              reviewAudit,
             );
           }
           await this.publishAcceptanceGuide(
@@ -2397,6 +2430,7 @@ export class PrBot {
             check,
             guide,
             true,
+            reviewAudit,
           );
         }
         return;
@@ -2628,6 +2662,8 @@ export class PrBot {
           context,
           check,
           guide,
+          false,
+          reviewAudit,
         );
         if (this.config.defectReviewEnabled) {
           await this.publishJansoreeAdvisory(
@@ -2638,6 +2674,7 @@ export class PrBot {
             ledgerSnapshot.publishedFingerprints,
             failedExtractionPasses.includes("defect"),
             undecidedFatalCandidates,
+            reviewAudit,
           );
         }
       }
@@ -3494,6 +3531,7 @@ export class PrBot {
     publishedFingerprints: ReadonlySet<string>,
     defectReviewFailed = false,
     undecidedCandidates = 0,
+    reviewAudit: ReviewAuditSession | null = null,
   ): Promise<void> {
     try {
       if (!this.jansoree.available()) {
@@ -3518,6 +3556,7 @@ export class PrBot {
       );
       if (newFindings.length === 0) {
         await postPrComment(octokit, repo, prNumber, summary);
+        await this.notifyJansoreeAudit(reviewAudit, summary, []);
         return;
       }
       const inlineComments: InlineReviewComment[] = newFindings.map((finding, index) => ({
@@ -3526,12 +3565,55 @@ export class PrBot {
         body: formatReviewGateFinding(finding, index + 1),
       }));
       await this.safeSubmitReview(octokit, repo, prNumber, headSha, "COMMENT", summary, inlineComments);
+      await this.notifyJansoreeAudit(reviewAudit, summary, newFindings);
     } catch (error) {
       this.logger.warn(
         { error, repo: repo.fullName, prNumber, headSha },
         "Jansoree advisory publication failed",
       );
     }
+  }
+
+  private async notifyAcceptanceGuideAudit(
+    reviewAudit: ReviewAuditSession | null,
+    guide: AcceptanceGuideOutput,
+    publicationNote: string,
+  ): Promise<void> {
+    await Promise.all([
+      this.operationsNotifier.notifyReviewAuditEntry(reviewAudit, {
+        entryKey: "seori-summary",
+        title: "서리 리뷰 · 요약",
+        text: `${guide.summary}${publicationNote}`,
+      }),
+      ...guide.items.map((item, index) =>
+        this.operationsNotifier.notifyReviewAuditEntry(reviewAudit, {
+          entryKey: `seori-thread-${index + 1}-${item.id}`,
+          title: `서리 리뷰 · 쓰레드 ${index + 1}`,
+          text: formatAcceptanceGuideThread(item),
+        })
+      ),
+    ]);
+  }
+
+  private async notifyJansoreeAudit(
+    reviewAudit: ReviewAuditSession | null,
+    summary: string,
+    findings: readonly ReviewGatePublicFatalFinding[],
+  ): Promise<void> {
+    await Promise.all([
+      this.operationsNotifier.notifyReviewAuditEntry(reviewAudit, {
+        entryKey: "jansoree-summary",
+        title: "잔소리 리뷰 · 요약",
+        text: summary,
+      }),
+      ...findings.map((finding, index) =>
+        this.operationsNotifier.notifyReviewAuditEntry(reviewAudit, {
+          entryKey: `jansoree-thread-${index + 1}-${finding.fingerprint || "unfingerprinted"}`,
+          title: `잔소리 리뷰 · 지적 ${index + 1}`,
+          text: formatReviewGateFinding(finding, index + 1),
+        })
+      ),
+    ]);
   }
 
   private async tryResolveThread(octokit: Octokit, threadNodeId: string): Promise<void> {

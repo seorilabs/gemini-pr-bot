@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { connect, type NatsConnection } from "@nats-io/transport-node";
 import type { AiReviewProviderName, Config } from "./config.js";
 import type { AiProviderQuotaEvent } from "./ai-client.js";
+import type { MiniMaxGateResponse } from "./minimax-gate.js";
 
 type Logger = {
   info: (value: unknown, message?: string) => void;
@@ -20,6 +21,43 @@ export type ApprovalNotification = {
   source: string;
   reason: string;
   mode: ApprovalNotificationMode;
+};
+
+export type ReviewAuditContext = {
+  repoFullName: string;
+  prNumber: number;
+  prTitle: string;
+  prUrl: string;
+  headSha: string;
+  workflowId?: number;
+};
+
+export type ReviewAuditSession = ReviewAuditContext & {
+  parentId: string;
+  threadName: string;
+};
+
+export type ReviewAuditEntry = {
+  entryKey: string;
+  title: string;
+  text: string;
+};
+
+type NotificationAttachment = {
+  filename: string;
+  contentType: string;
+  base64: string;
+};
+
+type NotificationThread = {
+  parentId: string;
+  name: string;
+  plain?: boolean;
+};
+
+type NotificationPayloadOptions = {
+  attachment?: NotificationAttachment;
+  thread?: NotificationThread;
 };
 
 type QuotaProviderSummary = {
@@ -92,6 +130,110 @@ export class OperationsNotifier {
     );
   }
 
+  async startReviewAudit(context: ReviewAuditContext): Promise<ReviewAuditSession | null> {
+    if (!this.config.reviewDiscordAuditEnabled) return null;
+    const workflowIdentity = context.workflowId === undefined ? "direct" : String(context.workflowId);
+    const parentId = stableId(
+      "review-audit",
+      context.repoFullName,
+      String(context.prNumber),
+      context.headSha,
+      workflowIdentity,
+    );
+    const repoName = context.repoFullName.split("/").at(-1) || context.repoFullName;
+    const session: ReviewAuditSession = {
+      ...context,
+      parentId,
+      threadName: `${repoName} #${context.prNumber} 리뷰 로그 ${context.headSha.slice(0, 12)}`.slice(0, 100),
+    };
+    const accepted = await this.publishText(
+      parentId,
+      this.reviewAuditRootMessage(session),
+      "review Discord audit root",
+      {
+        repo: context.repoFullName,
+        prNumber: context.prNumber,
+        headSha: context.headSha,
+        workflowId: context.workflowId,
+      },
+    );
+    return accepted ? session : null;
+  }
+
+  async notifyReviewAuditEntry(
+    session: ReviewAuditSession | null,
+    entry: ReviewAuditEntry,
+  ): Promise<void> {
+    if (!session) return;
+    const contentHash = createHash("sha256").update(entry.text).digest("hex");
+    await this.publishText(
+      stableId("review-audit-entry", session.parentId, entry.entryKey, contentHash),
+      [`**${entry.title}**`, "", entry.text].join("\n"),
+      "review Discord audit entry",
+      {
+        repo: session.repoFullName,
+        prNumber: session.prNumber,
+        headSha: session.headSha,
+        entryKey: entry.entryKey,
+      },
+      {
+        thread: { parentId: session.parentId, name: session.threadName, plain: false },
+      },
+    );
+  }
+
+  async notifyMiniMaxResponse(
+    session: ReviewAuditSession | null,
+    response: MiniMaxGateResponse,
+  ): Promise<void> {
+    if (!session) return;
+    const bodyHash = createHash("sha256").update(response.rawBody).digest("hex");
+    const phaseSlug = response.phase
+      .normalize("NFKD")
+      .replace(/[^A-Za-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .toLowerCase() || "response";
+    const contentType = (response.contentType?.split(";", 1)[0]?.trim() || "text/plain").slice(0, 100);
+    const extension = contentType === "application/json" ? "json" : "txt";
+    const filename = `minimax-${phaseSlug}-${bodyHash.slice(0, 12)}.${extension}`.slice(0, 120);
+    const byteLength = Buffer.byteLength(response.rawBody, "utf8");
+    const text = [
+      `단계: ${response.phase}`,
+      `모델: ${response.model}`,
+      `HTTP: ${response.status} ${response.ok ? "성공" : "실패"}`,
+      `수신: ${response.receivedAt}`,
+      response.requestId ? `request id: \`${singleLine(response.requestId, 160)}\`` : "request id: 응답 헤더에 없음",
+      byteLength > 0
+        ? `원문: \`${filename}\` 첨부 · ${byteLength.toLocaleString("en-US")} bytes`
+        : "원문: 빈 응답 body",
+    ].join("\n");
+    await this.publishText(
+      stableId("review-audit-minimax", session.parentId, response.phase, bodyHash),
+      [`**MiniMax API 응답 원문**`, "", text].join("\n"),
+      "MiniMax Discord audit response",
+      {
+        repo: session.repoFullName,
+        prNumber: session.prNumber,
+        headSha: session.headSha,
+        phase: response.phase,
+        status: response.status,
+        bodyBytes: byteLength,
+      },
+      {
+        thread: { parentId: session.parentId, name: session.threadName, plain: false },
+        ...(byteLength > 0
+          ? {
+              attachment: {
+                filename,
+                contentType,
+                base64: Buffer.from(response.rawBody, "utf8").toString("base64"),
+              },
+            }
+          : {}),
+      },
+    );
+  }
+
   async notifyQuotaEvent(event: AiProviderQuotaEvent): Promise<void> {
     if (!this.config.quotaDiscordNotifyEnabled) return;
     this.recordQuotaEvent(event);
@@ -134,7 +276,13 @@ export class OperationsNotifier {
     }
   }
 
-  private async publishText(id: string, text: string, logName: string, context: Record<string, unknown>): Promise<boolean> {
+  private async publishText(
+    id: string,
+    text: string,
+    logName: string,
+    context: Record<string, unknown>,
+    options: NotificationPayloadOptions = {},
+  ): Promise<boolean> {
     try {
       if (process.env.NODE_ENV === "local") {
         this.logger.info({ subject: SUBJECT, id, ...context }, `${logName} dry-run`);
@@ -143,7 +291,14 @@ export class OperationsNotifier {
       const nc = await this.connection();
       const response = await nc.request(
         SUBJECT,
-        encoder.encode(JSON.stringify({ version: 1, id, source: "seori-pr-bot", text, occurredAt: new Date().toISOString() })),
+        encoder.encode(JSON.stringify({
+          version: 1,
+          id,
+          source: "seori-pr-bot",
+          text,
+          occurredAt: new Date().toISOString(),
+          ...options,
+        })),
         { timeout: 5_000 },
       );
       const ack = JSON.parse(decoder.decode(response.data)) as NotificationAck;
@@ -191,6 +346,17 @@ export class OperationsNotifier {
       `방식: ${modeLabels[notification.mode]} · 트리거: ${notification.source}`,
       `요청자: @${notification.sender}`,
       `사유: ${singleLine(notification.reason, 300)}`,
+    ].join("\n");
+  }
+
+  private reviewAuditRootMessage(session: ReviewAuditSession): string {
+    return [
+      "🔎 **Seori PR 리뷰 로그**",
+      `저장소: ${session.repoFullName}`,
+      `PR: [#${session.prNumber} ${singleLine(session.prTitle, 120)}](${session.prUrl})`,
+      `HEAD: \`${session.headSha.slice(0, 12)}\``,
+      session.workflowId === undefined ? "실행: 직접 실행" : `workflow: \`${session.workflowId}\``,
+      "서리 리뷰, 잔소리 리뷰, MiniMax API 응답 원문은 이 메시지의 쓰레드에 기록됩니다.",
     ].join("\n");
   }
 

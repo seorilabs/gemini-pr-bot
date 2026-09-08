@@ -3,7 +3,11 @@
  * format-correction re-request. Shared by the bot's AI client and the local
  * gate probe so both exercise the identical retry contract.
  */
-import { callMiniMaxMessages, type MiniMaxHttpOptions } from "./minimax-client.js";
+import {
+  callMiniMaxMessages,
+  type MiniMaxHttpOptions,
+  type MiniMaxHttpResponse,
+} from "./minimax-client.js";
 import {
   MINIMAX_REVIEW_MODEL,
   type MiniMaxMessagesRequest,
@@ -26,6 +30,11 @@ export type MiniMaxGateRequestUsage = {
   elapsedMs: number;
 };
 
+export type MiniMaxGateResponse = MiniMaxHttpResponse & {
+  phase: string;
+  model: typeof MINIMAX_REVIEW_MODEL;
+};
+
 export type MiniMaxGateRequestOptions<T> = {
   http: MiniMaxHttpOptions;
   buildRequest: () => MiniMaxMessagesRequest;
@@ -36,6 +45,7 @@ export type MiniMaxGateRequestOptions<T> = {
   /** Re-request once with the validation errors appended when the first output fails strict parsing. */
   repairInvalidOutput?: boolean;
   onRequestCompleted?: (usage: MiniMaxGateRequestUsage) => void;
+  onResponseReceived?: (response: MiniMaxGateResponse) => Promise<void> | void;
 };
 
 export async function executeMiniMaxGateRequest<T>(
@@ -81,7 +91,17 @@ async function callGateMessages<T>(
   options: MiniMaxGateRequestOptions<T>,
 ): Promise<unknown> {
   const startedAt = Date.now();
-  const response = await callMiniMaxMessages(request, options.http);
+  const response = await callMiniMaxMessages(request, {
+    ...options.http,
+    onResponse: async (httpResponse) => {
+      await options.http.onResponse?.(httpResponse);
+      await options.onResponseReceived?.({
+        ...httpResponse,
+        phase: phaseLabel,
+        model: MINIMAX_REVIEW_MODEL,
+      });
+    },
+  });
   const usage = (response as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
   options.onRequestCompleted?.({
     phase: phaseLabel,

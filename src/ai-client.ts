@@ -9,6 +9,7 @@ import {
 } from "./minimax-client.js";
 import {
   executeMiniMaxGateRequest,
+  type MiniMaxGateResponse,
   type MiniMaxGateRequestUsage,
   type MiniMaxGateResult,
 } from "./minimax-gate.js";
@@ -133,6 +134,7 @@ export class AiClient {
     systemPrompt: string,
     userPrompt: string,
     expectedAcceptanceCriteria: readonly string[],
+    onResponseReceived?: (response: MiniMaxGateResponse) => Promise<void> | void,
   ): Promise<MiniMaxGateResult<MiniMaxReviewResult>> {
     return executeMiniMaxGateRequest({
       http: this.minimaxHttpOptions(),
@@ -141,6 +143,7 @@ export class AiClient {
       originalUserPrompt: userPrompt,
       phaseLabel: "커버리지 분류",
       onRequestCompleted: this.logGateRequest,
+      onResponseReceived,
     });
   }
 
@@ -148,6 +151,7 @@ export class AiClient {
   async reviewGateDefectCandidates(
     systemPrompt: string,
     userPrompt: string,
+    onResponseReceived?: (response: MiniMaxGateResponse) => Promise<void> | void,
   ): Promise<MiniMaxGateResult<MiniMaxReviewResult>> {
     return executeMiniMaxGateRequest({
       http: this.minimaxHttpOptions(),
@@ -156,6 +160,7 @@ export class AiClient {
       originalUserPrompt: userPrompt,
       phaseLabel: "결함 후보 탐색",
       onRequestCompleted: this.logGateRequest,
+      onResponseReceived,
     });
   }
 
@@ -164,6 +169,7 @@ export class AiClient {
     systemPrompt: string,
     userPrompt: string,
     candidate: Pick<MiniMaxReviewCandidate, "candidateId" | "kind">,
+    onResponseReceived?: (response: MiniMaxGateResponse) => Promise<void> | void,
   ): Promise<MiniMaxGateResult<MiniMaxVerificationResult>> {
     const expectedCandidates = [{ candidateId: candidate.candidateId, kind: candidate.kind }];
     return executeMiniMaxGateRequest({
@@ -173,6 +179,7 @@ export class AiClient {
       originalUserPrompt: userPrompt,
       phaseLabel: `후보 반증 ${candidate.candidateId}`,
       onRequestCompleted: this.logGateRequest,
+      onResponseReceived,
     });
   }
 
