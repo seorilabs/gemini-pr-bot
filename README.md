@@ -140,6 +140,7 @@ flowchart TD
   Verifier --> Host["Host: AC 원문·전체 테스트·현재 HEAD exact 근거 검증"]
   Host --> Ledger["finding 원장: open / resolved / refuted"]
   Ledger -->|"확정 치명 결함 또는 테스트 누락"| Output["한글 REQUEST_CHANGES + action_required"]
+  Ledger -->|"확정 오동작 advisory"| Jansoree["잔소리 인라인 코멘트; 게이트 판정과 무관"]
   Ledger -->|"첫째 또는 둘째 턴 근거 불완전"| FollowUp["구체적 PR 댓글 + action_required"]
   Ledger -->|"셋째 이후 지엽적 항목만 남음"| Neutral["PR 댓글 + neutral; approval 없음"]
   Ledger -->|통과| GateApproval["GitHub APPROVE 후 check success; bot 자동 병합 없음"]
@@ -158,6 +159,18 @@ flowchart TD
   Agent -->|Approval current| Stop["No further agent action"]
   Agent -->|New commit or stale approval| Review
 ```
+
+결함 후보는 `defect_outcome`으로 두 등급을 구분합니다. `deterministic_crash`,
+`permanent_data_loss_or_corruption`, `exploitable_security_or_privacy_exposure`,
+`primary_flow_unusable`은 병합을 막는 치명 등급이고, host가 종단 코드 한 줄에서
+그 결과를 직접 일으키는 서명을 확인합니다. `deterministic_misbehavior`는 advisory
+등급으로, 크래시나 데이터 손실까지 가지 않아도 정상 경로에서 코드가 선언된 의도와
+확정적으로 다르게 동작할 때 사용합니다. 한 줄 서명으로는 일반 오동작을 표현할 수
+없으므로 advisory 등급은 서명 대신 실행 가능한 줄인지만 확인하고, root line이 이번
+PR이 추가한 현재 HEAD 줄일 것, 같은 파일 인과 근거 2~6줄, symbol grounding,
+검증자의 독립 confirmed는 두 등급에 동일하게 요구합니다. advisory 결함은 Seori
+Review check의 판정과 보류 항목에 전혀 반영되지 않고 잔소리 인라인 코멘트로만
+게시됩니다.
 
 `acceptance_coverage`의 개수와 `AC-1..N` 순서는 host가 엄격히 검증합니다. 모델이
 반복 출력한 인수조건 문장은 신뢰하지 않고 같은 ID의 host 원문으로 다시 결합하므로,
@@ -278,6 +291,17 @@ AUTO_SQUASH_MERGE_ENABLED=true
 
 The conservative gate uses MiniMax-M3's Anthropic-compatible Messages API with a strict submit_review tool contract. It runs three bounded passes: an acceptance-coverage pass (criteria plus the host evidence inventory, no diff; also proposes missing-test candidates), a fatal-defect pass (diff and current-HEAD code, at most two candidates) that runs in parallel with it, and one adversarial verifier request per candidate. A failed pass degrades only its own output (unknown coverage, no defect candidate, or an uncertain verdict) and is recorded in the run's validation errors; the whole gate abstains only when every extraction pass fails. The host accepts only exact Korean structured output grounded in the current HEAD; an exhaustive inventory is additionally mandatory before claiming that a test is missing. GitHub Copilot is not a bot review provider at all; use GitHub's native Copilot review separately.
 
+요청 파라미터는 MiniMax 공식 권장을 그대로 따릅니다. `temperature: 1`과 `top_p: 0.95`가 M3
+권장값이고, `top_k`는 Anthropic 호환 엔드포인트가 무시하므로 보내지 않습니다. `tool_choice`는
+`auto`와 `none`만 지원하므로 특정 도구를 강제할 수 없고, 그래서 형식 오류는 강제 대신 한 번의
+보정 재요청으로 처리합니다. `service_tier`는 `standard`를 유지합니다. `priority`는 1.5배 비용으로
+TTFT p95만 줄이는데 이 게이트의 지연은 대부분 출력 토큰 생성에 쓰이므로 이득이 없습니다.
+`MINIMAX_TIMEOUT_MS`는 출력 예산에서 역산합니다. 추출 패스의 `max_tokens`는 24,576이고 standard
+tier 출력 속도가 약 60tps이므로 예산을 모두 쓰면 약 410초가 걸립니다. 450초는 여기에 TTFT와
+여유를 더한 값이며, 이보다 낮추면 모델이 예산을 다 쓸 때 구조적으로 타임아웃합니다. 프롬프트는
+M3의 자동 prefix 캐시가 걸리도록 고정 지시를 먼저 두고 `head_sha`부터 시작하는 PR별 값을 뒤에
+둡니다.
+
 Structured PR reviews use the bounded MiniMax candidate/verifier gate above. PR Q&A and agent commands use the same configured provider router. A host-confirmed fatal defect or exhaustive missing acceptance test is actionable. Incomplete or ambiguous evidence on the first two review turns becomes `FOLLOW_UP`, posts a PR comment with a host-owned reason and concrete Contributor response, and completes the check as `action_required`. From the third turn, `neutral` is permitted only when every remaining item is peripheral; it still posts the unresolved scope and required response, submits no approval, and hands merge authorization to a current-HEAD human review.
 
 Changed-file context is product-code-first. Small changed product files are supplied in full; large files use changed-hunk windows plus a bounded symbol outline. Fatal review is scoped to defects introduced on changed lines, so a PASS requires a visible usable patch for every current product file instead of the full body of every large file. Related tests and repository context use the remaining prompt budget.
@@ -323,7 +347,7 @@ After a `stale-self-trigger` marker is present for the current HEAD, later unmen
 
 ## Local Gate Probe
 
-`scripts/gate-probe.mts` replays the production gate against the real MiniMax API on synthetic PR fixtures, so prompt and budget changes can be measured without a deploy-and-webhook cycle. It uses the same prompt builders, request/repair contract (`executeMiniMaxGateRequest`), two isolated extraction passes (coverage without the diff, fatal-defect discovery without the evidence inventory), isolated per-candidate verification, and host trust boundary (`evaluateMiniMaxReviewGateCandidates`) as the bot. `--thinking-budget=N` or `--thinking-off` applies an experimental thinking setting to the extraction passes for latency comparison; production always uses adaptive thinking.
+`scripts/gate-probe.mts` replays the production gate against the real MiniMax API on synthetic PR fixtures, so prompt and budget changes can be measured without a deploy-and-webhook cycle. It uses the same prompt builders, request/repair contract (`executeMiniMaxGateRequest`), two isolated extraction passes (coverage without the diff, fatal-defect discovery without the evidence inventory), isolated per-candidate verification, and host trust boundary (`evaluateMiniMaxReviewGateCandidates`) as the bot. `--thinking-off` applies an experimental thinking setting to the extraction passes for latency comparison; production always uses adaptive thinking. MiniMax documents only `adaptive` and `disabled` for M3, so Anthropic's `budget_tokens` variant is not offered.
 
 ```bash
 set -a; source ~/.config/seorilabs/minimax-api-key.env; set +a   # shared/minimax/coding-plan-api-key

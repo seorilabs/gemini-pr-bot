@@ -9,6 +9,7 @@ import {
   buildMiniMaxCoverageRequest,
   buildMiniMaxDefectRequest,
   parseMiniMaxCoverageResponse,
+  defectOutcomeSeverity,
   parseMiniMaxDefectResponse,
   buildMiniMaxVerificationRequest,
   parseMiniMaxReviewPayload,
@@ -30,7 +31,7 @@ function fatalCandidate(id = "C-1", line = 42): Record<string, unknown> {
     symbol: "save",
     line,
     code_quote: 'throw new Error("저장 실패")',
-    fatal_outcome: "deterministic_crash",
+    defect_outcome: "deterministic_crash",
     criterion_id: null,
     acceptance_criterion: null,
     test_search_summary_ko: null,
@@ -58,7 +59,7 @@ function missingTestCandidate(id = "C-1"): Record<string, unknown> {
     symbol: "restoreSavedValue",
     line: null,
     code_quote: null,
-    fatal_outcome: null,
+    defect_outcome: null,
     criterion_id: "AC-1",
     acceptance_criterion: "저장 후 다시 열어도 값이 유지된다.",
     test_search_summary_ko: "전체 테스트 목록과 본문을 검색했지만 복원값 단언을 찾지 못했습니다.",
@@ -199,10 +200,10 @@ test("defect request carries a candidates-only fatal schema and honors an explic
   const request = buildMiniMaxDefectRequest({
     systemPrompt: "결함 규칙",
     userPrompt: "diff와 현재 HEAD",
-    thinking: { type: "enabled", budget_tokens: 4_096 },
+    thinking: { type: "disabled" },
   });
   assert.equal(request.max_tokens, 24_576);
-  assert.deepEqual(request.thinking, { type: "enabled", budget_tokens: 4_096 });
+  assert.deepEqual(request.thinking, { type: "disabled" });
   const schema = request.tools[0]?.input_schema as any;
   assert.deepEqual(schema.required, ["candidates"]);
   assert.equal(schema.properties.acceptance_coverage, undefined);
@@ -318,7 +319,7 @@ test("tool_use submit_review candidate response is mapped to typed camelCase fie
   assert.equal(parsed.source, "tool_use");
   assert.equal(parsed.value.candidates[0]?.candidateId, "C-1");
   assert.equal(parsed.value.candidates[0]?.symbol, "save");
-  assert.equal(parsed.value.candidates[0]?.fatalOutcome, "deterministic_crash");
+  assert.equal(parsed.value.candidates[0]?.defectOutcome, "deterministic_crash");
   assert.equal(parsed.value.candidates[0]?.evidence[0]?.explanationKo.includes("현재 HEAD"), true);
 });
 
@@ -926,4 +927,20 @@ test("무의미 키만 든 test_evidence 객체도 null로 정규화된다", () 
   if (parsed.ok) {
     assert.equal(parsed.value.acceptanceCoverage[0]?.testEvidence, null);
   }
+});
+
+test("defect_outcome은 치명 4종과 advisory 등급을 모두 받고 severity를 host가 유도한다", () => {
+  const advisory = parseMiniMaxDefectResponse(
+    messagesResponse({ candidates: [{ ...fatalCandidate(), defect_outcome: "deterministic_misbehavior" }] }),
+  );
+  assert.equal(advisory.ok, true);
+  if (!advisory.ok) return;
+  assert.equal(advisory.value.candidates[0]?.defectOutcome, "deterministic_misbehavior");
+  assert.equal(defectOutcomeSeverity("deterministic_misbehavior"), "advisory");
+  assert.equal(defectOutcomeSeverity("primary_flow_unusable"), "fatal");
+
+  const unknown = parseMiniMaxDefectResponse(
+    messagesResponse({ candidates: [{ ...fatalCandidate(), defect_outcome: "minor_style_issue" }] }),
+  );
+  assert.equal(unknown.ok, false);
 });

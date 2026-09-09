@@ -7,7 +7,7 @@
  */
 import type { ChangeClass } from "./repo-context.js";
 
-export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v7-minimax";
+export const REVIEW_GATE_PROMPT_VERSION = "acceptance-guide-v8-minimax";
 
 // The former single candidate pass mixed acceptance-coverage classification
 // (large output: one row per AC) with fatal-defect discovery (large input: the
@@ -28,6 +28,28 @@ const SHARED_GUIDE_RULES = {
 const DEFECT_SYMBOL_RULE =
   "symbol은 인과 근거 범위의 현재 HEAD 코드에 그대로 나타나는 식별자 하나만 제출하세요. 파일명, 모듈, 클래스 수식을 붙이거나 새로 만들지 마세요.";
 
+const DEFECT_SEVERITY_RULES = [
+  "후보의 등급은 defect_outcome으로 정합니다. 치명 등급은 deterministic_crash, permanent_data_loss_or_corruption, exploitable_security_or_privacy_exposure, primary_flow_unusable이고, advisory 등급은 deterministic_misbehavior입니다.",
+  "치명 등급은 정상 또는 필수 경로에서 그 결과가 root line으로 직접 발생할 때만 제출하세요.",
+  "deterministic_misbehavior는 크래시나 데이터 손실까지 가지 않더라도, 정상 경로에서 코드가 선언된 의도와 확정적으로 다르게 동작할 때 제출하세요. 선언된 의도는 이 PR의 인수조건, 같은 파일의 주석이나 함수 계약, 같은 파일이 이미 구현한 같은 종류의 다른 분기에서만 읽고 새로 지어내지 마세요.",
+  "치명 등급의 evidence는 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하세요.",
+  "deterministic_misbehavior의 evidence는 root line 하나만으로도 됩니다. 선언된 의도가 같은 파일의 주석이나 선언부 한 줄에 있으면 그 줄을 첫 근거로 함께 넣으세요.",
+  "등급과 무관하게 evidence는 같은 파일에서 줄 번호 오름차순이어야 하고, 마지막 근거는 결과를 직접 일으키는 root line이며 file, line, code_quote가 후보의 값과 같아야 합니다. root line은 이번 PR이 추가한 줄이어야 합니다.",
+] as const;
+
+const DEFECT_EXCLUSION_RULES = [
+  "등급과 무관하게 가드가 이미 막는 경로, 부분 diff의 부재, 문서로 확인되지 않은 프레임워크 동작 추측, 스타일과 유지보수성 의견은 후보가 아닙니다.",
+  "런타임 결과를 추측해야 하면 후보가 아닙니다. 확정적으로 다른 동작이 현재 HEAD 코드만으로 읽혀야 합니다.",
+] as const;
+
+const DEFECT_EXAMPLE_RULES = [
+  "치명 예시: 정상 호출에서 guard 없이 persistent storage delete가 직접 실행되고 전 경로가 보이면 deterministic_crash 또는 permanent_data_loss_or_corruption 후보입니다.",
+  "치명 예시: 주석이나 문서가 명시한 정상 입력 범위가 같은 파일의 코드 계약(배열 크기, 0 나눗셈, null 접근)을 확정 위반하면 deterministic_crash 후보입니다.",
+  "advisory 예시: 같은 파일의 다른 분기는 수행하는 필수 상태 갱신을 한 분기만 빠뜨려 저장값과 화면이 확정적으로 어긋나면 deterministic_misbehavior 후보입니다.",
+  "advisory 예시: 인수조건이나 주석이 정한 경계값을 root line의 비교 연산자나 순서가 확정적으로 반대로 적용하면 deterministic_misbehavior 후보입니다.",
+  "advisory 예시: 같은 파일이 정의한 입력 처리 계약을 root line이 확정적으로 가로채 선언된 조작이 불가능해지면 deterministic_misbehavior 후보입니다.",
+] as const;
+
 const ACCEPTANCE_GUIDE_COVERAGE_RULES = [
   SHARED_GUIDE_RULES.role,
   "Host가 제공한 모든 인수조건을 AC-1부터 순서와 원문 그대로 acceptance_coverage에 한 번씩 제출하세요.",
@@ -35,6 +57,8 @@ const ACCEPTANCE_GUIDE_COVERAGE_RULES = [
   "허용 후보는 최대 2개이며 missing_acceptance_test뿐입니다.",
   "missing_acceptance_test는 host가 test_inventory_complete=true라고 명시했고 AC-N 원문에 대응하는 테스트가 전체 인벤토리에 없을 때만 제출하세요.",
   "후보가 없더라도 acceptance_coverage는 모두 채우고 candidates만 빈 배열로 제출하세요.",
+  "missing_acceptance_test 후보는 file, line, symbol, code_quote, defect_outcome을 모두 null로 두고 evidence는 빈 배열로 제출하세요. 코드 근거를 넣으면 후보 전체가 폐기됩니다.",
+  "missing_acceptance_test 후보의 criterion_id는 같은 응답의 acceptance_coverage에서 status가 missing인 행의 criterion_id와 같아야 합니다. covered나 unknown인 인수조건을 후보로 내지 마세요.",
   "covered는 Host Evidence Candidates에서 현재 HEAD의 직접적인 테스트 또는 소스 근거를 정확히 선택할 때만 사용하세요.",
   "test_evidence와 supporting_test_evidence는 Host Evidence Candidates JSON line의 file, line, test_name, quote를 그대로 복사하세요. 후보 목록에 없는 file, test_name, line, assertion_quote는 어떤 이유로도 만들지 마세요.",
   "소스 연결 자체가 조건인 인수조건도 kind가 source인 후보를 선택해 증명하세요. 대응하는 후보가 목록에 없으면 covered가 아니라 unknown입니다.",
@@ -51,15 +75,12 @@ const ACCEPTANCE_GUIDE_COVERAGE_RULES = [
 const ACCEPTANCE_GUIDE_DEFECT_RULES = [
   SHARED_GUIDE_RULES.role,
   SHARED_GUIDE_RULES.noGeneralReview,
-  "허용 후보는 최대 2개이며 fatal_defect뿐입니다.",
-  "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
-  "치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하고, 마지막 근거는 결과를 직접 일으키는 root line이어야 합니다.",
+  "허용 후보는 최대 2개이며 kind는 fatal_defect뿐입니다.",
+  ...DEFECT_SEVERITY_RULES,
   DEFECT_SYMBOL_RULE,
-  "가드가 있는 경로, 단순 return false/null, UI 옵션, deny 규칙, 부분 diff의 부재, 프레임워크 동작 추측은 치명 결함이 아닙니다.",
+  ...DEFECT_EXCLUSION_RULES,
   "fatal_defect 후보의 criterion_id, acceptance_criterion, test_search_summary_ko는 null로 제출하세요.",
-  "후보 예시 1: 정상 호출에서 guard 없이 persistent storage delete가 직접 실행되고 전 경로가 보이면 fatal_defect 후보입니다.",
-  "후보 예시 2: 주석이나 문서가 명시한 정상 입력 범위가 같은 파일의 코드 계약(배열 크기, 0 나눗셈, null 접근)을 확정 위반하면 deterministic_crash 후보입니다.",
-  "후보 예시 3: pointerEvents, ref 연결, 일반 false 반환처럼 런타임 결과를 추측해야 하면 후보가 아닙니다.",
+  ...DEFECT_EXAMPLE_RULES,
   SHARED_GUIDE_RULES.koreanTool,
 ] as const;
 
@@ -88,6 +109,8 @@ const CONSERVATIVE_GATE_COVERAGE_RULES = [
   "전체 테스트 인벤토리가 불완전하거나 테스트 근거를 확정하지 못하면 missing이 아니라 unknown입니다. complete inventory에서 대응 테스트가 없을 때만 missing입니다.",
   "missing_acceptance_test는 host가 test_inventory_complete=true라고 명시했고 AC-N 원문에 대응하는 테스트가 전체 인벤토리에 없을 때만 제출하세요.",
   "후보가 없더라도 acceptance_coverage는 모두 채우고 candidates만 빈 배열로 제출하세요.",
+  "missing_acceptance_test 후보는 file, line, symbol, code_quote, defect_outcome을 모두 null로 두고 evidence는 빈 배열로 제출하세요. 코드 근거를 넣으면 후보 전체가 폐기됩니다.",
+  "missing_acceptance_test 후보의 criterion_id는 같은 응답의 acceptance_coverage에서 status가 missing인 행의 criterion_id와 같아야 합니다. covered나 unknown인 인수조건을 후보로 내지 마세요.",
   "예시 1: complete inventory에 AC 테스트가 없으면 missing_acceptance_test 후보입니다.",
   "예시 2: 테스트 파일 일부만 보이고 테스트를 못 찾았으면 후보가 아니라 빈 배열입니다.",
 ] as const;
@@ -95,19 +118,17 @@ const CONSERVATIVE_GATE_COVERAGE_RULES = [
 const CONSERVATIVE_GATE_DEFECT_RULES = [
   SHARED_CONSERVATIVE_RULES.role,
   SHARED_CONSERVATIVE_RULES.noGeneralReview,
-  "허용 후보는 최대 2개이며 fatal_defect뿐입니다.",
+  "허용 후보는 최대 2개이며 kind는 fatal_defect뿐입니다.",
   SHARED_CONSERVATIVE_RULES.copyExact,
   SHARED_CONSERVATIVE_RULES.currentHeadOnly,
   SHARED_CONSERVATIVE_RULES.followUpScope,
   "후속 턴에서 이전 review 이후 수정되지 않은 누적 PR 코드로 새 범위를 열지 마세요. 현재 HEAD 전체 파일은 추가 변경의 최종 상태와 직전 요청 해소 여부를 확인할 때만 사용하세요.",
-  "fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시, 영구 데이터 손실, 악용 가능한 보안·개인정보 노출, 핵심 흐름 완전 불능 중 하나가 직접 발생할 때만 제출하세요.",
-  "치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하고, 마지막 근거는 결과를 직접 일으키는 root line이어야 합니다.",
+  ...DEFECT_SEVERITY_RULES,
   DEFECT_SYMBOL_RULE,
-  "가드가 있는 경로, 단순 return false/null, UI 옵션, deny 규칙, 부분 diff의 부재, 프레임워크 동작 추측은 치명 결함이 아닙니다.",
+  ...DEFECT_EXCLUSION_RULES,
   "refuted 상태는 현재 Changed Files에 같은 file/symbol의 새 added root가 직접 보일 때만 회귀 후보로 제출하세요. 현재 파일에 코드가 남았다는 이유만으로 반복하지 마세요.",
   "확실한 후보가 없으면 candidates는 빈 배열로 제출하세요.",
-  "예시 3: 정상 호출에서 guard 없이 persistent storage delete가 직접 실행되고 전 경로가 보이면 fatal_defect 후보입니다.",
-  "예시 4: pointerEvents, ref 연결, 일반 false 반환처럼 런타임 결과를 추측해야 하면 후보가 아닙니다.",
+  ...DEFECT_EXAMPLE_RULES,
 ] as const;
 
 const REVIEW_GATE_VERIFIER_RULES = [
@@ -115,6 +136,7 @@ const REVIEW_GATE_VERIFIER_RULES = [
   "현재 HEAD에서 기존 테스트, 가드, 호출 조건, 반대 코드, 이미 적용된 수정부터 찾아 후보를 깨뜨리세요.",
   "직접 반증되면 rejected, 근거가 일부라도 부족하면 uncertain, 모든 조건과 정확한 종단 근거가 남을 때만 confirmed입니다.",
   "fatal_defect confirmed/rejected는 현재 HEAD의 동일 root file:line:code_quote를 포함해야 합니다.",
+  "후보의 defect_outcome이 deterministic_misbehavior이면 크래시나 데이터 손실이 아니라, 선언된 의도와 다른 확정적 동작이 현재 HEAD 발췌로 증명되는지만 판정하세요. 심각도가 낮다는 이유로 rejected하지 마세요.",
   "missing_acceptance_test는 host의 complete inventory와 AC 원문만으로 confirmed할 수 있으며 코드 evidence는 비워 둡니다.",
   "제공되는 현재 HEAD 코드는 후보가 지목한 파일의 발췌이며 각 줄은 `L줄번호: 원문` 형식입니다. evidence의 line은 그 줄번호, code_quote는 접두어를 제외한 원문 줄 그대로입니다.",
   "발췌 밖의 경로나 줄, 전달되지 않은 파일은 인용하지 마세요. 판정에 필요한 본문이 발췌에 없으면 uncertain입니다.",
@@ -202,8 +224,16 @@ export function formatReviewGateAcceptanceCriteria(criteria: readonly string[]):
  * stays small regardless of PR size.
  */
 export function buildReviewGateCoverageUserPrompt(input: ReviewGateCoverageUserPromptInput): string {
+  // Same prefix-cache ordering as the defect pass: fixed instructions first,
+  // then everything that changes per PR.
   return [
     `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`,
+    "",
+    "## 수행할 작업",
+    input.acceptanceGuideMode
+      ? "아래 각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, complete inventory에 대응 테스트가 없는 인수조건만 missing_acceptance_test 후보로 최대 2개 candidates에 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
+      : "아래 각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, 허용된 missing_acceptance_test 후보를 최대 2개 찾아 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
+    "",
     ...formatReviewGateHostFacts(input),
     "",
     ...formatReviewGateAcceptanceCriteria(input.explicitAcceptanceCriteria),
@@ -228,11 +258,6 @@ export function buildReviewGateCoverageUserPrompt(input: ReviewGateCoverageUserP
     "",
     "### Contributor Responses Since Previous Seori Result",
     input.contributorResponses || "(none)",
-    "",
-    "## 수행할 작업",
-    input.acceptanceGuideMode
-      ? "각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, complete inventory에 대응 테스트가 없는 인수조건만 missing_acceptance_test 후보로 최대 2개 candidates에 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
-      : "각 인수조건의 현재 HEAD 근거 상태를 acceptance_coverage로 분류하고, 허용된 missing_acceptance_test 후보를 최대 2개 찾아 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
   ].join("\n");
 }
 
@@ -242,8 +267,16 @@ export function buildReviewGateCoverageUserPrompt(input: ReviewGateCoverageUserP
  * candidates, so generated tokens stay small even on large PRs.
  */
 export function buildReviewGateDefectUserPrompt(input: ReviewGateDefectUserPromptInput): string {
+  // MiniMax-M3 caches prefixes automatically, so every line that is identical
+  // across requests is kept ahead of the first per-PR value (head_sha).
   return [
     `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`,
+    "",
+    "## 수행할 작업",
+    input.acceptanceGuideMode
+      ? "아래 현재 HEAD 근거만으로 완전히 입증된 후보를 치명과 advisory 등급을 합쳐 최대 2개 candidates에 제출하고 등급은 defect_outcome으로 표시하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
+      : "아래 현재 HEAD 근거만으로 허용된 fatal_defect 후보를 치명과 advisory 등급을 합쳐 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
+    "",
     ...formatReviewGateHostFacts(input),
     "",
     ...formatReviewGateAcceptanceCriteria(input.explicitAcceptanceCriteria),
@@ -255,10 +288,5 @@ export function buildReviewGateDefectUserPrompt(input: ReviewGateDefectUserPromp
     input.ledgerText || "(이전 지적 없음)",
     "",
     input.reviewGateMarkdown,
-    "",
-    "## 수행할 작업",
-    input.acceptanceGuideMode
-      ? "위 현재 HEAD 근거만으로 완전히 입증된 치명 후보를 최대 2개 candidates에 제출하세요. 확실한 후보가 없으면 candidates는 빈 배열입니다."
-      : "위 현재 HEAD 근거만으로 허용된 fatal_defect 후보를 최대 2개 찾고 submit_review 도구로 제출하세요. 확실한 후보가 없으면 빈 배열을 제출하세요.",
   ].join("\n");
 }

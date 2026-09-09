@@ -1,7 +1,10 @@
-import type {
-  MiniMaxCandidateVerification,
-  MiniMaxCodeEvidence,
-  MiniMaxReviewCandidate,
+import {
+  defectOutcomeSeverity,
+  type DefectSeverity,
+  type MiniMaxCandidateVerification,
+  type MiniMaxCodeEvidence,
+  type MiniMaxDefectOutcome,
+  type MiniMaxReviewCandidate,
 } from "./minimax-review.js";
 import {
   fingerprintReviewFinding,
@@ -9,6 +12,7 @@ import {
   type MissingTestsFindingCandidate,
   type ReviewFindingCandidate,
   type ReviewFindingEvidence,
+  type StoredReviewFinding,
 } from "./review-finding-ledger.js";
 import {
   formatReviewGateFinding,
@@ -16,6 +20,18 @@ import {
 } from "./review-gate-format.js";
 import { buildChangedLineEvidence } from "./review-grounding.js";
 import { isExplicitlyManualAcceptanceCriterion } from "./review-acceptance-coverage.js";
+
+/**
+ * Missing-test findings and fatal defects block the Seori Review verdict.
+ * Advisory defects are proven the same way but are published by Jansoree only,
+ * so they must never turn a clean gate into a FAIL.
+ */
+export function storedReviewFindingBlocks(finding: StoredReviewFinding): boolean {
+  return (
+    finding.candidate.kind !== "fatal" ||
+    defectOutcomeSeverity(finding.candidate.outcome as MiniMaxDefectOutcome) === "fatal"
+  );
+}
 
 export const REVIEW_GATE_PIPELINE_MAX_FINDINGS = 2 as const;
 
@@ -48,6 +64,7 @@ export type ReviewGateCandidateRejectionCode =
   | "fatal_symbol_not_grounded"
   | "fatal_causal_chain_invalid"
   | "fatal_outcome_not_direct"
+  | "advisory_root_not_executable"
   | "verifier_evidence_not_grounded"
   | "public_finding_invalid";
 
@@ -178,7 +195,7 @@ function validateCandidate(
   if (candidate.kind === "missing_acceptance_test") {
     return validateMissingTestCandidate(input, candidate);
   }
-  return validateFatalCandidate(input, candidate, verification);
+  return validateDefectCandidate(input, candidate, verification);
 }
 
 function validateMissingTestCandidate(
@@ -190,7 +207,7 @@ function validateMissingTestCandidate(
     candidate.symbol !== null ||
     candidate.line !== null ||
     candidate.codeQuote !== null ||
-    candidate.fatalOutcome !== null ||
+    candidate.defectOutcome !== null ||
     candidate.evidence.length !== 0 ||
     !candidate.criterionId ||
     !candidate.acceptanceCriterion ||
@@ -282,17 +299,29 @@ function validateMissingTestCandidate(
   return validatePublicFinding(candidate, ledgerCandidate, publicFinding);
 }
 
-function validateFatalCandidate(
+/**
+ * Shared validation for both defect severities. The `fatal_*` rejection codes
+ * keep their names so operational log analysis stays comparable across the
+ * advisory rollout.
+ */
+function validateDefectCandidate(
   input: ReviewGatePipelineInput,
-  candidate: MiniMaxReviewCandidate,
-  verification: MiniMaxCandidateVerification,
+  candidateInput: MiniMaxReviewCandidate,
+  verificationInput: MiniMaxCandidateVerification,
 ): CandidateValidationResult {
+  // M3 reports the right line of code with an off-by-a-few line number often
+  // enough to lose otherwise valid defects. Rebinding to the single line whose
+  // current-HEAD text matches exactly keeps the proof grounded — an ambiguous
+  // quote is left alone and still rejected by the checks below.
+  const rebound = rebindCandidateLines(candidateInput, input);
+  const candidate = rebound.candidate;
+  const verification = rebound.verification(verificationInput);
   if (
     !candidate.file ||
     !candidate.symbol ||
     candidate.line === null ||
     !candidate.codeQuote ||
-    !candidate.fatalOutcome ||
+    !candidate.defectOutcome ||
     candidate.criterionId !== null ||
     candidate.acceptanceCriterion !== null ||
     candidate.testSearchSummaryKo !== null
@@ -308,7 +337,7 @@ function validateFatalCandidate(
   const candidateSymbol = candidate.symbol;
   const candidateLine = candidate.line;
   const candidateCodeQuote = candidate.codeQuote;
-  const fatalOutcome = candidate.fatalOutcome;
+  const defectOutcome = candidate.defectOutcome;
   const path = normalizeRepositoryPath(candidateFile);
   const content = path ? normalizedContentMap(input.currentHeadFileContents).get(path) : undefined;
   if (!path || content === undefined || !isExactCurrentLine(content, candidateLine, candidateCodeQuote)) {
@@ -329,12 +358,14 @@ function validateFatalCandidate(
     );
   }
 
+  const severity = defectOutcomeSeverity(defectOutcome);
   const causalError = validateCausalEvidence(
     candidate,
     content,
     path,
     candidateLine,
     candidateCodeQuote,
+    severity,
   );
   if (causalError) {
     return rejected(candidate, causalError.code, causalError.reason);
@@ -349,11 +380,24 @@ function validateFatalCandidate(
     );
   }
 
-  if (!hasDirectOutcomeSignature(fatalOutcome, candidateCodeQuote)) {
+  // A single-line signature can express a catastrophe (a throw, a delete, an
+  // open security rule) but not ordinary misbehaviour, so advisory candidates
+  // are held to executability instead. Every other proof — the root line being
+  // an added current-HEAD line, the causal chain, the grounded symbol, and the
+  // verifier's independent confirmation — applies to both severities.
+  if (severity === "fatal") {
+    if (!hasDirectOutcomeSignature(defectOutcome, candidateCodeQuote)) {
+      return rejected(
+        candidate,
+        "fatal_outcome_not_direct",
+        "종단 코드 한 줄이 주장한 치명 결과를 직접 발생시키는 서명을 포함하지 않습니다.",
+      );
+    }
+  } else if (!executableCode(candidateCodeQuote)) {
     return rejected(
       candidate,
-      "fatal_outcome_not_direct",
-      "종단 코드 한 줄이 주장한 치명 결과를 직접 발생시키는 서명을 포함하지 않습니다.",
+      "advisory_root_not_executable",
+      "종단 근거가 주석 줄이라 실행되는 동작을 증명하지 못합니다.",
     );
   }
 
@@ -382,7 +426,7 @@ function validateFatalCandidate(
   const ledgerCandidate: FatalFindingCandidate = {
     kind: "fatal",
     category: "fatal_defect",
-    outcome: fatalOutcome,
+    outcome: defectOutcome,
     file: path,
     symbol: groundedSymbol,
     // Stable host-owned trigger prevents paraphrases from creating duplicates.
@@ -391,6 +435,7 @@ function validateFatalCandidate(
   };
   const publicFinding: ReviewGatePublicFinding = {
     kind: "fatal_defect",
+    severity,
     title: candidate.titleKo,
     problem: candidate.problemKo,
     trigger: candidate.triggerKo,
@@ -412,11 +457,20 @@ function validateCausalEvidence(
   normalizedPath: string,
   candidateLine: number,
   candidateCodeQuote: string,
+  severity: DefectSeverity,
 ): Pick<RejectedReviewGateCandidate, "code" | "reason"> | null {
-  if (candidate.evidence.length < 2) {
+  // A fatal candidate must show how a normal path reaches the catastrophic
+  // line, so it needs a start and an end. An advisory defect is proven by the
+  // root line contradicting an intent the same file already declares, and that
+  // intent is often a comment or a signature rather than a second executed
+  // line, so a single grounded root is enough.
+  const minimumEvidence = severity === "fatal" ? 2 : 1;
+  if (candidate.evidence.length < minimumEvidence) {
     return {
       code: "fatal_causal_chain_invalid",
-      reason: "치명 결함에는 시작 원인과 종단 결과를 포함한 코드 근거가 최소 2개 필요합니다.",
+      reason: severity === "fatal"
+        ? "치명 결함에는 시작 원인과 종단 결과를 포함한 코드 근거가 최소 2개 필요합니다."
+        : "확정 오동작에는 종단 결과를 포함한 코드 근거가 최소 1개 필요합니다.",
     };
   }
 
@@ -457,6 +511,67 @@ function validateCausalEvidence(
     };
   }
   return null;
+}
+
+/**
+ * Host-side correction for model line drift. A quote that appears exactly once
+ * in the current HEAD file is rebound to that line; anything ambiguous or
+ * absent keeps the model's number so the existing grounding checks reject it.
+ */
+function groundCodeLine(content: string, line: number, codeQuote: string): number | null {
+  if (/[\r\n]/u.test(codeQuote)) {
+    return null;
+  }
+  if (isExactCurrentLine(content, line, codeQuote)) {
+    return line;
+  }
+  const target = normalizedCode(codeQuote);
+  if (!target) {
+    return null;
+  }
+  const lines = content.split(/\r?\n/u);
+  let found: number | null = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (normalizedCode(lines[index]!) !== target) {
+      continue;
+    }
+    if (found !== null) {
+      return null;
+    }
+    found = index + 1;
+  }
+  return found;
+}
+
+function rebindCandidateLines(
+  candidate: MiniMaxReviewCandidate,
+  input: ReviewGatePipelineInput,
+): {
+  candidate: MiniMaxReviewCandidate;
+  verification: (value: MiniMaxCandidateVerification) => MiniMaxCandidateVerification;
+} {
+  const contents = normalizedContentMap(input.currentHeadFileContents);
+  const rebindEvidence = (evidence: MiniMaxCodeEvidence): MiniMaxCodeEvidence => {
+    const path = normalizeRepositoryPath(evidence.file);
+    const content = path ? contents.get(path) : undefined;
+    const line = content === undefined
+      ? null
+      : groundCodeLine(content, evidence.line, evidence.codeQuote);
+    return line === null || line === evidence.line ? evidence : { ...evidence, line };
+  };
+  const path = candidate.file ? normalizeRepositoryPath(candidate.file) : null;
+  const content = path ? contents.get(path) : undefined;
+  const rootLine = content === undefined || candidate.line === null || candidate.codeQuote === null
+    ? candidate.line
+    : groundCodeLine(content, candidate.line, candidate.codeQuote) ?? candidate.line;
+  return {
+    candidate: {
+      ...candidate,
+      line: rootLine,
+      evidence: candidate.evidence.map(rebindEvidence),
+    },
+    verification: (value) => ({ ...value, evidence: value.evidence.map(rebindEvidence) }),
+  };
 }
 
 function isGroundedCodeEvidence(
@@ -540,7 +655,7 @@ function qualifiedSymbolTail(symbol: string): string | null {
 }
 
 function hasDirectOutcomeSignature(
-  outcome: NonNullable<MiniMaxReviewCandidate["fatalOutcome"]>,
+  outcome: NonNullable<MiniMaxReviewCandidate["defectOutcome"]>,
   sourceLine: string,
 ): boolean {
   const line = executableCode(sourceLine);

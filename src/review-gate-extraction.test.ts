@@ -28,7 +28,7 @@ function candidate(kind: MiniMaxReviewCandidate["kind"], titleKo: string): MiniM
     symbol: null,
     line: kind === "fatal_defect" ? 3 : null,
     codeQuote: kind === "fatal_defect" ? "return x[3]" : null,
-    fatalOutcome: kind === "fatal_defect" ? "deterministic_crash" : null,
+    defectOutcome: kind === "fatal_defect" ? "deterministic_crash" : null,
     criterionId: kind === "fatal_defect" ? null : "AC-1",
     acceptanceCriterion: kind === "fatal_defect" ? null : CRITERIA[0]!,
     testSearchSummaryKo: kind === "fatal_defect" ? null : "대응 테스트 없음",

@@ -13,6 +13,7 @@ function fatalFinding(
 ): ReviewGatePublicFatalFinding {
   return {
     kind: "fatal_defect",
+    severity: "fatal",
     title: "저장 시 프로세스가 종료됩니다",
     problem: "정상적인 저장 경로에서 예외가 항상 발생합니다.",
     trigger: "사용자가 기본 저장 버튼을 누릅니다.",
@@ -323,7 +324,7 @@ test("잔소리 요약은 결함이 없어도 항상 게시 형식을 만든다"
   assert.match(empty, /advisory이며 병합을 막지 않습니다/u);
 });
 
-test("잔소리 요약은 치명 결함만 세어 위치와 함께 나열한다", () => {
+test("잔소리 요약은 결함 후보만 세어 위치와 함께 나열한다", () => {
   const summary = formatJansoreeSummary({
     headSha: "abc1234",
     findings: [
@@ -340,7 +341,7 @@ test("잔소리 요약은 치명 결함만 세어 위치와 함께 나열한다"
     ],
     markerPrefix: "jansoree:advisory",
   });
-  assert.match(summary, /발견한 결함: 1건/u);
+  assert.match(summary, /발견한 결함: 치명 결함 1건/u);
   assert.match(summary, /`src\/save\.ts:42`/u);
   assert.doesNotMatch(summary, /AC-1 테스트 없음/u);
 });
@@ -362,7 +363,7 @@ test("잔소리 요약은 결함 검토 호출이 실패하면 지적 없음으�
     markerPrefix: "jansoree:advisory",
     defectReviewFailed: true,
   });
-  assert.match(withFinding, /발견한 결함: 1건/u);
+  assert.match(withFinding, /발견한 결함: 치명 결함 1건/u);
 });
 
 test("잔소리 요약은 host가 근거를 확정하지 못한 후보를 지적 없음으로 위장하지 않는다", () => {
@@ -389,5 +390,39 @@ test("잔소리 요약은 host가 근거를 확정하지 못한 후보를 지적
     markerPrefix: "jansoree:advisory",
     undecidedCandidates: 1,
   });
-  assert.match(withFinding, /발견한 결함: 1건/u);
+  assert.match(withFinding, /발견한 결함: 치명 결함 1건/u);
+});
+
+test("잔소리 요약은 치명 결함과 확정 오동작을 등급별로 나눠 센다", () => {
+  const summary = formatJansoreeSummary({
+    headSha: "abc1234",
+    findings: [
+      fatalFinding(),
+      fatalFinding({
+        severity: "advisory",
+        title: "힌트 버튼이 스크롤 입력을 가로챕니다",
+        evidence: { file: "src/ui/hint_panel.gd", line: 88, code: "accept_event()" },
+      }),
+    ],
+    markerPrefix: "jansoree:advisory",
+  });
+  assert.match(summary, /발견한 결함: 치명 결함 1건, 확정 오동작 1건/u);
+  assert.match(summary, /\[치명 결함\] 저장 시 프로세스가 종료됩니다/u);
+  assert.match(summary, /\[확정 오동작\] 힌트 버튼이 스크롤 입력을 가로챕니다/u);
+  assert.match(summary, /`src\/ui\/hint_panel\.gd:88`/u);
+});
+
+test("확정 오동작 지적은 치명 결함과 다른 등급 라벨로 게시된다", () => {
+  const advisory = formatReviewGateFinding(
+    fatalFinding({
+      severity: "advisory",
+      title: "힌트 버튼이 스크롤 입력을 가로챕니다",
+    }),
+    1,
+  );
+  assert.match(advisory, /### 1\. 확정 오동작 · 힌트 버튼이 스크롤 입력을 가로챕니다/u);
+  assert.doesNotMatch(advisory, /치명 결함/u);
+
+  const fatal = formatReviewGateFinding(fatalFinding(), 1);
+  assert.match(fatal, /### 1\. 치명 결함 ·/u);
 });

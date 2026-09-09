@@ -10,6 +10,10 @@ export const MINIMAX_REVIEW_TOOL_NAME = "submit_review" as const;
 export const MINIMAX_REVIEW_MAX_CANDIDATES = 2 as const;
 export const MINIMAX_REVIEW_MAX_ACCEPTANCE_CRITERIA = 32 as const;
 
+/**
+ * Outcomes severe enough to block a merge. The host proves each one with a
+ * direct code signature, so this list stays narrow on purpose.
+ */
 export const MINIMAX_FATAL_OUTCOMES = [
   "deterministic_crash",
   "permanent_data_loss_or_corruption",
@@ -17,6 +21,28 @@ export const MINIMAX_FATAL_OUTCOMES = [
   "primary_flow_unusable",
 ] as const;
 export type MiniMaxFatalOutcome = (typeof MINIMAX_FATAL_OUTCOMES)[number];
+
+/**
+ * Advisory-only outcomes. The defect is still proven from current-HEAD code
+ * with the same causal chain and verifier confirmation a fatal candidate needs,
+ * but its consequence is ordinary misbehaviour rather than a catastrophe, so no
+ * single-line signature can express it and it never blocks a merge.
+ */
+export const MINIMAX_ADVISORY_OUTCOMES = ["deterministic_misbehavior"] as const;
+export type MiniMaxAdvisoryOutcome = (typeof MINIMAX_ADVISORY_OUTCOMES)[number];
+
+export const MINIMAX_DEFECT_OUTCOMES = [
+  ...MINIMAX_FATAL_OUTCOMES,
+  ...MINIMAX_ADVISORY_OUTCOMES,
+] as const;
+export type MiniMaxDefectOutcome = (typeof MINIMAX_DEFECT_OUTCOMES)[number];
+
+export type DefectSeverity = "fatal" | "advisory";
+
+/** Severity is host-derived from the outcome so the model never declares it. */
+export function defectOutcomeSeverity(outcome: MiniMaxDefectOutcome): DefectSeverity {
+  return (MINIMAX_FATAL_OUTCOMES as readonly string[]).includes(outcome) ? "fatal" : "advisory";
+}
 
 export const MINIMAX_REVIEW_CANDIDATE_KINDS = [
   "fatal_defect",
@@ -67,7 +93,7 @@ export type MiniMaxReviewCandidate = {
   symbol: string | null;
   line: number | null;
   codeQuote: string | null;
-  fatalOutcome: MiniMaxFatalOutcome | null;
+  defectOutcome: MiniMaxDefectOutcome | null;
   criterionId: string | null;
   acceptanceCriterion: string | null;
   testSearchSummaryKo: string | null;
@@ -120,11 +146,12 @@ export type MiniMaxMessagesRequest = {
   tool_choice: { type: "auto" };
 };
 
-/** Anthropic-compatible thinking control. MiniMax-M3 accepts adaptive, a token budget, or off. */
-export type MiniMaxThinking =
-  | { type: "adaptive" }
-  | { type: "enabled"; budget_tokens: number }
-  | { type: "disabled" };
+/**
+ * MiniMax-M3 thinking control. The provider documents only these two values
+ * for the Anthropic-compatible endpoint; Anthropic's `budget_tokens` variant is
+ * not part of MiniMax's contract and is silently ignored, so it is not offered.
+ */
+export type MiniMaxThinking = { type: "adaptive" } | { type: "disabled" };
 
 export type MiniMaxReviewRequestOptions = {
   systemPrompt: string;
@@ -200,7 +227,7 @@ const CANDIDATE_KEYS = [
   "symbol",
   "line",
   "code_quote",
-  "fatal_outcome",
+  "defect_outcome",
   "criterion_id",
   "acceptance_criterion",
   "test_search_summary_ko",
@@ -211,7 +238,7 @@ const VERIFICATION_KEYS = ["candidate_id", "verdict", "reason_ko", "evidence"] a
 const EVIDENCE_KEYS = ["file", "line", "code_quote", "explanation_ko"] as const;
 
 const CANDIDATE_KIND_SET = new Set<string>(MINIMAX_REVIEW_CANDIDATE_KINDS);
-const FATAL_OUTCOME_SET = new Set<string>(MINIMAX_FATAL_OUTCOMES);
+const DEFECT_OUTCOME_SET = new Set<string>(MINIMAX_DEFECT_OUTCOMES);
 const VERDICT_SET = new Set<string>(MINIMAX_VERIFICATION_VERDICTS);
 const COVERAGE_STATUS_SET = new Set<string>(MINIMAX_ACCEPTANCE_COVERAGE_STATUSES);
 const HANGUL_PATTERN = /\p{Script=Hangul}/u;
@@ -335,7 +362,11 @@ function candidateItemSchema(kinds: readonly MiniMaxReviewCandidateKind[]): Reco
       },
       line: { type: ["integer", "null"], minimum: 1 },
       code_quote: { type: ["string", "null"], minLength: 1, maxLength: 2_000 },
-      fatal_outcome: { anyOf: [{ enum: [...MINIMAX_FATAL_OUTCOMES] }, { type: "null" }] },
+      defect_outcome: {
+        anyOf: [{ enum: [...MINIMAX_DEFECT_OUTCOMES] }, { type: "null" }],
+        description:
+          "fatal_defect 후보가 증명한 결과입니다. 병합을 막는 치명 결과 4종과 advisory 등급 deterministic_misbehavior 중 하나만 쓰고, missing_acceptance_test 후보는 null입니다.",
+      },
       criterion_id: {
         anyOf: [{ type: "string", pattern: "^AC-[1-9][0-9]*$" }, { type: "null" }],
       },
@@ -401,7 +432,7 @@ function defectTool(): MiniMaxMessagesRequest["tools"][number] {
   return {
     name: MINIMAX_REVIEW_TOOL_NAME,
     description:
-      "현재 HEAD 코드만으로 완전히 입증된 치명 결함 후보를 최대 2개 제출합니다. 확실한 후보가 없으면 빈 배열입니다.",
+      "현재 HEAD 코드만으로 완전히 입증된 결함 후보를 최대 2개 제출합니다. 병합을 막는 치명 등급과 advisory 등급을 defect_outcome으로 구분하며, 확실한 후보가 없으면 빈 배열입니다.",
     input_schema: {
       type: "object",
       additionalProperties: false,
@@ -907,10 +938,10 @@ function validateCandidate(raw: unknown, index: number): ValidationResult<MiniMa
   const symbol = readNullableString(raw.symbol, `${path}.symbol`, errors, 300);
   const line = readNullablePositiveInteger(raw.line, `${path}.line`, errors);
   const codeQuote = readNullableString(raw.code_quote, `${path}.code_quote`, errors, 2_000);
-  const fatalOutcome = readNullableEnum(
-    raw.fatal_outcome,
-    FATAL_OUTCOME_SET,
-    `${path}.fatal_outcome`,
+  const defectOutcome = readNullableEnum(
+    raw.defect_outcome,
+    DEFECT_OUTCOME_SET,
+    `${path}.defect_outcome`,
     errors,
   );
   const criterionId = readNullableString(raw.criterion_id, `${path}.criterion_id`, errors, 80);
@@ -933,7 +964,7 @@ function validateCandidate(raw: unknown, index: number): ValidationResult<MiniMa
     requirePresent(symbol, `${path}.symbol`, errors);
     requirePresent(line, `${path}.line`, errors);
     requirePresent(codeQuote, `${path}.code_quote`, errors);
-    requirePresent(fatalOutcome, `${path}.fatal_outcome`, errors);
+    requirePresent(defectOutcome, `${path}.defect_outcome`, errors);
     // M3 habitually links a fatal candidate back to an AC id and echoes a
     // test-search summary. The linkage is surplus to the contract, so it is
     // dropped below instead of failing the row.
@@ -956,7 +987,7 @@ function validateCandidate(raw: unknown, index: number): ValidationResult<MiniMa
     requireNull(file, `${path}.file`, errors);
     requireNull(line, `${path}.line`, errors);
     requireNull(codeQuote, `${path}.code_quote`, errors);
-    requireNull(fatalOutcome, `${path}.fatal_outcome`, errors);
+    requireNull(defectOutcome, `${path}.defect_outcome`, errors);
     requirePresent(criterionId, `${path}.criterion_id`, errors);
     if (criterionId && !CRITERION_ID_PATTERN.test(criterionId)) {
       errors.push(`${path}.criterion_id: expected an AC-N identifier`);
@@ -981,7 +1012,7 @@ function validateCandidate(raw: unknown, index: number): ValidationResult<MiniMa
     symbol === undefined ||
     line === undefined ||
     codeQuote === undefined ||
-    fatalOutcome === undefined ||
+    defectOutcome === undefined ||
     criterionId === undefined ||
     acceptanceCriterion === undefined ||
     testSearchSummaryKo === undefined ||
@@ -1004,7 +1035,7 @@ function validateCandidate(raw: unknown, index: number): ValidationResult<MiniMa
       symbol,
       line,
       codeQuote,
-      fatalOutcome: fatalOutcome as MiniMaxFatalOutcome | null,
+      defectOutcome: defectOutcome as MiniMaxDefectOutcome | null,
       criterionId: kind === "fatal_defect" ? null : criterionId,
       acceptanceCriterion: kind === "fatal_defect" ? null : acceptanceCriterion,
       testSearchSummaryKo: kind === "fatal_defect" ? null : testSearchSummaryKo,

@@ -1,3 +1,5 @@
+import type { DefectSeverity } from "./minimax-review.js";
+
 export type ReviewGatePublicVerdict = "PASS" | "FAIL" | "FOLLOW_UP" | "ABSTAIN";
 
 export type ReviewGatePublicFindingKind = "fatal_defect" | "missing_acceptance_test";
@@ -27,6 +29,11 @@ type ReviewGatePublicFindingBase = {
 
 export type ReviewGatePublicFatalFinding = ReviewGatePublicFindingBase & {
   kind: "fatal_defect";
+  /**
+   * Host-derived from the candidate outcome. Only "fatal" reaches the Seori
+   * Review verdict; "advisory" is published by Jansoree alone.
+   */
+  severity: DefectSeverity;
   evidence: ReviewGatePublicCodeEvidence;
   acceptanceCriterion?: string;
 };
@@ -333,8 +340,9 @@ export function formatReviewGateFinding(
 ): string {
   validateFinding(finding);
 
-  const kindLabel =
-    finding.kind === "fatal_defect" ? "치명 결함" : "인수조건 테스트 누락";
+  const kindLabel = finding.kind === "fatal_defect"
+    ? (finding.severity === "advisory" ? "확정 오동작" : "치명 결함")
+    : "인수조건 테스트 누락";
   const title = publicProse(finding.title, MAX_TITLE_LENGTH);
   const problem = publicProse(finding.problem, MAX_PROSE_LENGTH);
   const trigger = publicProse(finding.trigger, MAX_PROSE_LENGTH);
@@ -384,6 +392,9 @@ function validateFinding(finding: ReviewGatePublicFinding): void {
     throw new TypeError("finding.evidence에는 현재 HEAD의 검증 근거가 필요합니다.");
   }
   if (finding.kind === "fatal_defect") {
+    if (finding.severity !== "fatal" && finding.severity !== "advisory") {
+      throw new TypeError("finding.severity는 fatal 또는 advisory여야 합니다.");
+    }
     requiredText(finding.evidence.file, "finding.evidence.file", 500, false);
     requiredText(finding.evidence.code, "finding.evidence.code", 10_000, false);
     if (!Number.isInteger(finding.evidence.line) || finding.evidence.line < 1) {
@@ -580,9 +591,11 @@ export function formatJansoreeSummary(input: {
    */
   undecidedCandidates?: number;
 }): string {
-  const fatalFindings = input.findings.filter(
+  const defectFindings = input.findings.filter(
     (finding): finding is ReviewGatePublicFatalFinding => finding.kind === "fatal_defect",
   );
+  const fatalCount = defectFindings.filter((finding) => finding.severity === "fatal").length;
+  const advisoryCount = defectFindings.length - fatalCount;
   const lines = [
     `<!-- ${input.markerPrefix} head=${input.headSha} -->`,
     JANSOREE_SUMMARY_HEADER,
@@ -591,18 +604,25 @@ export function formatJansoreeSummary(input: {
     "",
   ];
   const undecidedCandidates = input.undecidedCandidates ?? 0;
-  if (fatalFindings.length === 0 && input.defectReviewFailed) {
+  if (defectFindings.length === 0 && input.defectReviewFailed) {
     lines.push("결함 검토 모델 호출이 실패해 이번 HEAD의 결함 여부를 판정하지 못했습니다. 지적이 없다는 뜻은 아닙니다.");
-  } else if (fatalFindings.length === 0 && undecidedCandidates > 0) {
+  } else if (defectFindings.length === 0 && undecidedCandidates > 0) {
     lines.push(
       `결함 후보 ${undecidedCandidates}건이 host 근거 검증을 통과하지 못해 이번 HEAD의 결함 여부를 판정하지 못했습니다. 지적이 없다는 뜻은 아닙니다.`,
     );
-  } else if (fatalFindings.length === 0) {
+  } else if (defectFindings.length === 0) {
     lines.push("지적할 결함을 찾지 못했습니다.");
   } else {
-    lines.push(`발견한 결함: ${fatalFindings.length}건`, "");
-    fatalFindings.forEach((finding, index) => {
-      lines.push(`${index + 1}. ${finding.title} — \`${finding.evidence.file}:${finding.evidence.line}\``);
+    const breakdown = [
+      fatalCount > 0 ? `치명 결함 ${fatalCount}건` : "",
+      advisoryCount > 0 ? `확정 오동작 ${advisoryCount}건` : "",
+    ].filter(Boolean).join(", ");
+    lines.push(`발견한 결함: ${breakdown}`, "");
+    defectFindings.forEach((finding, index) => {
+      const label = finding.severity === "advisory" ? "확정 오동작" : "치명 결함";
+      lines.push(
+        `${index + 1}. [${label}] ${finding.title} — \`${finding.evidence.file}:${finding.evidence.line}\``,
+      );
     });
     lines.push("", "세부 내용은 인라인 코멘트를 참고하세요.");
   }

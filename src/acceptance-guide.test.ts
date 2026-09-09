@@ -104,6 +104,7 @@ test("치명 결함 finding은 가이드 항목과 check 계산에 섞이지 않
     findings: [
       {
         kind: "fatal_defect",
+        severity: "fatal",
         title: "저장 시 크래시",
         problem: "저장 경로에서 예외가 발생합니다.",
         trigger: "저장 버튼",

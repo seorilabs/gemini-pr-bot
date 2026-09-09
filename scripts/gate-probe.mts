@@ -7,10 +7,11 @@
  * without a deploy-and-webhook cycle.
  *
  * Usage:
- *   MINIMAX_API_KEY=... node --import tsx scripts/gate-probe.mts <defect|clean|large-defect> [runs] [--thinking-budget N|--thinking-off]
+ *   MINIMAX_API_KEY=... node --import tsx scripts/gate-probe.mts <defect|clean|large-defect|misbehavior> [runs] [--thinking-off]
  *
  * The optional thinking flag applies to the coverage and defect passes only and
  * exists to measure MiniMax-M3 latency against production's adaptive default.
+ * MiniMax documents only adaptive and disabled, so there is no budget option.
  *
  * Exit code 1 when no planted root is accepted by the host pipeline, a clean
  * fixture yields an accepted finding, a phase or isolated verifier call fails,
@@ -55,7 +56,10 @@ const MAX_CHANGED_FILE_CONTENT_CHARS = 20_000;
 const MAX_REVIEW_GATE_PATCH_CHARS = 60_000;
 const MAX_CONTEXT_CHARS = 160_000;
 const REVIEW_GATE_PROMPT_RESERVE_CHARS = 16_000;
-const REQUEST_TIMEOUT_MS = 300_000;
+// Mirrors MINIMAX_TIMEOUT_MS in k8s/deployment.yaml: max_tokens 24576 at the
+// documented ~60tps standard-tier output speed needs about 410 seconds.
+const REQUEST_TIMEOUT_MS = 450_000;
+// Verification runs on a 16384-token budget, so it stays on the smaller bound.
 const VERIFIER_TIMEOUT_BUDGET_MS = 300_000;
 
 type FixtureFile = {
@@ -108,7 +112,7 @@ const SMALL_CLEAN_FILE = `extends RefCounted
 const REWARD_TIERS: Array[int] = [10, 20, 30]
 
 
-## 전달된 tier의 보상량을 돌려준다. 범위 밖 tier는 최솟값으로 보정한다.
+## 전달된 tier의 보상량을 돌려준다. 범위 밖 tier는 가장 가까운 티어로 보정한다.
 static func reward_for_tier(tier: int) -> int:
 \tvar index := clampi(tier - 1, 0, REWARD_TIERS.size() - 1)
 \treturn REWARD_TIERS[index]
@@ -122,6 +126,26 @@ static func average_score(scores: Array) -> float:
 \tfor score in scores:
 \t\ttotal += score
 \treturn total / scores.size()
+`;
+
+
+const MISBEHAVIOR_ACCEPTANCE_CRITERIA = [
+  "남은 시도가 1회 이상이면 도전할 수 있다.",
+  "순위표는 점수가 높은 순으로 정렬된다.",
+] as const;
+
+const MISBEHAVIOR_FILE = `extends RefCounted
+
+## 남은 시도가 1회 이상이면 도전할 수 있다. 0회면 막는다.
+static func can_challenge(remaining: int) -> bool:
+\treturn remaining > 1
+
+
+## 점수가 높은 순으로 정렬한 순위표를 돌려준다.
+static func ranked(scores: Array) -> Array:
+\tvar ordered := scores.duplicate()
+\tordered.sort()
+\treturn ordered
 `;
 
 function addedFile(content: string): FixtureFile {
@@ -232,6 +256,19 @@ function buildFixture(name: string): Fixture {
       plantedRoots: [
         { file: largePath, line: newLineOf(0, INDEX_DEFECT_BLOCK.length - 1) },
         { file: largePath, line: newLineOf(1, DIVISION_DEFECT_BLOCK.length - 1) },
+      ],
+    };
+  }
+  if (name === "misbehavior") {
+    const path = "godot/scripts/challenge_rules.gd";
+    const lines = MISBEHAVIOR_FILE.split("\n");
+    return {
+      title: "chore: 잔소리 봇 프로브 (확정 오동작)",
+      acceptanceCriteria: MISBEHAVIOR_ACCEPTANCE_CRITERIA,
+      files: { [path]: addedFile(MISBEHAVIOR_FILE) },
+      plantedRoots: [
+        { file: path, line: lines.indexOf("\treturn remaining > 1") + 1 },
+        { file: path, line: lines.indexOf("\tordered.sort()") + 1 },
       ],
     };
   }
@@ -385,17 +422,14 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const scenario = args.find((arg) => !arg.startsWith("--")) || "defect";
   const runs = Number.parseInt(args.filter((arg) => !arg.startsWith("--"))[1] || "1", 10);
-  const budgetArg = args.find((arg) => arg.startsWith("--thinking-budget="))?.split("=")[1];
   const thinking: MiniMaxThinking | undefined = args.includes("--thinking-off")
     ? { type: "disabled" }
-    : budgetArg
-      ? { type: "enabled", budget_tokens: Number.parseInt(budgetArg, 10) }
-      : undefined;
+    : undefined;
   const apiKey = process.env.MINIMAX_API_KEY?.trim();
   if (!apiKey) {
     throw new Error("MINIMAX_API_KEY is required");
   }
-  if (!["defect", "clean", "large-defect"].includes(scenario)) {
+  if (!["defect", "clean", "large-defect", "misbehavior"].includes(scenario)) {
     throw new Error(`unknown fixture: ${scenario}`);
   }
 
@@ -514,9 +548,18 @@ async function main(): Promise<void> {
       visibleChangedPatches: context.visibleChangedPatches,
     });
 
+    // The host rebinds a drifted line number to the matching current-HEAD line,
+    // so accepted roots must be read from the public finding rather than from
+    // the model's original candidate.
     const acceptedRoots = pipeline.accepted.map((item) => {
       const candidate = candidates.find((entry) => entry.candidateId === item.candidateId);
-      return { candidateId: item.candidateId, file: candidate?.file ?? null, line: candidate?.line ?? null };
+      const finding = item.publicFinding;
+      const grounded = finding.kind === "fatal_defect" ? finding.evidence : null;
+      return {
+        candidateId: item.candidateId,
+        file: grounded?.file ?? candidate?.file ?? null,
+        line: grounded?.line ?? candidate?.line ?? null,
+      };
     });
     const plantedDetected = fixture.plantedRoots.map((root) => ({
       ...root,
@@ -545,7 +588,10 @@ async function main(): Promise<void> {
         kind: candidate.kind,
         file: candidate.file,
         line: candidate.line,
-        outcome: candidate.fatalOutcome,
+        outcome: candidate.defectOutcome,
+        symbol: candidate.symbol,
+        codeQuote: candidate.codeQuote,
+        evidence: candidate.evidence.map((entry) => `${entry.file}:${entry.line}: ${entry.codeQuote}`),
       })),
       verifications: isolated.verifications.map((entry) => ({
         id: entry.candidateId,

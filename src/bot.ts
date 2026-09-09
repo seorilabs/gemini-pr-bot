@@ -60,7 +60,7 @@ import {
 import { isStatusReconciliationEvent, parseBotCommand, truncate } from "./text.js";
 import { reconcileAcceptanceGuideStatus, type StatusReconciliationLock } from "./status-reconciliation.js";
 import type { ReviewRunRecord } from "./review-run.js";
-import { MINIMAX_REVIEW_MODEL } from "./minimax-review.js";
+import { defectOutcomeSeverity, MINIMAX_REVIEW_MODEL } from "./minimax-review.js";
 import {
   REVIEW_GATE_PROMPT_VERSION,
   buildReviewGateCoverageSystemPrompt,
@@ -82,6 +82,7 @@ import {
 } from "./review-gate-extraction.js";
 import {
   evaluateMiniMaxReviewGateCandidates,
+  storedReviewFindingBlocks,
 } from "./review-gate-pipeline.js";
 import {
   fingerprintReviewFinding,
@@ -2555,8 +2556,16 @@ export class PrBot {
     const currentConfirmedFingerprints = new Set(
       pipeline.ledgerCandidates.map((candidate) => fingerprintReviewFinding(candidate)),
     );
-    const blockingOpenFindings = openFindings.filter((finding) =>
+    const currentOpenFindings = openFindings.filter((finding) =>
       currentConfirmedFingerprints.has(finding.semanticFingerprint),
+    );
+    // Advisory defects are proven the same way as fatal ones but never reach
+    // the Seori Review verdict: Jansoree publishes them on its own identity.
+    const blockingOpenFindings = currentOpenFindings.filter((finding) =>
+      storedReviewFindingBlocks(finding)
+    );
+    const advisoryOpenFindings = currentOpenFindings.filter((finding) =>
+      !storedReviewFindingBlocks(finding)
     );
     const unconfirmedOpenFindings = openFindings.filter((finding) =>
       !currentConfirmedFingerprints.has(finding.semanticFingerprint),
@@ -2566,15 +2575,16 @@ export class PrBot {
       !context.fatalContextComplete ||
       !coverage.complete ||
       failedExtractionPasses.length > 0 ||
-      blockingOpenFindings.length !== openFindings.length ||
+      currentOpenFindings.length !== openFindings.length ||
       pipeline.rejected.some((rejected) => {
         const verification = evaluatedEnvelope.verifications.find((item) => item.candidateId === rejected.candidateId);
         return verification?.verdict === "uncertain";
       });
-    // Verifier-confirmed fatal candidates the host could not ground. Jansoree
-    // must not report those runs as "no defect found": the gate never reached
-    // that judgement, and a silent drop reads exactly like a clean review.
-    const undecidedFatalCandidates = pipeline.rejected.filter((rejectedCandidate) => {
+    // Verifier-confirmed defect candidates of either severity that the host
+    // could not ground. Jansoree must not report those runs as "no defect found":
+    // the gate never reached that judgement, and a silent drop reads exactly like
+    // a clean review.
+    const undecidedDefectCandidates = pipeline.rejected.filter((rejectedCandidate) => {
       const candidate = evaluatedEnvelope.candidates.find(
         (item) => item.candidateId === rejectedCandidate.candidateId,
       );
@@ -2594,6 +2604,13 @@ export class PrBot {
     const publicFindings = baseVerdict === "FAIL"
       ? this.reviewGatePublicFindings(blockingOpenFindings, publicByFingerprint, context)
       : [];
+    // Computed regardless of the verdict so a clean gate still carries advisory
+    // defects to Jansoree.
+    const advisoryFindings = this.reviewGatePublicFindings(
+      advisoryOpenFindings,
+      publicByFingerprint,
+      context,
+    );
     const disclosure = buildReviewGateDisclosure({
       explicitAcceptanceCriteria,
       acceptanceCoverage: evaluatedEnvelope.acceptanceCoverage,
@@ -2670,10 +2687,10 @@ export class PrBot {
             repo,
             prNumber,
             context.headSha,
-            publicFindings,
+            [...publicFindings, ...advisoryFindings],
             ledgerSnapshot.publishedFingerprints,
             failedExtractionPasses.includes("defect"),
-            undecidedFatalCandidates,
+            undecidedDefectCandidates,
             reviewAudit,
           );
         }
@@ -3362,25 +3379,34 @@ export class PrBot {
     if (!root?.file || !root.line) {
       throw new Error(`fatal finding ${finding.semanticFingerprint} has no grounded root evidence`);
     }
-    const outcome = this.reviewGateFatalOutcomeKo(finding.candidate.outcome);
+    const outcome = this.reviewGateDefectOutcomeKo(finding.candidate.outcome);
+    const severity = defectOutcomeSeverity(
+      finding.candidate.outcome as Parameters<typeof defectOutcomeSeverity>[0],
+    );
     return {
       kind: "fatal_defect",
+      severity,
       title: `${outcome} 근거가 아직 남아 있습니다`,
-      problem: "이전에 확인한 치명 결함의 동일한 종단 코드가 현재 HEAD에도 존재합니다.",
+      problem: severity === "fatal"
+        ? "이전에 확인한 치명 결함의 동일한 종단 코드가 현재 HEAD에도 존재합니다."
+        : "이전에 확인한 확정적 오동작의 동일한 종단 코드가 현재 HEAD에도 존재합니다.",
       trigger: `현재 HEAD에서 ${finding.candidate.file}의 ${finding.candidate.symbol || "지정 경로"}가 실행될 때입니다.`,
-      impact: `${outcome}이 확정적으로 발생해 병합을 차단합니다.`,
+      impact: severity === "fatal"
+        ? `${outcome}이 확정적으로 발생해 병합을 차단합니다.`
+        : `${outcome}이 확정적으로 발생합니다. 병합은 막지 않습니다.`,
       requiredAction: "아래 종단 결과를 제거하고 같은 실행 경로의 회귀 테스트를 추가해야 합니다.",
       evidence: { file: root.file, line: root.line, code: root.quote },
       fingerprint: finding.semanticFingerprint,
     };
   }
 
-  private reviewGateFatalOutcomeKo(outcome: string): string {
+  private reviewGateDefectOutcomeKo(outcome: string): string {
     const labels: Record<string, string> = {
       deterministic_crash: "정상 경로의 확정적 크래시",
       permanent_data_loss_or_corruption: "영구 데이터 손실 또는 손상",
       exploitable_security_or_privacy_exposure: "악용 가능한 보안 또는 개인정보 노출",
       primary_flow_unusable: "핵심 사용자 흐름 완전 불능",
+      deterministic_misbehavior: "선언된 동작과 다른 확정적 오동작",
     };
     return labels[outcome] || "치명적인 실행 결과";
   }
@@ -3566,6 +3592,18 @@ export class PrBot {
       }));
       await this.safeSubmitReview(octokit, repo, prNumber, headSha, "COMMENT", summary, inlineComments);
       await this.notifyJansoreeAudit(reviewAudit, summary, newFindings);
+      // Severity counts make the advisory rollout measurable from operational
+      // logs instead of only from the published GitHub comments.
+      this.logger.info(
+        {
+          repo: repo.fullName,
+          prNumber,
+          headSha,
+          fatal: newFindings.filter((finding) => finding.severity === "fatal").length,
+          advisory: newFindings.filter((finding) => finding.severity === "advisory").length,
+        },
+        "Jansoree advisory published",
+      );
     } catch (error) {
       this.logger.warn(
         { error, repo: repo.fullName, prNumber, headSha },
