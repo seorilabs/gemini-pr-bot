@@ -36,7 +36,7 @@ function validEnvelope(): MiniMaxReviewGateCacheEnvelope {
         symbol: null,
         line: null,
         codeQuote: null,
-        fatalOutcome: null,
+        defectOutcome: null,
         criterionId: "AC-1",
         acceptanceCriterion: ACCEPTANCE_CRITERION,
         testSearchSummaryKo: "현재 HEAD의 전체 테스트 파일을 확인했지만 대응 단언이 없습니다.",

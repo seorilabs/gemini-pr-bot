@@ -68,8 +68,10 @@ spec:
               value: "3306"
             - name: MYSQL_DATABASE
               value: base
+            # max_tokens 24576 / 공식 standard tier 출력 속도 약 60tps = 약 410초.
+            # TTFT p95 3.4초와 여유를 더해 450초로 둔다.
             - name: MINIMAX_TIMEOUT_MS
-              value: "300000"
+              value: "450000"
             - name: DEFECT_REVIEW_ENABLED
               value: "true"
             - name: AI_REVIEW_PROVIDERS

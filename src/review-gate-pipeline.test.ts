@@ -7,9 +7,12 @@ import type {
 import {
   SYMBOL_MAX_DISTANCE,
   evaluateMiniMaxReviewGateCandidates,
+  isAdvisoryDefectCandidate,
   normalizeRepositoryPath,
+  storedReviewFindingBlocks,
   type ReviewGatePipelineInput,
 } from "./review-gate-pipeline.js";
+import type { StoredReviewFinding } from "./review-finding-ledger.js";
 
 const ACCEPTANCE_CRITERION = "앱을 다시 열어도 기존 세션이 유지된다.";
 const FATAL_FILE = "src/save.ts";
@@ -153,13 +156,69 @@ test("모델의 발생 조건 문구가 바뀌어도 host-stable fatal fingerpri
   assert.notEqual(first.publicFindings[0]?.trigger, second.publicFindings[0]?.trigger);
 });
 
-test("대표 코드의 line 또는 exact quote가 현재 HEAD와 다르면 치명 결함을 거부한다", () => {
+test("현재 HEAD에 없는 exact quote는 치명 결함을 거부한다", () => {
+  const result = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({
+      line: 3,
+      codeQuote: 'storage.wipe("save-record");',
+      evidence: [
+        codeEvidence(2, "if (value === null) {"),
+        codeEvidence(3, 'storage.wipe("save-record");'),
+      ],
+    })],
+    verifications: [fatalVerification({
+      evidence: [codeEvidence(3, 'storage.wipe("save-record");')],
+    })],
+  }));
+
+  assert.equal(result.accepted.length, 0);
+  assert.equal(result.rejected[0]?.code, "fatal_code_not_grounded");
+});
+
+test("line 번호만 어긋나고 quote가 파일에서 유일하면 현재 HEAD 줄로 교정한다", () => {
+  // M3는 정확한 코드 줄을 짚고도 줄 번호를 한두 칸 밀어 보내는 일이 잦다.
+  // 유일하게 일치하는 줄로만 교정하므로 근거는 여전히 현재 HEAD에 묶여 있다.
+  const result = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({
+      line: 4,
+      evidence: [
+        codeEvidence(1, "export function saveDraft(value: string | null) {"),
+        codeEvidence(4, 'storage.remove("save-record");'),
+      ],
+    })],
+    verifications: [fatalVerification({
+      evidence: [codeEvidence(4, 'storage.remove("save-record");')],
+    })],
+  }));
+
+  assert.deepEqual(result.rejected, []);
+  assert.equal(result.accepted.length, 1);
+  const finding = result.publicFindings[0];
+  if (finding?.kind === "fatal_defect") {
+    assert.equal(finding.evidence.line, 3);
+  }
+});
+
+test("같은 코드가 파일에 여러 번 나오면 교정하지 않고 거부한다", () => {
+  const duplicated = [
+    "export function saveDraft(value: string | null) {",
+    '  storage.remove("save-record");',
+    '  storage.remove("save-record");',
+    "}",
+  ].join("\n");
   const result = evaluateMiniMaxReviewGateCandidates(input({
     candidates: [fatalCandidate({
       line: 4,
       codeQuote: 'storage.remove("save-record");',
+      evidence: [
+        codeEvidence(1, "export function saveDraft(value: string | null) {"),
+        codeEvidence(4, 'storage.remove("save-record");'),
+      ],
     })],
-    verifications: [fatalVerification()],
+    verifications: [fatalVerification({
+      evidence: [codeEvidence(4, 'storage.remove("save-record");')],
+    })],
+    currentHeadFileContents: { [FATAL_FILE]: duplicated },
   }));
 
   assert.equal(result.accepted.length, 0);
@@ -283,7 +342,7 @@ test("종단 코드가 주장한 치명 결과를 직접 발생시키지 않으�
     "}",
   ].join("\n");
   const candidate = fatalCandidate({
-    fatalOutcome: "primary_flow_unusable",
+    defectOutcome: "primary_flow_unusable",
     line: 3,
     codeQuote: "return false;",
     evidence: [codeEvidence(2, "if (value === null) {"), codeEvidence(3, "return false;")],
@@ -297,6 +356,148 @@ test("종단 코드가 주장한 치명 결과를 직접 발생시키지 않으�
 
   assert.equal(result.accepted.length, 0);
   assert.equal(result.rejected[0]?.code, "fatal_outcome_not_direct");
+});
+
+test("advisory 등급은 치명 서명 없이도 나머지 근거가 모두 남으면 통과한다", () => {
+  // 한 줄 정규식 서명은 크래시나 삭제를 증명할 수 있어도 일반 오동작을 표현할
+  // 수 없다. advisory 후보는 서명만 면제하고 root 실재·추가줄·인과 근거·symbol·
+  // verifier 확인은 치명 등급과 동일하게 요구한다.
+  const source = [
+    "func _on_hint_pressed(event):",
+    "  if event.is_pressed():",
+    "    accept_event()",
+    "  return",
+  ].join("\n");
+  const file = "src/ui/hint_panel.gd";
+  const candidate = fatalCandidate({
+    file,
+    symbol: "accept_event",
+    line: 3,
+    codeQuote: "accept_event()",
+    defectOutcome: "deterministic_misbehavior",
+    evidence: [
+      { file, line: 2, codeQuote: "if event.is_pressed():", explanationKo: "정상 입력 경로입니다." },
+      { file, line: 3, codeQuote: "accept_event()", explanationKo: "스크롤 입력을 가로챕니다." },
+    ],
+  });
+  const result = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [candidate],
+    verifications: [fatalVerification({
+      evidence: [{ file, line: 3, codeQuote: "accept_event()", explanationKo: "동일 종단 근거입니다." }],
+    })],
+    currentHeadFileContents: { [file]: source },
+    visibleChangedPatches: { [file]: addedLinePatch(3, "accept_event()") },
+  }));
+
+  assert.deepEqual(result.rejected, []);
+  assert.equal(result.accepted.length, 1);
+  const finding = result.publicFindings[0];
+  assert.equal(finding?.kind, "fatal_defect");
+  if (finding?.kind === "fatal_defect") {
+    assert.equal(finding.severity, "advisory");
+  }
+  assert.equal(result.ledgerCandidates[0]?.kind, "fatal");
+});
+
+test("advisory 등급은 선언된 의도를 담은 근거 줄을 함께 요구한다", () => {
+  // root 한 줄만 받으면 "선언된 의도"가 모델 산문에만 존재하게 되어, 새로 추가된
+  // 어떤 비교나 반환도 확정 오동작으로 통과할 수 있다. 의도 줄도 현재 HEAD에
+  // 실재해야 한다.
+  const source = [
+    "## 남은 시도가 1회 이상이면 도전할 수 있다.",
+    "static func can_challenge(remaining: int) -> bool:",
+    "\treturn remaining > 1",
+  ].join("\n");
+  const file = "godot/scripts/challenge_rules.gd";
+  const root = { file, line: 3, codeQuote: "\treturn remaining > 1", explanationKo: "경계값을 반대로 적용합니다." };
+  const intent = {
+    file,
+    line: 1,
+    codeQuote: "## 남은 시도가 1회 이상이면 도전할 수 있다.",
+    explanationKo: "같은 파일이 선언한 의도입니다.",
+  };
+  const rootOnly = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({
+      file,
+      symbol: "can_challenge",
+      line: 3,
+      codeQuote: "\treturn remaining > 1",
+      defectOutcome: "deterministic_misbehavior",
+      evidence: [root],
+    })],
+    verifications: [fatalVerification({ evidence: [root] })],
+    currentHeadFileContents: { [file]: source },
+    visibleChangedPatches: { [file]: addedLinePatch(3, "\treturn remaining > 1") },
+  }));
+  assert.equal(rootOnly.accepted.length, 0);
+  assert.equal(rootOnly.rejected[0]?.code, "fatal_causal_chain_invalid");
+
+  const withIntent = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({
+      file,
+      symbol: "can_challenge",
+      line: 3,
+      codeQuote: "\treturn remaining > 1",
+      defectOutcome: "deterministic_misbehavior",
+      evidence: [intent, root],
+    })],
+    verifications: [fatalVerification({ evidence: [root] })],
+    currentHeadFileContents: { [file]: source },
+    visibleChangedPatches: { [file]: addedLinePatch(3, "\treturn remaining > 1") },
+  }));
+  assert.deepEqual(withIntent.rejected, []);
+  assert.equal(withIntent.accepted.length, 1);
+});
+
+test("치명 등급은 근거가 하나뿐이면 계속 거부한다", () => {
+  const result = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({ evidence: [codeEvidence(3, 'storage.remove("save-record");')] })],
+    verifications: [fatalVerification()],
+  }));
+  assert.equal(result.rejected[0]?.code, "fatal_causal_chain_invalid");
+});
+
+test("advisory 등급도 종단 근거가 주석 줄이면 거부한다", () => {
+  const source = [
+    "func _on_hint_pressed(event):",
+    "  if event.is_pressed():",
+    "    # accept_event()",
+    "  return",
+  ].join("\n");
+  const file = "src/ui/hint_panel.gd";
+  const result = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({
+      file,
+      symbol: "accept_event",
+      line: 3,
+      codeQuote: "# accept_event()",
+      defectOutcome: "deterministic_misbehavior",
+      evidence: [
+        { file, line: 2, codeQuote: "if event.is_pressed():", explanationKo: "정상 입력 경로입니다." },
+        { file, line: 3, codeQuote: "# accept_event()", explanationKo: "주석입니다." },
+      ],
+    })],
+    verifications: [fatalVerification({
+      evidence: [{ file, line: 3, codeQuote: "# accept_event()", explanationKo: "동일 종단 근거입니다." }],
+    })],
+    currentHeadFileContents: { [file]: source },
+    visibleChangedPatches: { [file]: addedLinePatch(3, "# accept_event()") },
+  }));
+
+  assert.equal(result.accepted.length, 0);
+  assert.equal(result.rejected[0]?.code, "advisory_root_not_executable");
+});
+
+test("치명 등급은 advisory 도입 뒤에도 직접 서명을 계속 요구한다", () => {
+  const accepted = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate()],
+    verifications: [fatalVerification()],
+  }));
+  const finding = accepted.publicFindings[0];
+  assert.equal(finding?.kind, "fatal_defect");
+  if (finding?.kind === "fatal_defect") {
+    assert.equal(finding.severity, "fatal");
+  }
 });
 
 test("verifier가 같은 종단 근거를 현재 HEAD에서 독립적으로 인용하지 못하면 거부한다", () => {
@@ -382,7 +583,7 @@ function missingCandidate(
     symbol: null,
     line: null,
     codeQuote: null,
-    fatalOutcome: null,
+    defectOutcome: null,
     criterionId: "AC-1",
     acceptanceCriterion: ACCEPTANCE_CRITERION,
     testSearchSummaryKo: "현재 HEAD의 전체 테스트 파일을 검색했지만 관련 테스트가 없습니다.",
@@ -406,7 +607,7 @@ function fatalCandidate(
     symbol: "saveDraft",
     line: 3,
     codeQuote: 'storage.remove("save-record");',
-    fatalOutcome: "permanent_data_loss_or_corruption",
+    defectOutcome: "permanent_data_loss_or_corruption",
     criterionId: null,
     acceptanceCriterion: null,
     testSearchSummaryKo: null,
@@ -457,7 +658,7 @@ test("인덱스 접근 root는 서명 키워드 없이도 deterministic_crash로
     "}",
   ].join("\n");
   const candidate = fatalCandidate({
-    fatalOutcome: "deterministic_crash",
+    defectOutcome: "deterministic_crash",
     symbol: "rewardForTier",
     line: 3,
     codeQuote: "return TIERS[tier];",
@@ -480,7 +681,7 @@ test("나눗셈 root는 deterministic_crash로 인정하고, 일반 호출 root�
   ].join("\n");
   const division = evaluateMiniMaxReviewGateCandidates(input({
     candidates: [fatalCandidate({
-      fatalOutcome: "deterministic_crash",
+      defectOutcome: "deterministic_crash",
       symbol: "average",
       line: 2,
       codeQuote: "return total / count;",
@@ -499,7 +700,7 @@ test("나눗셈 root는 deterministic_crash로 인정하고, 일반 호출 root�
   ].join("\n");
   const plain = evaluateMiniMaxReviewGateCandidates(input({
     candidates: [fatalCandidate({
-      fatalOutcome: "deterministic_crash",
+      defectOutcome: "deterministic_crash",
       symbol: "run",
       line: 2,
       codeQuote: "return doWork(value);",
@@ -519,4 +720,64 @@ test("검증자 발췌가 재사용하는 grounding 상수와 경로 정규화�
   assert.equal(normalizeRepositoryPath("a\\b.gd"), "a/b.gd");
   assert.equal(normalizeRepositoryPath("../a.gd"), null);
   assert.equal(normalizeRepositoryPath("/abs.gd"), null);
+});
+
+test("advisory 결함은 Seori 판정을 막지 않고 치명 결함과 테스트 누락만 막는다", () => {
+  // 잔소리는 advisory 지적을 게시하지만 병합 게이트는 치명 등급만 본다.
+  assert.equal(storedReviewFindingBlocks(storedFinding("permanent_data_loss_or_corruption")), true);
+  assert.equal(storedReviewFindingBlocks(storedFinding("deterministic_crash")), true);
+  assert.equal(storedReviewFindingBlocks(storedFinding("deterministic_misbehavior")), false);
+  assert.equal(storedReviewFindingBlocks(storedMissingTestFinding()), true);
+});
+
+function storedFinding(outcome: string): StoredReviewFinding {
+  return {
+    ...storedBase(),
+    candidate: {
+      kind: "fatal",
+      category: "fatal_defect",
+      outcome,
+      file: FATAL_FILE,
+      symbol: "saveDraft",
+      trigger: `${FATAL_FILE}#saveDraft`,
+      evidence: [{ kind: "code", file: FATAL_FILE, line: 3, symbol: "saveDraft", quote: "x" }],
+    },
+  };
+}
+
+function storedMissingTestFinding(): StoredReviewFinding {
+  return {
+    ...storedBase(),
+    candidate: {
+      kind: "missing_tests",
+      category: "missing_acceptance_test",
+      acceptanceCriterion: ACCEPTANCE_CRITERION,
+      file: null,
+      symbol: null,
+      trigger: ACCEPTANCE_CRITERION,
+      evidence: [{ kind: "acceptance_criterion", file: null, line: null, symbol: null, quote: ACCEPTANCE_CRITERION }],
+    },
+  };
+}
+
+function storedBase() {
+  return {
+    semanticFingerprint: "f".repeat(64),
+    evidenceHash: "e".repeat(64),
+    state: "open" as const,
+    firstSeenHeadSha: "abc1234",
+    lastSeenHeadSha: "abc1234",
+    lastEvaluatedHeadSha: "abc1234",
+    contextHash: "c".repeat(64),
+    refutation: null,
+  };
+}
+
+test("advisory 후보 판정은 게이트 입력 필터가 공유하는 하나의 기준을 쓴다", () => {
+  // Seori 판정 입력(bot.ts)과 공개 보류 항목(disclosure)이 서로 다른 기준을 쓰면
+  // 한쪽만 advisory를 걸러 "보류인데 보류 항목이 없는" 상태가 만들어진다.
+  assert.equal(isAdvisoryDefectCandidate(fatalCandidate({ defectOutcome: "deterministic_misbehavior" })), true);
+  assert.equal(isAdvisoryDefectCandidate(fatalCandidate({ defectOutcome: "deterministic_crash" })), false);
+  assert.equal(isAdvisoryDefectCandidate(fatalCandidate({ defectOutcome: "primary_flow_unusable" })), false);
+  assert.equal(isAdvisoryDefectCandidate(missingCandidate()), false);
 });

@@ -93,7 +93,7 @@ export function encodeReviewGateCache(
       symbol: candidate.symbol,
       line: candidate.line,
       code_quote: candidate.codeQuote,
-      fatal_outcome: candidate.fatalOutcome,
+      defect_outcome: candidate.defectOutcome,
       criterion_id: candidate.criterionId,
       acceptance_criterion: candidate.acceptanceCriterion,
       test_search_summary_ko: candidate.testSearchSummaryKo,

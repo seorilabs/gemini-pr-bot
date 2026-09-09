@@ -163,7 +163,13 @@ function assertMiniMaxEnvelopeOk(response: unknown): void {
     return;
   }
   const statusMsg = (baseResp as { status_msg?: unknown }).status_msg;
-  const quotaHint = statusCode === 1002 ? " (rate limit)" : statusCode === 1008 ? " (insufficient quota)" : "";
+  // 1002는 요청 수, 1039는 토큰 수 상한이며 둘 다 burst 스로틀이므로 같은
+  // cooldown 경로로 보낸다. 1008은 잔여 쿼터 소진이라 별도 문구를 쓴다.
+  const quotaHint = statusCode === 1002 || statusCode === 1039
+    ? " (rate limit)"
+    : statusCode === 1008
+      ? " (insufficient quota)"
+      : "";
   throw new Error(`MiniMax API error ${String(statusCode)}: ${String(statusMsg ?? "unknown")}${quotaHint}`);
 }
 

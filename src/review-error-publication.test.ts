@@ -101,6 +101,7 @@ test("서리 리뷰와 잔소리 리뷰의 요약 및 지적을 Discord 리뷰 �
   }, "");
   await bot.notifyJansoreeAudit(session, "잔소리 리뷰 결과", [{
     kind: "fatal_defect",
+    severity: "fatal",
     title: "저장 시 프로세스가 종료됩니다",
     problem: "정상 저장 경로에서 예외가 발생합니다.",
     trigger: "저장 버튼을 누릅니다.",

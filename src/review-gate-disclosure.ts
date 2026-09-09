@@ -1,16 +1,19 @@
-import type {
-  MiniMaxAcceptanceCoverage,
-  MiniMaxCandidateVerification,
-  MiniMaxReviewCandidate,
+import {
+  defectOutcomeSeverity,
+  type MiniMaxAcceptanceCoverage,
+  type MiniMaxCandidateVerification,
+  type MiniMaxDefectOutcome,
+  type MiniMaxReviewCandidate,
 } from "./minimax-review.js";
 import {
   isExplicitlyManualAcceptanceCriterion,
   normalizeReviewAcceptanceEvidence,
 } from "./review-acceptance-coverage.js";
 import type { StoredReviewFinding } from "./review-finding-ledger.js";
-import type {
-  ReviewGateCandidateRejectionCode,
-  ReviewGatePipelineResult,
+import {
+  isAdvisoryDefectCandidate,
+  type ReviewGateCandidateRejectionCode,
+  type ReviewGatePipelineResult,
 } from "./review-gate-pipeline.js";
 import type {
   ReviewGateAbstainItem,
@@ -126,8 +129,10 @@ export function buildReviewGateDisclosure(
       .filter((verification) => verification.verdict === "uncertain")
       .map((verification) => verification.candidateId),
   );
+  // Advisory defects never reach the Seori verdict, so an unresolved advisory
+  // candidate must not turn the gate into an abstain item either.
   const uncertainCandidates = input.candidates.filter((candidate) =>
-    uncertainCandidateIds.has(candidate.candidateId)
+    uncertainCandidateIds.has(candidate.candidateId) && !isAdvisoryDefectCandidate(candidate)
   );
   for (const candidate of uncertainCandidates) {
     abstainItems.push({
@@ -161,6 +166,12 @@ export function buildReviewGateDisclosure(
   }
 
   for (const finding of input.unconfirmedOpenFindings) {
+    if (
+      finding.candidate.kind === "fatal" &&
+      defectOutcomeSeverity(finding.candidate.outcome as MiniMaxDefectOutcome) === "advisory"
+    ) {
+      continue;
+    }
     abstainItems.push({
       label: unconfirmedFindingLabel(finding),
       reason: "이전에 확인된 지적이 현재 HEAD에서 유지되는지 또는 해소됐는지 재검증 근거가 충분하지 않습니다.",
@@ -174,7 +185,10 @@ export function buildReviewGateDisclosure(
     input.pipeline.inputValid &&
     !failedPasses.has("defect") &&
     !uncertainCandidates.some((candidate) => candidate.kind === "fatal_defect") &&
-    !input.unconfirmedOpenFindings.some((finding) => finding.candidate.kind === "fatal");
+    !input.unconfirmedOpenFindings.some((finding) =>
+      finding.candidate.kind === "fatal" &&
+      defectOutcomeSeverity(finding.candidate.outcome as MiniMaxDefectOutcome) === "fatal"
+    );
 
   return {
     coveredCriteria,

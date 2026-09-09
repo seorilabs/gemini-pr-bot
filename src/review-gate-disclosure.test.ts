@@ -227,7 +227,7 @@ function fatalCandidate(): MiniMaxReviewCandidate {
     symbol: "saveDraft",
     line: 42,
     codeQuote: "throw error;",
-    fatalOutcome: "deterministic_crash",
+    defectOutcome: "deterministic_crash",
     criterionId: null,
     acceptanceCriterion: null,
     testSearchSummaryKo: null,
@@ -268,4 +268,52 @@ test("추출 패스 실패는 공개 보류 항목이 되고 결함 검사 통�
   });
   assert.equal(healthy.fatalCheckPassed, true);
   assert.deepEqual(healthy.abstainItems, []);
+});
+
+test("advisory 결함이 확정되지 않아도 Seori 판정을 보류시키지 않는다", () => {
+  // 잔소리 advisory는 병합 게이트 밖에 있으므로 uncertain 판정이 나도
+  // 보류 항목이나 결함 검사 실패로 번지면 안 된다.
+  const advisory: MiniMaxReviewCandidate = {
+    ...fatalCandidate(),
+    defectOutcome: "deterministic_misbehavior",
+  };
+  const disclosure = buildReviewGateDisclosure({
+    explicitAcceptanceCriteria: [],
+    acceptanceCoverage: [],
+    groundedAcceptanceCriteria: new Set(),
+    coverageValidationErrors: [],
+    fatalContextComplete: true,
+    pipeline: pipeline(),
+    candidates: [advisory],
+    verifications: [{
+      candidateId: "C-1",
+      verdict: "uncertain",
+      reasonKo: "확정도 기각도 하지 못했습니다.",
+      evidence: [],
+    }],
+    unconfirmedOpenFindings: [],
+    failedExtractionPasses: [],
+  });
+  assert.equal(disclosure.fatalCheckPassed, true);
+  assert.deepEqual(disclosure.abstainItems, []);
+
+  const fatal = buildReviewGateDisclosure({
+    explicitAcceptanceCriteria: [],
+    acceptanceCoverage: [],
+    groundedAcceptanceCriteria: new Set(),
+    coverageValidationErrors: [],
+    fatalContextComplete: true,
+    pipeline: pipeline(),
+    candidates: [fatalCandidate()],
+    verifications: [{
+      candidateId: "C-1",
+      verdict: "uncertain",
+      reasonKo: "확정도 기각도 하지 못했습니다.",
+      evidence: [],
+    }],
+    unconfirmedOpenFindings: [],
+    failedExtractionPasses: [],
+  });
+  assert.equal(fatal.fatalCheckPassed, false);
+  assert.equal(fatal.abstainItems.length, 1);
 });

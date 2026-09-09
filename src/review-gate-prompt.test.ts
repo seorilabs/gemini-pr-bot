@@ -54,10 +54,14 @@ test("커버리지 패스와 결함 패스는 후보 종류와 규칙을 서로 
   assert.doesNotMatch(coverage, /fatal_defect는 정상 또는 필수 경로에서/u);
   assert.doesNotMatch(coverage, /후보 예시 1/u);
 
-  assert.match(defect, /허용 후보는 최대 2개이며 fatal_defect뿐입니다/u);
-  assert.match(defect, /fatal_defect는 정상 또는 필수 경로에서 확정적으로 크래시/u);
-  assert.match(defect, /치명 결함은 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시/u);
-  assert.match(defect, /후보 예시 2: 주석이나 문서가 명시한 정상 입력 범위/u);
+  assert.match(defect, /허용 후보는 최대 2개이며 kind는 fatal_defect뿐입니다/u);
+  assert.match(defect, /후보의 등급은 defect_outcome으로 정합니다/u);
+  assert.match(defect, /advisory 등급은 deterministic_misbehavior입니다/u);
+  assert.match(defect, /치명 등급의 evidence는 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시/u);
+  assert.match(defect, /deterministic_misbehavior의 evidence는 선언된 의도를 담은 같은 파일의 현재 HEAD 줄/u);
+  assert.match(defect, /치명 등급 후보를 먼저 모두 채우고/u);
+  assert.match(defect, /치명 예시: 주석이나 문서가 명시한 정상 입력 범위/u);
+  assert.match(defect, /advisory 예시: 인수조건이나 주석이 정한 경계값/u);
   assert.doesNotMatch(defect, /acceptance_coverage/u);
   assert.doesNotMatch(defect, /Host Evidence Candidates/u);
 
@@ -72,7 +76,7 @@ test("보수적 게이트 프롬프트는 가이드 모드와 분리된다", () 
   assert.notEqual(conservativeCoverage(), guideCoverage());
   assert.notEqual(conservativeDefect(), guideDefect());
   assert.match(conservativeCoverage(), /허용 후보는 최대 2개이며 missing_acceptance_test뿐입니다/u);
-  assert.match(conservativeDefect(), /허용 후보는 최대 2개이며 fatal_defect뿐입니다/u);
+  assert.match(conservativeDefect(), /허용 후보는 최대 2개이며 kind는 fatal_defect뿐입니다/u);
   assert.match(conservativeDefect(), /refuted 상태는 현재 Changed Files에/u);
   // 후속 턴 규칙은 보수 게이트 전용으로 남는다.
   assert.match(conservativeCoverage(), /review_round가 2 이상이면/u);
@@ -96,11 +100,12 @@ test("검증자 프롬프트는 발췌 입력 계약을 설명한다", () => {
   assert.match(prompt, /본문이 발췌에 없으면 uncertain/u);
 });
 
-test("프롬프트 버전은 가이드 모드 v7 MiniMax를 가리킨다", () => {
+test("프롬프트 버전은 가이드 모드 v8 MiniMax를 가리킨다", () => {
   // 버전 문자열은 review_runs 테이블의 회귀 측정 단위이자 게이트 캐시 격리 키다.
   // v6: 검증자 입력을 후보 파일 발췌로 축소하고 후보별 격리 호출로 바꿨다.
   // v7: 후보 추출을 커버리지 패스와 결함 패스로 분할했다.
-  assert.equal(REVIEW_GATE_PROMPT_VERSION, "acceptance-guide-v7-minimax");
+  // v8: 결함 후보를 치명 등급과 advisory 등급으로 나눴다.
+  assert.equal(REVIEW_GATE_PROMPT_VERSION, "acceptance-guide-v8-minimax");
 });
 
 const hostFacts = {
@@ -126,7 +131,9 @@ test("커버리지 유저 프롬프트는 인수조건·인벤토리·출처만 
   });
   const lines = prompt.split("\n");
   assert.equal(lines[0], `Gate version: ${REVIEW_GATE_PROMPT_VERSION}`);
-  assert.equal(lines[1], "## Host 검증 사실");
+  assert.equal(lines[2], "## 수행할 작업");
+  // 자동 prefix 캐시가 걸리도록 고정 지시가 첫 per-PR 값보다 앞에 온다.
+  assert.ok(prompt.indexOf("## 수행할 작업") < prompt.indexOf("head_sha:"));
   assert.match(prompt, /^## Host가 추출한 명시적 인수조건\nAC-1: 정상 진행 tier 1\.\.3 입력에서 보상량이 반환된다\.$/mu);
   assert.match(prompt, /^## Host Evidence Candidates$/mu);
   assert.match(prompt, /tests\/a\.gd/u);
@@ -135,7 +142,6 @@ test("커버리지 유저 프롬프트는 인수조건·인벤토리·출처만 
   assert.match(prompt, /^\(none - first review turn\)$/mu);
   assert.match(prompt, /^## 신뢰된 명시 요청\n\(없음\)$/mu);
   assert.doesNotMatch(prompt, /## Changed Files|## Current Changed File Contents|## Deep Repository Context|## 지적 원장/u);
-  assert.ok(prompt.endsWith("확실한 후보가 없으면 candidates는 빈 배열입니다."));
   assert.match(prompt, /missing_acceptance_test 후보로 최대 2개/u);
 });
 
@@ -153,7 +159,9 @@ test("결함 유저 프롬프트는 게이트 마크다운과 원장을 담고 �
   assert.match(prompt, /^- fp state=open kind=fatal target=a\.gd#f$/mu);
   assert.match(prompt, /# Pull Request Merge Gate Context\n## Changed Files\n\(body\)/u);
   assert.doesNotMatch(prompt, /## Host Evidence Candidates|## Trusted Acceptance Sources/u);
-  assert.ok(prompt.endsWith("확실한 후보가 없으면 빈 배열을 제출하세요."));
+  // M3의 자동 prefix 캐시가 걸리도록 고정 지시가 첫 per-PR 값(head_sha)보다 앞에 온다.
+  assert.ok(prompt.indexOf("## 수행할 작업") < prompt.indexOf("head_sha:"));
+  assert.ok(prompt.endsWith("# Pull Request Merge Gate Context\n## Changed Files\n(body)"));
 
   const guide = buildReviewGateDefectUserPrompt({
     ...hostFacts,
@@ -164,5 +172,6 @@ test("결함 유저 프롬프트는 게이트 마크다운과 원장을 담고 �
     acceptanceGuideMode: true,
   });
   assert.match(guide, /^## 지적 원장\n\(이전 지적 없음\)$/mu);
-  assert.ok(guide.endsWith("확실한 후보가 없으면 candidates는 빈 배열입니다."));
+  assert.ok(guide.indexOf("확실한 후보가 없으면 candidates는 빈 배열입니다.") < guide.indexOf("head_sha:"));
+  assert.ok(guide.endsWith("(body)"));
 });
