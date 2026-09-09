@@ -82,6 +82,7 @@ import {
 } from "./review-gate-extraction.js";
 import {
   evaluateMiniMaxReviewGateCandidates,
+  isAdvisoryDefectCandidate,
   storedReviewFindingBlocks,
 } from "./review-gate-pipeline.js";
 import {
@@ -2570,13 +2571,22 @@ export class PrBot {
     const unconfirmedOpenFindings = openFindings.filter((finding) =>
       !currentConfirmedFingerprints.has(finding.semanticFingerprint),
     );
+    // Advisory results are excluded from the disclosure items, so they must be
+    // excluded from the verdict inputs too. Otherwise the gate abstains with an
+    // empty item list and the check output builder rejects that combination.
     const hasUnresolvedValidation =
       !pipeline.inputValid ||
       !context.fatalContextComplete ||
       !coverage.complete ||
       failedExtractionPasses.length > 0 ||
-      currentOpenFindings.length !== openFindings.length ||
+      unconfirmedOpenFindings.some((finding) => storedReviewFindingBlocks(finding)) ||
       pipeline.rejected.some((rejected) => {
+        const candidate = evaluatedEnvelope.candidates.find(
+          (item) => item.candidateId === rejected.candidateId,
+        );
+        if (candidate && isAdvisoryDefectCandidate(candidate)) {
+          return false;
+        }
         const verification = evaluatedEnvelope.verifications.find((item) => item.candidateId === rejected.candidateId);
         return verification?.verdict === "uncertain";
       });

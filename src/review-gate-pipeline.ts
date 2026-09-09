@@ -22,6 +22,19 @@ import { buildChangedLineEvidence } from "./review-grounding.js";
 import { isExplicitlyManualAcceptanceCriterion } from "./review-acceptance-coverage.js";
 
 /**
+ * True for a defect candidate whose outcome is advisory-only. Advisory results
+ * are published by Jansoree and must be filtered out of every input to the
+ * Seori Review verdict, not just the disclosure items.
+ */
+export function isAdvisoryDefectCandidate(candidate: MiniMaxReviewCandidate): boolean {
+  return (
+    candidate.kind === "fatal_defect" &&
+    candidate.defectOutcome !== null &&
+    defectOutcomeSeverity(candidate.defectOutcome) === "advisory"
+  );
+}
+
+/**
  * Missing-test findings and fatal defects block the Seori Review verdict.
  * Advisory defects are proven the same way but are published by Jansoree only,
  * so they must never turn a clean gate into a FAIL.
@@ -459,18 +472,17 @@ function validateCausalEvidence(
   candidateCodeQuote: string,
   severity: DefectSeverity,
 ): Pick<RejectedReviewGateCandidate, "code" | "reason"> | null {
-  // A fatal candidate must show how a normal path reaches the catastrophic
-  // line, so it needs a start and an end. An advisory defect is proven by the
-  // root line contradicting an intent the same file already declares, and that
-  // intent is often a comment or a signature rather than a second executed
-  // line, so a single grounded root is enough.
-  const minimumEvidence = severity === "fatal" ? 2 : 1;
-  if (candidate.evidence.length < minimumEvidence) {
+  // A fatal candidate shows how a normal path reaches the catastrophic line. An
+  // advisory candidate shows the declared intent the root line contradicts, and
+  // that intent must itself be a grounded current-HEAD line (a contract comment,
+  // a signature, or a contrasting branch) — otherwise only model prose supports
+  // the claim. Both therefore need at least two grounded rows.
+  if (candidate.evidence.length < 2) {
     return {
       code: "fatal_causal_chain_invalid",
       reason: severity === "fatal"
         ? "치명 결함에는 시작 원인과 종단 결과를 포함한 코드 근거가 최소 2개 필요합니다."
-        : "확정 오동작에는 종단 결과를 포함한 코드 근거가 최소 1개 필요합니다.",
+        : "확정 오동작에는 선언된 의도와 종단 결과를 포함한 코드 근거가 최소 2개 필요합니다.",
     };
   }
 

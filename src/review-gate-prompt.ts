@@ -30,10 +30,11 @@ const DEFECT_SYMBOL_RULE =
 
 const DEFECT_SEVERITY_RULES = [
   "후보의 등급은 defect_outcome으로 정합니다. 치명 등급은 deterministic_crash, permanent_data_loss_or_corruption, exploitable_security_or_privacy_exposure, primary_flow_unusable이고, advisory 등급은 deterministic_misbehavior입니다.",
+  "후보 자리는 최대 2개뿐입니다. 치명 등급 후보를 먼저 모두 채우고, deterministic_misbehavior는 남은 자리에만 제출하세요. 치명 후보를 밀어내면 병합 게이트가 그 결함을 영영 보지 못합니다.",
   "치명 등급은 정상 또는 필수 경로에서 그 결과가 root line으로 직접 발생할 때만 제출하세요.",
   "deterministic_misbehavior는 크래시나 데이터 손실까지 가지 않더라도, 정상 경로에서 코드가 선언된 의도와 확정적으로 다르게 동작할 때 제출하세요. 선언된 의도는 이 PR의 인수조건, 같은 파일의 주석이나 함수 계약, 같은 파일이 이미 구현한 같은 종류의 다른 분기에서만 읽고 새로 지어내지 마세요.",
   "치명 등급의 evidence는 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시하세요.",
-  "deterministic_misbehavior의 evidence는 root line 하나만으로도 됩니다. 선언된 의도가 같은 파일의 주석이나 선언부 한 줄에 있으면 그 줄을 첫 근거로 함께 넣으세요.",
+  "deterministic_misbehavior의 evidence는 선언된 의도를 담은 같은 파일의 현재 HEAD 줄(계약 주석, 선언부, 같은 종류의 다른 분기)을 첫 근거로 넣고 root line으로 끝내는 2~6개입니다. 의도 줄 없이 root만 제출하면 폐기됩니다.",
   "등급과 무관하게 evidence는 같은 파일에서 줄 번호 오름차순이어야 하고, 마지막 근거는 결과를 직접 일으키는 root line이며 file, line, code_quote가 후보의 값과 같아야 합니다. root line은 이번 PR이 추가한 줄이어야 합니다.",
 ] as const;
 

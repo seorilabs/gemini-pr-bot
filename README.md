@@ -166,9 +166,11 @@ flowchart TD
 그 결과를 직접 일으키는 서명을 확인합니다. `deterministic_misbehavior`는 advisory
 등급으로, 크래시나 데이터 손실까지 가지 않아도 정상 경로에서 코드가 선언된 의도와
 확정적으로 다르게 동작할 때 사용합니다. 한 줄 서명으로는 일반 오동작을 표현할 수
-없으므로 advisory 등급은 서명 대신 실행 가능한 줄인지만 확인하고, root line이 이번
-PR이 추가한 현재 HEAD 줄일 것, 같은 파일 인과 근거 2~6줄, symbol grounding,
-검증자의 독립 confirmed는 두 등급에 동일하게 요구합니다. advisory 결함은 Seori
+없으므로 advisory 등급은 서명 대신 실행 가능한 줄인지만 확인합니다. 대신 advisory는
+선언된 의도를 담은 같은 파일의 현재 HEAD 줄을 첫 근거로 요구해 그 의도 자체가 코드로
+확인되게 합니다. root line이 이번 PR이 추가한 현재 HEAD 줄일 것, 같은 파일 인과 근거
+2~6줄, symbol grounding, 검증자의 독립 confirmed는 두 등급에 동일하게 요구합니다.
+후보 자리는 두 등급을 합쳐 최대 2개이므로 치명 등급을 먼저 채웁니다. advisory 결함은 Seori
 Review check의 판정과 보류 항목에 전혀 반영되지 않고 잔소리 인라인 코멘트로만
 게시됩니다.
 

@@ -58,7 +58,8 @@ test("커버리지 패스와 결함 패스는 후보 종류와 규칙을 서로 
   assert.match(defect, /후보의 등급은 defect_outcome으로 정합니다/u);
   assert.match(defect, /advisory 등급은 deterministic_misbehavior입니다/u);
   assert.match(defect, /치명 등급의 evidence는 같은 파일의 현재 HEAD 정확한 코드 2~6개로 도달 경로를 제시/u);
-  assert.match(defect, /deterministic_misbehavior의 evidence는 root line 하나만으로도 됩니다/u);
+  assert.match(defect, /deterministic_misbehavior의 evidence는 선언된 의도를 담은 같은 파일의 현재 HEAD 줄/u);
+  assert.match(defect, /치명 등급 후보를 먼저 모두 채우고/u);
   assert.match(defect, /치명 예시: 주석이나 문서가 명시한 정상 입력 범위/u);
   assert.match(defect, /advisory 예시: 인수조건이나 주석이 정한 경계값/u);
   assert.doesNotMatch(defect, /acceptance_coverage/u);

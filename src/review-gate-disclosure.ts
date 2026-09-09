@@ -10,9 +10,10 @@ import {
   normalizeReviewAcceptanceEvidence,
 } from "./review-acceptance-coverage.js";
 import type { StoredReviewFinding } from "./review-finding-ledger.js";
-import type {
-  ReviewGateCandidateRejectionCode,
-  ReviewGatePipelineResult,
+import {
+  isAdvisoryDefectCandidate,
+  type ReviewGateCandidateRejectionCode,
+  type ReviewGatePipelineResult,
 } from "./review-gate-pipeline.js";
 import type {
   ReviewGateAbstainItem,
@@ -131,7 +132,7 @@ export function buildReviewGateDisclosure(
   // Advisory defects never reach the Seori verdict, so an unresolved advisory
   // candidate must not turn the gate into an abstain item either.
   const uncertainCandidates = input.candidates.filter((candidate) =>
-    uncertainCandidateIds.has(candidate.candidateId) && !isAdvisoryCandidate(candidate)
+    uncertainCandidateIds.has(candidate.candidateId) && !isAdvisoryDefectCandidate(candidate)
   );
   for (const candidate of uncertainCandidates) {
     abstainItems.push({
@@ -296,12 +297,4 @@ function uniqueAbstainItems(items: readonly ReviewGateAbstainItem[]): ReviewGate
     unique.set(`${item.label}\u0000${item.reason}`, item);
   }
   return [...unique.values()];
-}
-
-function isAdvisoryCandidate(candidate: MiniMaxReviewCandidate): boolean {
-  return (
-    candidate.kind === "fatal_defect" &&
-    candidate.defectOutcome !== null &&
-    defectOutcomeSeverity(candidate.defectOutcome) === "advisory"
-  );
 }

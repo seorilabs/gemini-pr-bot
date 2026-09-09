@@ -432,7 +432,7 @@ function defectTool(): MiniMaxMessagesRequest["tools"][number] {
   return {
     name: MINIMAX_REVIEW_TOOL_NAME,
     description:
-      "현재 HEAD 코드만으로 완전히 입증된 결함 후보를 최대 2개 제출합니다. 병합을 막는 치명 등급과 advisory 등급을 defect_outcome으로 구분하며, 확실한 후보가 없으면 빈 배열입니다.",
+      "현재 HEAD 코드만으로 완전히 입증된 결함 후보를 최대 2개 제출합니다. 병합을 막는 치명 등급과 advisory 등급을 defect_outcome으로 구분하고 치명 등급을 먼저 채우며, 확실한 후보가 없으면 빈 배열입니다.",
     input_schema: {
       type: "object",
       additionalProperties: false,

@@ -7,6 +7,7 @@ import type {
 import {
   SYMBOL_MAX_DISTANCE,
   evaluateMiniMaxReviewGateCandidates,
+  isAdvisoryDefectCandidate,
   normalizeRepositoryPath,
   storedReviewFindingBlocks,
   type ReviewGatePipelineInput,
@@ -398,9 +399,10 @@ test("advisory 등급은 치명 서명 없이도 나머지 근거가 모두 남�
   assert.equal(result.ledgerCandidates[0]?.kind, "fatal");
 });
 
-test("advisory 등급은 root line 하나만으로도 인과 근거를 인정한다", () => {
-  // 확정 오동작은 선언된 의도를 위반하는 root 한 줄로 완결되는 경우가 많다.
-  // 치명 등급의 도달 경로 요구(2줄 이상)를 그대로 적용하면 전량 폐기된다.
+test("advisory 등급은 선언된 의도를 담은 근거 줄을 함께 요구한다", () => {
+  // root 한 줄만 받으면 "선언된 의도"가 모델 산문에만 존재하게 되어, 새로 추가된
+  // 어떤 비교나 반환도 확정 오동작으로 통과할 수 있다. 의도 줄도 현재 HEAD에
+  // 실재해야 한다.
   const source = [
     "## 남은 시도가 1회 이상이면 도전할 수 있다.",
     "static func can_challenge(remaining: int) -> bool:",
@@ -408,7 +410,13 @@ test("advisory 등급은 root line 하나만으로도 인과 근거를 인정한
   ].join("\n");
   const file = "godot/scripts/challenge_rules.gd";
   const root = { file, line: 3, codeQuote: "\treturn remaining > 1", explanationKo: "경계값을 반대로 적용합니다." };
-  const result = evaluateMiniMaxReviewGateCandidates(input({
+  const intent = {
+    file,
+    line: 1,
+    codeQuote: "## 남은 시도가 1회 이상이면 도전할 수 있다.",
+    explanationKo: "같은 파일이 선언한 의도입니다.",
+  };
+  const rootOnly = evaluateMiniMaxReviewGateCandidates(input({
     candidates: [fatalCandidate({
       file,
       symbol: "can_challenge",
@@ -421,9 +429,24 @@ test("advisory 등급은 root line 하나만으로도 인과 근거를 인정한
     currentHeadFileContents: { [file]: source },
     visibleChangedPatches: { [file]: addedLinePatch(3, "\treturn remaining > 1") },
   }));
+  assert.equal(rootOnly.accepted.length, 0);
+  assert.equal(rootOnly.rejected[0]?.code, "fatal_causal_chain_invalid");
 
-  assert.deepEqual(result.rejected, []);
-  assert.equal(result.accepted.length, 1);
+  const withIntent = evaluateMiniMaxReviewGateCandidates(input({
+    candidates: [fatalCandidate({
+      file,
+      symbol: "can_challenge",
+      line: 3,
+      codeQuote: "\treturn remaining > 1",
+      defectOutcome: "deterministic_misbehavior",
+      evidence: [intent, root],
+    })],
+    verifications: [fatalVerification({ evidence: [root] })],
+    currentHeadFileContents: { [file]: source },
+    visibleChangedPatches: { [file]: addedLinePatch(3, "\treturn remaining > 1") },
+  }));
+  assert.deepEqual(withIntent.rejected, []);
+  assert.equal(withIntent.accepted.length, 1);
 });
 
 test("치명 등급은 근거가 하나뿐이면 계속 거부한다", () => {
@@ -749,3 +772,12 @@ function storedBase() {
     refutation: null,
   };
 }
+
+test("advisory 후보 판정은 게이트 입력 필터가 공유하는 하나의 기준을 쓴다", () => {
+  // Seori 판정 입력(bot.ts)과 공개 보류 항목(disclosure)이 서로 다른 기준을 쓰면
+  // 한쪽만 advisory를 걸러 "보류인데 보류 항목이 없는" 상태가 만들어진다.
+  assert.equal(isAdvisoryDefectCandidate(fatalCandidate({ defectOutcome: "deterministic_misbehavior" })), true);
+  assert.equal(isAdvisoryDefectCandidate(fatalCandidate({ defectOutcome: "deterministic_crash" })), false);
+  assert.equal(isAdvisoryDefectCandidate(fatalCandidate({ defectOutcome: "primary_flow_unusable" })), false);
+  assert.equal(isAdvisoryDefectCandidate(missingCandidate()), false);
+});
